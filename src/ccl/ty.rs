@@ -1,6 +1,8 @@
 //! The CCL [`Type`] lattice, its [`Refinement`] subset-type carrier, and the
 //! type-blind structural equality / hashing on refinement predicate terms.
 
+use crate::ccl::infer::solver::Solver;
+use crate::ccl::infer::solver::var::{Solved, SolverVar};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
@@ -384,9 +386,9 @@ impl FunKind {
 
     /// The identities of the binders a function of this kind is over, one per position —
     /// available whether or not the kind states what they range over.
-    pub fn binder_ids(&self) -> Vec<WitnessId> {
+    pub fn binder_ids(&self, solver: &mut Solver) -> Vec<WitnessId> {
         match self {
-            FunKind::Var(v) => v.binder_ids(),
+            FunKind::Var(v) => v.binder_ids(solver),
             other => other.witnesses().iter().map(|w| *w.id()).collect(),
         }
     }
@@ -403,14 +405,14 @@ impl FunKind {
     /// The display arrow for this kind: `⇒` for compute, `⤇` for data. A variable
     /// renders by its pin, so a consumer function reads as the collection it is; an
     /// unpinned one renders `⇒`.
-    pub fn arrow(&self) -> &'static str {
+    pub fn arrow(&self, solver: &Solver) -> &'static str {
         match self {
             FunKind::Compute => "⇒",
             FunKind::Data(..) => "⤇",
             // Every data spelling reads as a collection: `Data` is data with plain-vs-sum
             // still open, and `Plain` and `Sum` are the two ways it settles. Rendering
             // those as `⇒` printed a collection as a compute function.
-            FunKind::Var(v) if v.resolved().is_data() => "⤇",
+            FunKind::Var(v) if v.resolved_in(solver).is_data() => "⤇",
             FunKind::Var(_) => "⇒",
         }
     }
@@ -421,13 +423,19 @@ impl FunKind {
     /// A concrete kind is its own answer; a variable's is what its component was pinned to.
     /// There is no second encoding of these states, so no phase can lose a distinction an
     /// earlier one made by translating between two spellings of the lattice.
-    pub fn resolved(&self) -> KindPin {
+    pub fn resolved_in(&self, solver: &Solver) -> KindPin {
         match self {
             FunKind::Compute => KindPin::Compute,
             FunKind::Data(None) => KindPin::Plain,
             FunKind::Data(Some(ws)) => KindPin::Sum(ws.len()),
-            FunKind::Var(v) => v.resolved(),
+            FunKind::Var(v) => v.resolved_in(solver),
         }
+    }
+
+    /// [`Self::resolved_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn resolved(&self) -> KindPin {
+        self.resolved_in(&Solver::none())
     }
 
     /// Whether a function of this kind has **its domain as its data**: every kind but one
@@ -435,8 +443,8 @@ impl FunKind {
     /// collection's keys, which have no join, so it is kept rather than dropped
     /// ([`crate::ccl::subst::Mapping::Join`]). A kind nothing has settled counts, so an
     /// undecided domain is reported rather than widened.
-    pub fn has_data_domain(&self) -> bool {
-        !matches!(self.resolved(), KindPin::Compute)
+    pub fn has_data_domain(&self, solver: &Solver) -> bool {
+        !matches!(self.resolved_in(solver), KindPin::Compute)
     }
 
     /// Whether a function of this kind may be **a sum** — its slot is filled, or its
@@ -445,25 +453,25 @@ impl FunKind {
     /// `Data(None)` answers `false`: a plain collection and a sum are two of the three
     /// concrete kinds, and neither is below the other, so a phase that forms a sum from a
     /// plain collection is performing an edge `constrain_fun_kind` refuses.
-    pub fn admits_sum(&self) -> bool {
+    pub fn admits_sum(&self, solver: &Solver) -> bool {
         match self {
             FunKind::Compute => false,
             FunKind::Data(slot) => slot.is_some(),
             // **Unpinned is not a licence.** Nothing determined this kind, so it is not
             // known to be data at all, let alone a sum; admitting one here wraps a function
             // whose kind no value ever settled.
-            FunKind::Var(v) => matches!(v.resolved(), KindPin::Data | KindPin::Sum(_)),
+            FunKind::Var(v) => matches!(v.resolved_in(solver), KindPin::Data | KindPin::Sum(_)),
         }
     }
 
     /// How many binders a function of this kind is over, where anything has said.
-    pub fn arity(&self) -> Option<usize> {
-        self.resolved().arity()
+    pub fn arity(&self, solver: &Solver) -> Option<usize> {
+        self.resolved_in(solver).arity()
     }
 
-    /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds).
-    pub fn fresh_var() -> FunKind {
-        FunKind::Var(FunKindVar::fresh())
+    /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds), owned by `solver`.
+    pub fn fresh_var(solver: &mut Solver) -> FunKind {
+        FunKind::Var(FunKindVar::fresh(solver))
     }
 
     /// A fresh kind variable **pinned to `Data`** — a consumer's function, polymorphic in
@@ -471,17 +479,15 @@ impl FunKind {
     /// "Consuming a sum: pinning the consumer's kind"). The kind equation relates it to
     /// a plain collection and to a sum alike; a compute function flowing in is the conflict.
     pub fn fresh_data() -> FunKind {
-        let v = FunKindVar::fresh();
-        v.stamp_data();
-        FunKind::Var(v)
+        FunKind::Var(FunKindVar::unowned_data(false))
     }
 
     /// [`fresh_data`](Self::fresh_data) for a function an annotation's normalization mints at
     /// `level`.
-    pub fn fresh_data_at(level: crate::ccl::infer_var::Level) -> FunKind {
-        let v = FunKindVar::fresh();
-        v.stamp_data();
-        v.place_at(level);
+    pub fn fresh_data_at(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> FunKind {
+        let v = FunKindVar::fresh(solver);
+        v.stamp_data(solver);
+        v.place_at(solver, level);
         FunKind::Var(v)
     }
 
@@ -493,9 +499,7 @@ impl FunKind {
     /// normalization replaces it with a fresh data funkind at each occurrence, and nothing
     /// relates two occurrences through it.
     pub fn data_hole() -> FunKind {
-        let v = FunKindVar::minted(true);
-        v.stamp_data();
-        FunKind::Var(v)
+        FunKind::Var(FunKindVar::unowned_data(true))
     }
 }
 
@@ -517,46 +521,32 @@ pub(crate) fn next_fun_kind_var_id() -> FunKindVarId {
     FunKindVarId(FUN_KIND_VAR_COUNTER.load(Ordering::Relaxed))
 }
 
-#[cfg(debug_assertions)]
-thread_local! {
-    /// Every kind variable minted on this thread, for [`dump_kind_vars`]. Diagnostic only —
-    /// the counterpart of the inference arena, and read by nothing that decides anything.
-    static KIND_VARS: RefCell<Vec<Rc<FunKindVar>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Every kind variable and everything recorded on it, newest last — the whole kind graph in
-/// one place, for reading what the edges actually say.
-#[cfg(debug_assertions)]
-pub fn fun_kind_vars() -> Vec<Rc<FunKindVar>> {
-    KIND_VARS.with(|ks| ks.borrow().clone())
-}
-
 /// Which inference variable owns each kind variable, for the dump — the reverse of
 /// [`crate::ccl::InferVar::fun_kind`].
 #[cfg(debug_assertions)]
-fn kind_var_owners() -> std::collections::HashMap<u32, Vec<String>> {
+fn kind_var_owners(solver: &Solver) -> std::collections::HashMap<u32, Vec<String>> {
     let mut out: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
-    for v in crate::ccl::infer_var::arena_vars() {
-        out.entry(v.fun_kind.uid.0)
+    for v in solver.infer_vars() {
+        out.entry(v.fun_kind().uid.0)
             .or_default()
             .push(format!("?{}", v.uid.0));
     }
     out
 }
 
-/// A one-line rendering of every kind variable minted on this thread. Diagnostic only.
+/// A one-line rendering of every funkind variable `solver` minted. Diagnostic only.
 ///
-/// Debug-only along with `KIND_VARS`, the thread-local it reads: nothing outside a
-/// diagnostic consults it, and a release build mints no entries to render.
+/// Debug-only: nothing outside a diagnostic consults it.
 #[cfg(debug_assertions)]
-pub fn dump_kind_vars() -> String {
-    fun_kind_vars()
+pub fn dump_kind_vars(solver: &Solver) -> String {
+    solver
+        .funkind_vars()
         .iter()
         .map(|v| {
-            let owners = kind_var_owners();
+            let owners = kind_var_owners(solver);
             match owners.get(&v.uid.0) {
-                Some(os) => format!("{} owner={}", v.debug_dump(), os.join(",")),
-                None => format!("{} owner=-", v.debug_dump()),
+                Some(os) => format!("{} owner={}", v.debug_dump(solver), os.join(",")),
+                None => format!("{} owner=-", v.debug_dump(solver)),
             }
         })
         .collect::<Vec<_>>()
@@ -701,13 +691,13 @@ struct FunKindBounds {
 /// One position per position of each source, so the widths add. An empty list is not width
 /// zero: a kind nothing was built over says nothing about its width, and folding it to `0`
 /// would call every ordinary collection plain.
-fn built_width(sources: &[FunKind]) -> Option<usize> {
+fn built_width(solver: &Solver, sources: &[FunKind]) -> Option<usize> {
     if sources.is_empty() {
         return None;
     }
     sources
         .iter()
-        .map(FunKind::arity)
+        .map(|k| k.arity(solver))
         .try_fold(0, |acc, n| Some(acc + n?))
 }
 
@@ -723,64 +713,90 @@ fn built_width(sources: &[FunKind]) -> Option<usize> {
 /// binders, not the same ones — which is what the Σ rule reads — and a substitution maps
 /// between them, derived once the kind graph is closed and the arities are known.
 ///
-/// Identity (`uid`) is immutable and lives outside the `RefCell`, so equality and hashing are
-/// borrow-free and never inspect what has been recorded — mirroring [`crate::ccl::InferVar`].
-pub struct FunKindVar {
-    /// Stable, globally-unique identity — and, with a position, each binder's.
-    pub uid: FunKindVarId,
+/// The handle carries what is fixed when the variable is minted: what every solver variable has
+/// ([`SolverVar`]), its identity also each binder's with a position, and its sort's part
+/// ([`FunKindVarFixed`]). What a run records on it lives in the run's
+/// [`Solver`](crate::ccl::infer::solver::Solver) ([`FunKindState`]).
+pub type FunKindVar = SolverVar<FunKind>;
+
+impl Solved for FunKind {
+    type Id = FunKindVarId;
+    type Fixed = FunKindVarFixed;
+    fn next_id() -> FunKindVarId {
+        FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+    fn key(id: FunKindVarId) -> u32 {
+        id.0
+    }
+    fn fmt_var(id: FunKindVarId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "κ{}", id.0)
+    }
+}
+
+/// What a funkind variable carries besides what every solver variable has.
+pub struct FunKindVarFixed {
     /// Whether this is an annotation's **funkind hole** ([`FunKind::data_hole`]): a funkind the
     /// program left to inference, which normalization replaces with a fresh data funkind at
-    /// each occurrence, as it replaces a `Hole`. Immutable, like `uid`.
+    /// each occurrence, as it replaces a `Hole`.
     hole: bool,
+    /// What construction said this kind is: data, for a consumer's function
+    /// ([`FunKind::fresh_data`]) and an annotation's funkind hole, which lowering mints before
+    /// any run. A run can stamp it data later ([`FunKindVar::stamp_data`]).
+    minted: KindPin,
+}
+
+/// What a run has recorded on a [`FunKindVar`].
+#[derive(Default)]
+pub(crate) struct FunKindState {
     /// The scope level of what owns this funkind variable, the variable it is the funkind of or
     /// the annotation's function it was minted for, where that is known: a freshening copies it
     /// only above its cutoff, as it copies a variable, so an instantiation leaves an outer
     /// definition's funkind variable its own (`src/ccl/design/type-inference.md`, "Funkind
     /// variables are copied by level"). `None` where nothing records an owner's level, and such
     /// a funkind variable is copied by every freshening that reaches it.
-    level: std::cell::Cell<Option<crate::ccl::infer_var::Level>>,
-    bounds: RefCell<FunKindBounds>,
-    /// [`resolved`](Self::resolved)'s answer, with the [`KIND_FACTS`] count it was
-    /// computed at: still the answer while no kind variable has been written since.
+    level: Option<crate::ccl::infer_var::Level>,
+    bounds: FunKindBounds,
+    /// [`FunKindVar::resolved`]'s answer, with the solver's kind-fact count it was computed
+    /// at: still the answer while no funkind variable has been written since.
     resolved_at: RefCell<Option<(u64, KindPin)>>,
-    /// [`component`](Self::component)'s answer, with the [`KIND_FACTS`] count it was computed
-    /// at. Weak references avoid retaining the component through the cache.
+    /// [`FunKindVar::component`]'s answer, with the kind-fact count it was computed at. Weak
+    /// references, so a kind does not keep its relations alive through the cache.
     component_at: RefCell<Option<(u64, Rc<KindComponent>)>>,
-    /// Witness positions in this kind's graph, invalidated by new facts or binder names.
+    /// Witness positions in this kind's graph ([`FunKindVar::binder_position`]), with the
+    /// kind-fact and binder-name counts they were computed at.
     binder_positions_at: RefCell<Option<BinderPositions>>,
 }
 
+/// [`FunKindVar::binder_position`]'s answers, at the counts they were computed at.
 struct BinderPositions {
     facts: u64,
     names: u64,
     positions: std::collections::HashMap<WitnessId, usize>,
 }
 
+/// A kind's [`component`](FunKindVar::component): the kinds reached, and their binder names
+/// at the binder-name count they were read at.
 struct KindComponent {
     ids: std::collections::HashSet<FunKindVarId>,
     kinds: Vec<std::rc::Weak<FunKindVar>>,
     binders_at: RefCell<Option<(u64, Vec<WitnessId>)>>,
 }
 
-thread_local! {
-    /// How many facts have been written to kind variables on this thread: the bounds,
-    /// stamps and sources [`FunKindVar::resolved`] reads. Every write bumps it, so a
-    /// cached answer computed at the current count is still the answer.
-    static KIND_FACTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Binder names can be minted without changing the graph's facts.
-    static KIND_NAMES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+impl FunKindState {
+    pub(crate) fn names_mut(&mut self) -> &mut Vec<crate::ccl::infer_var::WitnessBinderId> {
+        &mut self.bounds.settled
+    }
 }
 
-fn kind_fact_written() {
-    KIND_FACTS.with(|n| n.set(n.get() + 1));
-}
-
-/// One entry per field of a [`FunKindVar`], for a copy of a funkind variable to name each field it
-/// carries or leaves, with why ([`FunKindVar::fields`]). A field added to it fails to compile in
-/// `fields`, and then at every copy that destructures this.
+/// One entry per field of a [`FunKindVar`] and of the [`FunKindState`] a run holds for it, for a
+/// copy of a funkind variable to name each field it carries or leaves, with why
+/// ([`FunKindVar::fields`]). A field added to either fails to compile in `fields`, and then at
+/// every copy that destructures this.
 pub(crate) struct FunKindVarFields {
     pub(crate) uid: (),
     pub(crate) hole: (),
+    pub(crate) minted: (),
+    pub(crate) home: (),
     pub(crate) level: (),
     pub(crate) bounds: (),
     pub(crate) resolved_at: (),
@@ -789,20 +805,27 @@ pub(crate) struct FunKindVarFields {
 }
 
 impl FunKindVar {
-    /// [`FunKindVarFields`], listed by destructuring this funkind variable exhaustively.
-    pub(crate) fn fields(&self) -> FunKindVarFields {
-        let FunKindVar {
+    /// [`FunKindVarFields`], listed by destructuring this funkind variable and its state in
+    /// `solver` exhaustively.
+    pub(crate) fn fields(&self, solver: &Solver) -> FunKindVarFields {
+        let SolverVar {
             uid: _,
-            hole: _,
+            home: _,
+            telescope: _,
+            fixed: FunKindVarFixed { hole: _, minted: _ },
+        } = self;
+        let FunKindState {
             level: _,
             bounds: _,
             resolved_at: _,
             component_at: _,
             binder_positions_at: _,
-        } = self;
+        } = solver.funkind_state(self);
         FunKindVarFields {
             uid: (),
             hole: (),
+            minted: (),
+            home: (),
             level: (),
             bounds: (),
             resolved_at: (),
@@ -813,43 +836,66 @@ impl FunKindVar {
 }
 
 impl FunKindVar {
-    /// Allocate a fresh kind variable with nothing recorded.
-    pub fn fresh() -> Rc<FunKindVar> {
-        Self::minted(false)
+    /// Mint a fresh funkind variable owned by `solver`, with nothing recorded.
+    pub fn fresh(solver: &mut Solver) -> Rc<FunKindVar> {
+        FunKindVar::mint(
+            solver,
+            crate::ccl::infer_var::Telescope::empty(),
+            FunKindVarFixed {
+                hole: false,
+                minted: KindPin::Unpinned,
+            },
+            FunKindState::default(),
+        )
     }
 
-    /// The scope level of what owns this funkind variable
-    /// ([`FunKindVar::level`](Self#structfield.level)).
-    pub fn level(&self) -> Option<crate::ccl::infer_var::Level> {
-        self.level.get()
+    /// Mint a data funkind variable outside every run, as lowering does.
+    fn unowned_data(hole: bool) -> Rc<FunKindVar> {
+        SolverVar::unowned(FunKindVarFixed {
+            hole,
+            minted: KindPin::Data,
+        })
+    }
+
+    /// This variable as its run closes it ([`crate::ccl::infer`]'s `Closer`): a variable no run
+    /// minted, minted alike, which every solver reads as nothing recorded, as it reads
+    /// lowering's marks.
+    pub(crate) fn closed(&self) -> Rc<FunKindVar> {
+        SolverVar::unowned(FunKindVarFixed {
+            hole: self.fixed.hole,
+            minted: self.fixed.minted.clone(),
+        })
+    }
+
+    /// Mint an unpinned funkind variable outside every run, for a generator of test types that
+    /// mints no solver.
+    pub fn unowned_unpinned() -> Rc<FunKindVar> {
+        SolverVar::unowned(FunKindVarFixed {
+            hole: false,
+            minted: KindPin::Unpinned,
+        })
+    }
+
+    /// The scope level of what owns this funkind variable ([`FunKindState`]'s `level`).
+    pub fn level(&self, solver: &Solver) -> Option<crate::ccl::infer_var::Level> {
+        solver.funkind_state(self).level
     }
 
     /// Record that what owns this funkind variable stands at `level`, or lower it there: it
     /// stands as low as its lowest owner.
-    pub fn place_at(&self, level: crate::ccl::infer_var::Level) {
-        if self.level.get().is_none_or(|l| l > level) {
-            self.level.set(Some(level));
+    pub fn place_at(&self, solver: &mut Solver, level: crate::ccl::infer_var::Level) {
+        if self.level(solver).is_none_or(|l| l > level) {
+            solver.funkind_state_mut(self).level = Some(level);
         }
     }
 
-    fn minted(hole: bool) -> Rc<FunKindVar> {
-        let v = Rc::new(FunKindVar {
-            uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            hole,
-            level: std::cell::Cell::new(None),
-            bounds: RefCell::new(FunKindBounds::default()),
-            resolved_at: RefCell::new(None),
-            component_at: RefCell::new(None),
-            binder_positions_at: RefCell::new(None),
-        });
-        #[cfg(debug_assertions)]
-        KIND_VARS.with(|ks| ks.borrow_mut().push(Rc::clone(&v)));
-        v
+    fn bounds<'s>(&self, solver: &'s Solver) -> &'s FunKindBounds {
+        &solver.funkind_state(self).bounds
     }
 
     /// Record `k` below (or above) this variable, with no substitution between the two.
-    pub fn record(&self, k: FunKind, lower: bool) {
-        self.record_under(k, lower, crate::ccl::subst::Subst::id());
+    pub fn record(&self, solver: &mut Solver, k: FunKind, lower: bool) {
+        self.record_under(solver, k, lower, crate::ccl::subst::Subst::id());
     }
 
     /// Record `k` below (or above) this variable across an edge whose far side is read under
@@ -858,21 +904,29 @@ impl FunKindVar {
     /// (`Bound::render_subst`). A sum's candidates read across the edge are read under it, as
     /// the bound's content is ([`Self::lower_edges`]). Deduplicated by the point it denotes
     /// and the substitution, so one edge drawn twice records once.
-    pub fn record_under(&self, k: FunKind, lower: bool, subst: crate::ccl::subst::Subst) {
+    pub fn record_under(
+        &self,
+        solver: &mut Solver,
+        k: FunKind,
+        lower: bool,
+        subst: crate::ccl::subst::Subst,
+    ) {
         // A variable against itself says nothing, and recording it makes every reader walk
         // a cycle to find that out.
         if matches!(&k, FunKind::Var(v) if v.uid == self.uid) {
             return;
         }
-        let mut b = self.bounds.borrow_mut();
-        let side = if lower { &mut b.lower } else { &mut b.upper };
-        if !side
+        let b = self.bounds(solver);
+        let side = if lower { &b.lower } else { &b.upper };
+        if side
             .iter()
-            .any(|(x, s)| same_fun_kind(x, &k) && *s == subst)
+            .any(|(x, s)| same_fun_kind(solver, x, &k) && *s == subst)
         {
-            side.push((k, subst));
-            kind_fact_written();
+            return;
         }
+        let b = &mut solver.funkind_state_mut(self).bounds;
+        let side = if lower { &mut b.lower } else { &mut b.upper };
+        side.push((k, subst));
     }
 
     /// **What this kind is**, as far as everything recorded says: the join of every point
@@ -888,16 +942,17 @@ impl FunKindVar {
     /// The answer is the join over every kind the walk reaches, and a kind it reaches
     /// reaches only kinds this one does, so a reached kind's cached answer stands in for
     /// walking it. An answer is cached once a whole walk computes it, and is current until
-    /// any kind variable is written ([`KIND_FACTS`]).
-    pub fn resolved(&self) -> KindPin {
-        let now = KIND_FACTS.with(|n| n.get());
-        fn cached(v: &FunKindVar, now: u64) -> Option<KindPin> {
-            match &*v.resolved_at.borrow() {
+    /// any kind variable is written ([`Solver::funkind_facts`](crate::ccl::infer::solver::Solver)).
+    pub fn resolved_in(&self, solver: &Solver) -> KindPin {
+        let now = solver.funkind_facts;
+        fn cached(solver: &Solver, v: &FunKindVar, now: u64) -> Option<KindPin> {
+            match &*solver.funkind_state(v).resolved_at.borrow() {
                 Some((at, pin)) if *at == now => Some(pin.clone()),
                 _ => None,
             }
         }
         fn go(
+            solver: &Solver,
             v: &FunKindVar,
             now: u64,
             seen: &mut std::collections::HashSet<FunKindVarId>,
@@ -905,44 +960,43 @@ impl FunKindVar {
             if !seen.insert(v.uid) {
                 return KindPin::Unpinned;
             }
-            if let Some(pin) = cached(v, now) {
+            if let Some(pin) = cached(solver, v, now) {
                 return pin;
             }
-            let b = v.bounds.borrow();
+            let b = v.bounds(solver);
             // **What a collection is built over says what it is.** It binds one position
             // per position of each source, so its width is their sum — a sum of that
             // width, or a plain collection where the sources bind nothing. Answered here
             // rather than beside this, so "what is this kind" and "how wide is it" cannot
             // give different answers about one kind.
-            let over = match built_width(&b.built_over) {
+            let over = match built_width(solver, &b.built_over) {
                 Some(0) => KindPin::Plain,
                 Some(n) => KindPin::Sum(n),
                 None => KindPin::Unpinned,
             };
             b.lower.iter().chain(b.upper.iter()).map(|(k, _)| k).fold(
-                b.stamped.clone().join(over),
+                v.fixed.minted.clone().join(b.stamped.clone()).join(over),
                 |acc, k| {
                     let point = match k {
-                        FunKind::Var(x) => go(x, now, seen),
-                        other => other.resolved(),
+                        FunKind::Var(x) => go(solver, x, now, seen),
+                        other => other.resolved_in(solver),
                     };
                     acc.join(point)
                 },
             )
         }
-        if let Some(pin) = cached(self, now) {
+        if let Some(pin) = cached(solver, self, now) {
             return pin;
         }
-        let pin = go(self, now, &mut std::collections::HashSet::new());
-        // The walk reads the sources' widths, which resolves other kinds, but resolving
-        // only reads and caches: the answer is computed at `now`.
-        debug_assert_eq!(
-            KIND_FACTS.with(|n| n.get()),
-            now,
-            "resolving a kind writes no kind facts"
-        );
-        *self.resolved_at.borrow_mut() = Some((now, pin.clone()));
+        let pin = go(solver, self, now, &mut std::collections::HashSet::new());
+        *solver.funkind_state(self).resolved_at.borrow_mut() = Some((now, pin.clone()));
         pin
+    }
+
+    /// [`Self::resolved_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn resolved(&self) -> KindPin {
+        self.resolved_in(&Solver::none())
     }
 
     /// Record that this collection is **built over** `src`, ahead of what is already there.
@@ -952,19 +1006,22 @@ impl FunKindVar {
     /// Front-first because a sum's positions are ordered — the outermost binds the first
     /// generator — and the caller that has sources to register walks them backwards to nest
     /// its applications. The order is the generator order, not the visit order.
-    pub fn contributes_first(self: &Rc<Self>, src: FunKind) {
-        self.bounds.borrow_mut().built_over.insert(0, src);
-        kind_fact_written();
+    pub fn contributes_first(&self, solver: &mut Solver, src: FunKind) {
+        solver
+            .funkind_state_mut(self)
+            .bounds
+            .built_over
+            .insert(0, src);
     }
 
     /// The kinds this one is built over, in generator order.
-    pub fn built_over(&self) -> Vec<FunKind> {
-        self.bounds.borrow().built_over.clone()
+    pub fn built_over(&self, solver: &Solver) -> Vec<FunKind> {
+        self.bounds(solver).built_over.clone()
     }
 
     /// How many binders this kind's function is over, where anything has said.
-    pub fn arity(&self) -> Option<usize> {
-        self.resolved().arity()
+    pub fn arity(&self, solver: &Solver) -> Option<usize> {
+        self.resolved_in(solver).arity()
     }
 
     /// **The names this kind's binders settle on**, minted once and answered from the kind
@@ -974,67 +1031,61 @@ impl FunKindVar {
     /// its position, which is `CompactTypeKind::merge`'s question and not the kind graph's
     /// (`var_binder_kind` in `crate::ccl::infer::solver::compact`). A second answer derived
     /// here is a second answer, and the two differ by whatever each walk did instead.
-    pub fn binder_ids(self: &Rc<Self>) -> Vec<WitnessId> {
-        let Some(arity) = self.arity() else {
+    pub fn binder_ids(&self, solver: &mut Solver) -> Vec<WitnessId> {
+        let Some(arity) = self.arity(solver) else {
             return Vec::new();
         };
-        let ids: Vec<crate::ccl::infer_var::WitnessBinderId> = {
-            let mut b = self.bounds.borrow_mut();
-            if b.settled.len() < arity {
-                b.settled
-                    .resize_with(arity, crate::ccl::infer_var::fresh_witness_binder_id);
-                KIND_NAMES.with(|n| n.set(n.get() + 1));
-            }
-            b.settled[..arity].to_vec()
-        };
-        ids.iter().copied().map(WitnessId).collect()
+        if self.bounds(solver).settled.len() < arity {
+            solver
+                .funkind_names_mut(self)
+                .resize_with(arity, crate::ccl::infer_var::fresh_witness_binder_id);
+        }
+        self.bounds(solver).settled[..arity]
+            .iter()
+            .copied()
+            .map(WitnessId)
+            .collect()
     }
 
     /// Whether this is an annotation's funkind hole ([`FunKind::data_hole`]).
     pub fn is_hole(&self) -> bool {
-        self.hole
+        self.fixed.hole
     }
 
     /// The name of this funkind's binder at `position`, minted now whatever its arity
     /// turns out to be. A position past the arity is never bound.
-    pub fn binder_id_at(self: &Rc<Self>, position: usize) -> WitnessId {
-        let mut b = self.bounds.borrow_mut();
-        if b.settled.len() <= position {
-            b.settled
+    pub fn binder_id_at(&self, solver: &mut Solver, position: usize) -> WitnessId {
+        if self.bounds(solver).settled.len() <= position {
+            solver
+                .funkind_names_mut(self)
                 .resize_with(position + 1, crate::ccl::infer_var::fresh_witness_binder_id);
-            KIND_NAMES.with(|n| n.set(n.get() + 1));
         }
-        WitnessId(b.settled[position])
+        WitnessId(self.bounds(solver).settled[position])
     }
 
     /// Every binder name minted so far, arity known or not.
-    pub fn named_binder_ids(&self) -> Vec<WitnessId> {
-        self.bounds
-            .borrow()
+    pub fn named_binder_ids(&self, solver: &Solver) -> Vec<WitnessId> {
+        self.bounds(solver)
             .settled
             .iter()
             .copied()
             .map(WitnessId)
             .collect()
     }
-    /// Stamp this kind **data** at construction — a collection whatever slot it turns out
-    /// to have. The one fact that is not an edge, because no `FunKind` spells it.
-    pub fn stamp_data(&self) {
-        self.bounds.borrow_mut().stamped = KindPin::Data;
-        kind_fact_written();
+
+    /// Stamp this kind **data** — a collection whatever slot it turns out to have. The one
+    /// fact that is not an edge, because no `FunKind` spells it.
+    pub fn stamp_data(&self, solver: &mut Solver) {
+        solver.funkind_state_mut(self).bounds.stamped = KindPin::Data;
     }
 
     /// A one-line rendering of everything recorded, for tracing.
-    pub fn debug_dump(&self) -> String {
-        let (stamped, lower, upper, over) = {
-            let b = self.bounds.borrow();
-            (
-                b.stamped.clone(),
-                b.lower.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-                b.upper.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-                b.built_over.clone(),
-            )
-        };
+    pub fn debug_dump(&self, solver: &Solver) -> String {
+        let b = self.bounds(solver);
+        let stamped = self.stamped(solver);
+        let lower: Vec<FunKind> = b.lower.iter().map(|(k, _)| k.clone()).collect();
+        let upper: Vec<FunKind> = b.upper.iter().map(|(k, _)| k.clone()).collect();
+        let over = b.built_over.clone();
         let f = |ks: &Vec<FunKind>| {
             ks.iter()
                 .map(|k| match k {
@@ -1046,22 +1097,20 @@ impl FunKindVar {
                             .collect::<Vec<_>>()
                             .join(",")
                     ),
-                    other => format!("{:?}", other.resolved()),
+                    other => format!("{:?}", other.resolved_in(solver)),
                 })
                 .collect::<Vec<_>>()
                 .join(",")
         };
         // The names this kind has picked, where it has picked any: a reader comparing a
         // dump against a rendered type needs to know which `σ@n` belongs to which kind.
-        let names = self
-            .bounds
-            .borrow()
+        let names = b
             .settled
             .iter()
             .map(|b| format!("\u{03c3}@{b}"))
             .collect::<Vec<_>>()
             .join(",");
-        let from = match self.instantiated_from() {
+        let from = match self.instantiated_from(solver) {
             Some(o) => format!(" from=k{}", o.uid.0),
             None => String::new(),
         };
@@ -1071,15 +1120,14 @@ impl FunKindVar {
             f(&lower),
             f(&upper),
             f(&over),
-            self.arity(),
+            self.arity(solver),
         )
     }
 
     /// The kinds recorded **below** this variable, for a reader deriving the correspondences
     /// between its binders and theirs.
-    pub fn lower(&self) -> Vec<FunKind> {
-        self.bounds
-            .borrow()
+    pub fn lower(&self, solver: &Solver) -> Vec<FunKind> {
+        self.bounds(solver)
             .lower
             .iter()
             .map(|(k, _)| k.clone())
@@ -1087,9 +1135,8 @@ impl FunKindVar {
     }
 
     /// The kinds recorded **above** this one.
-    pub fn upper(&self) -> Vec<FunKind> {
-        self.bounds
-            .borrow()
+    pub fn upper(&self, solver: &Solver) -> Vec<FunKind> {
+        self.bounds(solver)
             .upper
             .iter()
             .map(|(k, _)| k.clone())
@@ -1098,51 +1145,55 @@ impl FunKindVar {
 
     /// [`Self::lower`] with each edge's substitution ([`Self::record_under`]), for a reader of
     /// what a kind below states — a sum's candidates — which is read under it.
-    pub fn lower_edges(&self) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
-        self.bounds.borrow().lower.clone()
+    pub fn lower_edges(&self, solver: &Solver) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
+        self.bounds(solver).lower.clone()
     }
 
     /// [`Self::upper`] with each edge's substitution.
-    pub fn upper_edges(&self) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
-        self.bounds.borrow().upper.clone()
+    pub fn upper_edges(&self, solver: &Solver) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
+        self.bounds(solver).upper.clone()
     }
 
     /// Record that this kind is a copy of `original` — see
     /// [`instantiated_from`](FunKindBounds::instantiated_from).
-    pub fn copied_from(&self, original: &Rc<FunKindVar>) {
-        let mut bounds = self.bounds.borrow_mut();
-        if bounds.instantiated_from.as_ref().map(|k| k.uid) != Some(original.uid) {
-            bounds.instantiated_from = Some(Rc::clone(original));
-            drop(bounds);
-            kind_fact_written();
+    pub fn copied_from(&self, solver: &mut Solver, original: &Rc<FunKindVar>) {
+        if self
+            .bounds(solver)
+            .instantiated_from
+            .as_ref()
+            .map(|k| k.uid)
+            != Some(original.uid)
+        {
+            solver.funkind_state_mut(self).bounds.instantiated_from = Some(Rc::clone(original));
         }
     }
 
     /// What this kind is a copy of, where it is one.
-    pub fn instantiated_from(&self) -> Option<Rc<FunKindVar>> {
-        self.bounds.borrow().instantiated_from.clone()
+    pub fn instantiated_from(&self, solver: &Solver) -> Option<Rc<FunKindVar>> {
+        self.bounds(solver).instantiated_from.clone()
     }
 
     /// Whether a part of a function of this kind can name `w`: one of the kind's own binders,
     /// or of a sum related to it by a kind edge, whose occurrences arrive spelled in that sum's
     /// binder before the correspondence renames them.
-    pub fn may_bind(&self, w: &WitnessId) -> bool {
-        self.binder_position(w).is_some()
+    pub fn may_bind(&self, solver: &Solver, w: &WitnessId) -> bool {
+        self.binder_position(solver, w).is_some()
     }
 
     /// Which of this kind's binders `w` is, where a part of a function of this kind can name
     /// it ([`Self::may_bind`]): its position in the sum binding it, since binders correspond
     /// by position across a kind edge.
-    pub fn binder_position(&self, w: &WitnessId) -> Option<usize> {
-        let facts = KIND_FACTS.with(|n| n.get());
-        let names = KIND_NAMES.with(|n| n.get());
-        if let Some(done) = &*self.binder_positions_at.borrow()
+    pub fn binder_position(&self, solver: &Solver, w: &WitnessId) -> Option<usize> {
+        let facts = solver.funkind_facts;
+        let names = solver.funkind_names;
+        if let Some(done) = &*solver.funkind_state(self).binder_positions_at.borrow()
             && done.facts == facts
             && done.names == names
         {
             return done.positions.get(w).copied();
         }
         fn collect(
+            solver: &Solver,
             k: &FunKindVar,
             seen: &mut std::collections::HashSet<FunKindVarId>,
             positions: &mut std::collections::HashMap<WitnessId, usize>,
@@ -1150,10 +1201,10 @@ impl FunKindVar {
             if !seen.insert(k.uid) {
                 return;
             }
-            for (index, w) in k.named_binder_ids().into_iter().enumerate() {
+            for (index, w) in k.named_binder_ids(solver).into_iter().enumerate() {
                 positions.entry(w).or_insert(index);
             }
-            let b = k.bounds.borrow();
+            let b = k.bounds(solver);
             for (kind, _) in b.lower.iter().chain(&b.upper) {
                 match kind {
                     FunKind::Data(Some(ws)) => {
@@ -1161,18 +1212,23 @@ impl FunKindVar {
                             positions.entry(*w.id()).or_insert(index);
                         }
                     }
-                    FunKind::Var(other) => collect(other, seen, positions),
+                    FunKind::Var(other) => collect(solver, other, seen, positions),
                     _ => {}
                 }
             }
             if let Some(original) = &b.instantiated_from {
-                collect(original, seen, positions);
+                collect(solver, original, seen, positions);
             }
         }
         let mut positions = std::collections::HashMap::new();
-        collect(self, &mut std::collections::HashSet::new(), &mut positions);
+        collect(
+            solver,
+            self,
+            &mut std::collections::HashSet::new(),
+            &mut positions,
+        );
         let result = positions.get(w).copied();
-        *self.binder_positions_at.borrow_mut() = Some(BinderPositions {
+        *solver.funkind_state(self).binder_positions_at.borrow_mut() = Some(BinderPositions {
             facts,
             names,
             positions,
@@ -1182,9 +1238,9 @@ impl FunKindVar {
 
     /// **The kinds whose binders [`Self::binder_position`] can place**, this one included: every
     /// kind reached through kind edges in either direction or through being copied.
-    fn component(self: &Rc<Self>) -> Rc<KindComponent> {
-        let now = KIND_FACTS.with(|n| n.get());
-        if let Some((at, component)) = &*self.component_at.borrow()
+    fn component(self: &Rc<Self>, solver: &Solver) -> Rc<KindComponent> {
+        let now = solver.funkind_facts;
+        if let Some((at, component)) = &*solver.funkind_state(self).component_at.borrow()
             && *at == now
         {
             return Rc::clone(component);
@@ -1194,18 +1250,17 @@ impl FunKindVar {
         let mut next = 0;
         while let Some(k) = reached.get(next).cloned() {
             next += 1;
-            let mut related: Vec<Rc<FunKindVar>> = {
-                let b = k.bounds.borrow();
-                b.lower
-                    .iter()
-                    .chain(b.upper.iter())
-                    .filter_map(|(k, _)| match k {
-                        FunKind::Var(v) => Some(Rc::clone(v)),
-                        _ => None,
-                    })
-                    .collect()
-            };
-            related.extend(k.instantiated_from());
+            let b = k.bounds(solver);
+            let mut related: Vec<Rc<FunKindVar>> = b
+                .lower
+                .iter()
+                .chain(b.upper.iter())
+                .filter_map(|(k, _)| match k {
+                    FunKind::Var(v) => Some(Rc::clone(v)),
+                    _ => None,
+                })
+                .collect();
+            related.extend(k.instantiated_from(solver));
             for r in related {
                 if seen.insert(r.uid) {
                     reached.push(r);
@@ -1217,19 +1272,19 @@ impl FunKindVar {
             kinds: reached.iter().map(Rc::downgrade).collect(),
             binders_at: RefCell::new(None),
         });
-        *self.component_at.borrow_mut() = Some((now, Rc::clone(&component)));
+        *solver.funkind_state(self).component_at.borrow_mut() = Some((now, Rc::clone(&component)));
         component
     }
 
     /// Whether `other` is in this kind's [`component`](Self::component).
-    pub fn same_component(self: &Rc<Self>, other: &Rc<FunKindVar>) -> bool {
-        self.uid == other.uid || self.component().ids.contains(&other.uid)
+    pub fn same_component(self: &Rc<Self>, solver: &Solver, other: &Rc<FunKindVar>) -> bool {
+        self.uid == other.uid || self.component(solver).ids.contains(&other.uid)
     }
 
     /// Every binder name minted so far by a kind in this one's [`component`](Self::component).
-    pub fn component_binder_ids(self: &Rc<Self>) -> Vec<WitnessId> {
-        let component = self.component();
-        let now = KIND_NAMES.with(|n| n.get());
+    pub fn component_binder_ids(self: &Rc<Self>, solver: &Solver) -> Vec<WitnessId> {
+        let component = self.component(solver);
+        let now = solver.funkind_names;
         if let Some((at, ids)) = &*component.binders_at.borrow()
             && *at == now
         {
@@ -1239,16 +1294,19 @@ impl FunKindVar {
             .kinds
             .iter()
             .filter_map(std::rc::Weak::upgrade)
-            .flat_map(|k| k.named_binder_ids())
+            .flat_map(|k| k.named_binder_ids(solver))
             .collect();
         *component.binders_at.borrow_mut() = Some((now, ids.clone()));
         ids
     }
 
-    /// What this kind was stamped at construction — the one fact no edge spells
+    /// What this kind was stamped at construction or since — the one fact no edge spells
     /// ([`stamp_data`](Self::stamp_data)).
-    pub fn stamped(&self) -> KindPin {
-        self.bounds.borrow().stamped.clone()
+    pub fn stamped(&self, solver: &Solver) -> KindPin {
+        self.fixed
+            .minted
+            .clone()
+            .join(self.bounds(solver).stamped.clone())
     }
 }
 
@@ -1258,7 +1316,7 @@ impl FunKindVar {
 /// point and two different bounds: they bind *different* binders, and collapsing them drops
 /// an arm of every conditional, so a variable would answer with the first collection that
 /// reached it and never learn about the second.
-fn same_fun_kind(a: &FunKind, b: &FunKind) -> bool {
+fn same_fun_kind(solver: &Solver, a: &FunKind, b: &FunKind) -> bool {
     match (a, b) {
         (FunKind::Var(x), FunKind::Var(y)) => x.uid == y.uid,
         (FunKind::Var(_), _) | (_, FunKind::Var(_)) => false,
@@ -1266,26 +1324,7 @@ fn same_fun_kind(a: &FunKind, b: &FunKind) -> bool {
         (FunKind::Data(Some(x)), FunKind::Data(Some(y))) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| p.id() == q.id())
         }
-        _ => a.resolved() == b.resolved(),
-    }
-}
-
-// Identity-based (by `uid`), mirroring `InferVar`: borrow-free, never touches
-// `bounds`, so it is safe even while a variable's bounds are borrowed.
-impl PartialEq for FunKindVar {
-    fn eq(&self, other: &Self) -> bool {
-        self.uid == other.uid
-    }
-}
-impl Eq for FunKindVar {}
-impl std::hash::Hash for FunKindVar {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.uid.hash(state);
-    }
-}
-impl fmt::Debug for FunKindVar {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "κ{}", self.uid.0)
+        _ => a.resolved_in(solver) == b.resolved_in(solver),
     }
 }
 
@@ -1449,7 +1488,8 @@ impl From<Option<crate::ccl::Name>> for FunBinder {
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
 /// | `BoundedHole(𝑇)` | Lowering | "A bounded annotation `𝑥 <: 𝑇`: infer this, subject to `<: 𝑇`" — an obligation, not a shape | Pass 1's `normalize_annotation` (flagged as `UnresolvedBoundedHole` if it survives) |
-/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction accumulator's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreChannelize`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N of a typing run" | The end of its run, which closes it to `Undetermined` |
+/// | `Undetermined(id)` | A finished typing run | "A type the run determined nothing about" | Reachable from the program's root output, it is an error (`UnresolvedInfer`, `collect_type_errors`); an induction accumulator's *domain* is undetermined until the unified phase erases it (see `Strictness::PreChannelize`) |
 /// | `History` (`history_kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`history_kind: Append`) | Type checker only | "Feed channel `domain ⤇ value`: the defer binding's post-channelize collection type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
@@ -1612,25 +1652,19 @@ pub enum Type {
     /// outer scope, identified by a unique [`crate::ccl::BarrierVarId`].
     /// Gathers its lower bounds.
     BarrierVar(Rc<BarrierVar>),
-    /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
-    ///
-    /// Created during inference by the inference pass
-    /// ([`crate::ccl::infer`]) when coalescing a constraint
-    /// variable whose bounds left it genuinely unconstrained (e.g. an
-    /// identity lambda's parameter with no call-site usage).
-    ///
-    /// Invariant: any `Infer` reachable from the program's root output
-    /// type is an *ambiguous-type* error, reported by `collect_type_errors`
-    /// as `UnresolvedInfer`. `Infer` survivals are permitted only inside
-    /// sub-expressions whose output type is not exercised (e.g. a top-level
-    /// `f = \x -> x` that is never applied).
-    ///
-    /// Carries the mutable [`InferVar`] (id + level + bounds) that the
-    /// solver constrains in place. A *coalesced* `Infer` (one
-    /// surviving inference) has empty bounds and matters only for its
-    /// `uid`; the solver guarantees no still-mutating variable escapes
-    /// into a downstream pass.
+    /// An inference variable of a typing run, identified by a unique
+    /// [`crate::ccl::InferVarId`]. What is recorded on it lives in its run's
+    /// [`Solver`]. No `Infer` outlives its run: the run closes each one it hands back to
+    /// the [`Type::Undetermined`] it stands for (`src/ccl/design/type-inference.md`, "A run
+    /// closes what it hands back").
     Infer(Rc<InferVar>),
+    /// A type a finished typing run determined nothing about: the inference variable `id`,
+    /// closed as its run ended. A leaf nothing is recorded on. A run leaves one where nothing
+    /// in the program fixes a type: an induction accumulator's domain, which the unified phase
+    /// erases unread; a definition nothing applies (`f = \x -> x`); a feed nothing feeds; a
+    /// failed statement's poisoned binding. One reachable from the program's root output type
+    /// is an ambiguous-type error, which `collect_type_errors` reports as `UnresolvedInfer`.
+    Undetermined(crate::ccl::InferVarId),
     /// The opaque domain type of an externally-registered data source.
     ///
     /// Used as the domain in `Fun(DataSource(name), output_type)` types emitted
@@ -2154,7 +2188,11 @@ impl TraitRequirement {
 
     /// This requirement with its binders renamed to `names`, one each: a use proves a
     /// quantified requirement at binders of its own, which nothing else reads.
-    pub fn with_binders_named(&self, names: &[crate::ccl::Name]) -> TraitRequirement {
+    pub fn with_binders_named(
+        &self,
+        solver: &mut Solver,
+        names: &[crate::ccl::Name],
+    ) -> TraitRequirement {
         debug_assert_eq!(names.len(), self.binders.len(), "one name per binder");
         let terms: Vec<Rc<TypedExpr>> = names
             .iter()
@@ -2168,19 +2206,19 @@ impl TraitRequirement {
             .collect();
         TraitRequirement {
             binders,
-            ..self.discharged(&terms)
+            ..self.discharged(solver, &terms)
         }
     }
 
     /// This requirement at the terms `terms`, one per binder, which it no longer binds: an
     /// application `V(t)` reaching an obligation reads the assumption
     /// `forall (k: K) Iterable(V(k))` at `t` ([`crate::ccl::subst::discharge_binders`]).
-    pub fn discharged(&self, terms: &[Rc<TypedExpr>]) -> TraitRequirement {
+    pub fn discharged(&self, solver: &mut Solver, terms: &[Rc<TypedExpr>]) -> TraitRequirement {
         let names: Vec<crate::ccl::Name> = self.binders.iter().map(|(n, _)| n.clone()).collect();
-        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, terms);
+        let mut at = |t: &Type| crate::ccl::subst::discharge_binders(solver, &names, t, terms);
         TraitRequirement {
             trait_: self.trait_.clone(),
-            args: self.args.iter().map(at).collect(),
+            args: self.args.iter().map(&mut at).collect(),
             terms: self.terms.clone(),
             effect_assoc: self.effect_assoc.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
@@ -2194,6 +2232,7 @@ impl TraitRequirement {
     /// fixed by an earlier operand. Associated types are deposited only after no binder remains.
     pub fn at_application(
         &self,
+        solver: &mut Solver,
         path: &[u8],
         contribution: &FamilyApp,
     ) -> Option<TraitRequirement> {
@@ -2232,7 +2271,7 @@ impl TraitRequirement {
             .zip(&terms)
             .filter_map(|((n, _), t)| t.as_ref().map(|t| (n.clone(), Rc::clone(t))))
             .unzip();
-        let at = |t: &Type| crate::ccl::subst::discharge_binders(&names, t, &args);
+        let mut at = |t: &Type| crate::ccl::subst::discharge_binders(solver, &names, t, &args);
         Some(TraitRequirement {
             binders: self
                 .binders
@@ -2241,7 +2280,7 @@ impl TraitRequirement {
                 .filter(|(_, t)| t.is_none())
                 .map(|((n, t), _)| (n.clone(), at(t)))
                 .collect(),
-            args: self.args.iter().map(at).collect(),
+            args: self.args.iter().map(&mut at).collect(),
             terms: self.terms.clone(),
             effect_assoc: self.effect_assoc.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), at(t))).collect(),
@@ -2479,7 +2518,7 @@ impl PolyType {
             let r = &if r.binders.is_empty() {
                 (**r).clone()
             } else {
-                r.with_binders_named(&names)
+                r.with_binders_named(&mut Solver::none(), &names)
             };
             let mut group = Vec::new();
             let args: Vec<String> = r.args.iter().map(&mut write).collect();
@@ -2502,7 +2541,13 @@ impl PolyType {
                             .iter()
                             .find(|d| d.param.id == p.id)
                             .and_then(|d| d.kind.family_bound())
-                            .map(|family| crate::ccl::subst::family_at_names(family, &names)),
+                            .map(|family| {
+                                crate::ccl::subst::family_at_names(
+                                    &mut Solver::none(),
+                                    family,
+                                    &names,
+                                )
+                            }),
                         (other, _) => Some(other.clone()),
                     };
                     if let Some(bound) = bound {
@@ -3047,12 +3092,13 @@ impl Type {
     /// Every Σ rule is stated in terms of this: subtyping is
     /// `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁. 𝐵₀[𝑑] <: 𝐵₁[𝑒]` and elimination is `∀ 𝑑 ∈ 𝐾. 𝐵[𝑑] <: 𝑈`
     /// (`src/ccl/design/type-inference.md`, "How a sum flows through the solver").
-    pub fn instantiate_sum(&self, candidate: &Type) -> Type {
+    pub fn instantiate_sum_in(&self, solver: &mut Solver, candidate: &Type) -> Type {
         let Some([first, ..]) = self.sum() else {
             unreachable!("instantiate_sum on a type that is not a sum: {self}")
         };
         let binder = *first.id();
-        let out = crate::ccl::subst::Subst::discharge_witness(&binder, candidate).apply_type(self);
+        let out = crate::ccl::subst::Subst::discharge_witness(&binder, candidate)
+            .apply_type_in(solver, self);
         // **The body really is instantiated.** Every Σ rule compares instantiated bodies,
         // and an occurrence surviving here would be a rule comparing `𝐵` where it states
         // `𝐵[𝑑]`. Bound and free are spelled the same, so no downstream site can tell them
@@ -3065,13 +3111,19 @@ impl Type {
         out
     }
 
+    /// [`Self::instantiate_sum_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn instantiate_sum(&self, candidate: &Type) -> Type {
+        self.instantiate_sum_in(&mut Solver::none(), candidate)
+    }
+
     /// This sum **under fresh binders**, its occurrences renamed with them.
     ///
     /// What instantiating a scheme owes a sum: a scheme binds its witnesses, so each
     /// instantiation needs its own or every use names the ones the scheme wrote — and
     /// `box`'s scheme is a single sum, so sharing it would make every `box` in a program
     /// name one witness.
-    pub fn alpha_convert_sum(&self) -> Type {
+    pub fn alpha_convert_sum(&self, solver: &mut Solver) -> Type {
         let Some(ws) = self.sum() else {
             return self.clone();
         };
@@ -3085,7 +3137,7 @@ impl Type {
             .fold(crate::ccl::subst::Subst::id(), |acc, (old, new)| {
                 acc.extended_witness_rename(old.id(), new.id())
             });
-        let mut out = renames.apply_type(self);
+        let mut out = renames.apply_type_in(solver, self);
         let Type::Fun { fun_kind, .. } = &mut out else {
             unreachable!("a sum is a function")
         };
@@ -3268,7 +3320,7 @@ fn show_binders() -> bool {
 /// reference as its bare index — see [`symbolic::PiBinderEnv`].
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_type(f, self, None)
+        fmt_type(&mut Solver::detached(), f, self, None)
     }
 }
 
@@ -3284,7 +3336,7 @@ pub(crate) struct TypeUnder<'a, 'b>(
 
 impl fmt::Display for TypeUnder<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_type(f, self.0, self.1)
+        fmt_type(&mut Solver::detached(), f, self.0, self.1)
     }
 }
 
@@ -3294,6 +3346,7 @@ impl fmt::Display for TypeUnder<'_, '_> {
 /// as a de Bruijn index (`src/ccl/design/type-inference.md`, "Display opens
 /// what it descended through").
 fn fmt_type(
+    solver: &mut Solver,
     f: &mut fmt::Formatter<'_>,
     ty: &Type,
     binders: Option<&symbolic::PiBinderEnv<'_>>,
@@ -3345,8 +3398,12 @@ fn fmt_type(
             let cod = at(codomain, Some(&inner));
             let dom = at(domain, binders);
             match binder.spelled() {
-                Some(x) => write!(f, "(({x}: {dom}) {} {cod}{capabilities})", fun_kind.arrow()),
-                None => write!(f, "({dom} {} {cod}{capabilities})", fun_kind.arrow()),
+                Some(x) => write!(
+                    f,
+                    "(({x}: {dom}) {} {cod}{capabilities})",
+                    fun_kind.arrow(solver)
+                ),
+                None => write!(f, "({dom} {} {cod}{capabilities})", fun_kind.arrow(solver)),
             }
         }
         Type::Tuple(ts) => {
@@ -3459,6 +3516,7 @@ fn fmt_type(
         // requests, two `_#0`s are the same one.
         Type::SharedHole(id) => write!(f, "_#{id}"),
         Type::Infer(var) => write!(f, "?{}", var.uid),
+        Type::Undetermined(id) => write!(f, "?{}", id.0),
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
         Type::Param(param) => write!(f, "{}", param.spelling),
@@ -3550,7 +3608,7 @@ fn fmt_type(
                 "forall ({}) {}{}",
                 params.join(", "),
                 at(&body, binders),
-                crate::ccl::capabilities::clauses(requires, &capabilities)
+                crate::ccl::capabilities::clauses(solver, requires, &capabilities)
             )
         }
         Type::Txn => write!(f, "Txn"),
@@ -3665,17 +3723,27 @@ impl Type {
     /// tuple has one spelling, each component's references to binders around the
     /// tuple lowered past the components before it (`src/ccl/design/type-inference.md`,
     /// "Representation").
+    pub fn dep_tuple_in(
+        solver: &mut Solver,
+        components: Vec<(Option<crate::ccl::Name>, Self)>,
+    ) -> Self {
+        Self::dep_tuple_with_ids(solver, components, crate::ccl::Ids::Fresh)
+    }
+
+    /// [`Self::dep_tuple_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
     pub fn dep_tuple(components: Vec<(Option<crate::ccl::Name>, Self)>) -> Self {
-        Self::dep_tuple_with_ids(components, crate::ccl::Ids::Fresh)
+        Self::dep_tuple_in(&mut Solver::none(), components)
     }
 
     /// [`Type::dep_tuple`], the terms its closing copies copied as `ids` says.
     pub(crate) fn dep_tuple_with_ids(
+        solver: &mut Solver,
         mut components: Vec<(Option<crate::ccl::Name>, Self)>,
         ids: crate::ccl::Ids,
     ) -> Self {
-        crate::ccl::subst::close_tuple_components(&mut components, ids);
-        Self::closed_dep_tuple(components, ids)
+        crate::ccl::subst::close_tuple_components(solver, &mut components, ids);
+        Self::closed_dep_tuple(solver, components, ids)
     }
 
     /// [`Type::dep_tuple`] of components already closed, each reading the components before
@@ -3683,6 +3751,7 @@ impl Type {
     /// tuple's components can leave it. Nothing is closed by name, so a free name spelled like
     /// a component stays free.
     pub fn closed_dep_tuple(
+        solver: &mut Solver,
         components: Vec<(Option<crate::ccl::Name>, Self)>,
         ids: crate::ccl::Ids,
     ) -> Self {
@@ -3693,7 +3762,9 @@ impl Type {
         if dependent {
             Type::DepTuple(components)
         } else {
-            Type::tuple(crate::ccl::subst::tuple_of_components(components, ids))
+            Type::tuple(crate::ccl::subst::tuple_of_components(
+                solver, components, ids,
+            ))
         }
     }
 
@@ -3711,8 +3782,9 @@ impl Type {
     /// product type: a `Tuple`'s element, or a dependent tuple's component opened
     /// at `tuple.0 … tuple.(index − 1)`, outermost first. `project` builds the
     /// projection term `tuple.𝑗` with the type it is given, for the opening.
-    pub fn component_type(
+    pub fn component_type_in(
         &self,
+        solver: &mut Solver,
         index: usize,
         project: impl Fn(usize, &Type) -> TypedExpr,
     ) -> Option<Type> {
@@ -3721,6 +3793,7 @@ impl Type {
             Type::DepTuple(cs) => {
                 cs.get(index)?;
                 crate::ccl::subst::open_tuple_components(
+                    solver,
                     &cs[..=index],
                     |j, earlier| {
                         crate::ccl::subst::Mapping::Discharge(Rc::new(project(j, earlier)))
@@ -3753,6 +3826,16 @@ impl Type {
             result,
             FunKind::Compute,
         ))
+    }
+
+    /// [`Self::component_type_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn component_type(
+        &self,
+        index: usize,
+        project: impl Fn(usize, &Type) -> TypedExpr,
+    ) -> Option<Type> {
+        self.component_type_in(&mut Solver::none(), index, project)
     }
 
     /// The named product of `fields` — a [`Type::Record`], or
@@ -3843,8 +3926,19 @@ impl Type {
     /// constructed function never carries a free name for its own binder and
     /// two α-variant function types are structurally identical. See
     /// `src/ccl/design/type-inference.md`, "Where the conversions run".
+    pub fn pi_in(
+        solver: &mut Solver,
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+    ) -> Self {
+        Type::pi_kinded_in(solver, name, domain, codomain, FunKind::Compute)
+    }
+
+    /// [`Self::pi_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
-        Type::pi_kinded(name, domain, codomain, FunKind::Compute)
+        Self::pi_in(&mut Solver::none(), name, domain, codomain)
     }
 
     /// [`Type::pi`] at an explicit kind, for a rebuild that carries the `FunKind`
@@ -3854,17 +3948,37 @@ impl Type {
     /// Closes its codomain exactly as [`Type::pi`] does — the kind is the only
     /// difference, and reaching for a bare [`Type::Fun`] literal to get it is what
     /// leaves a free binder name in a stored type.
+    pub fn pi_kinded_in(
+        solver: &mut Solver,
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+        fun_kind: FunKind,
+    ) -> Self {
+        Self::pi_kinded_with_ids(
+            solver,
+            name,
+            domain,
+            codomain,
+            fun_kind,
+            crate::ccl::Ids::Fresh,
+        )
+    }
+
+    /// [`Self::pi_kinded_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
     pub fn pi_kinded(
         name: impl Into<crate::ccl::Name>,
         domain: Self,
         codomain: Self,
         fun_kind: FunKind,
     ) -> Self {
-        Self::pi_kinded_with_ids(name, domain, codomain, fun_kind, crate::ccl::Ids::Fresh)
+        Self::pi_kinded_in(&mut Solver::none(), name, domain, codomain, fun_kind)
     }
 
     /// [`Type::pi_kinded`], the terms its closing copies copied as `ids` says.
     pub(crate) fn pi_kinded_with_ids(
+        solver: &mut Solver,
         name: impl Into<crate::ccl::Name>,
         domain: Self,
         codomain: Self,
@@ -3872,7 +3986,7 @@ impl Type {
         ids: crate::ccl::Ids,
     ) -> Self {
         let name = name.into();
-        let codomain = crate::ccl::subst::close_pi_binder(&name, &codomain, ids);
+        let codomain = crate::ccl::subst::close_pi_binder(solver, &name, &codomain, ids);
         Type::Fun {
             binder: FunBinder::Whole(name),
             fun_kind,
@@ -3932,7 +4046,8 @@ impl Type {
     /// A plain function over a codomain that reads its binder leaves the reference unbound
     /// in a stored type, so a rebuild whose codomain may read the binder states it through
     /// this rather than choosing between [`Type::pi_kinded`] and a plain [`Type::Fun`].
-    pub fn fun_over(
+    pub fn fun_over_in(
+        solver: &mut Solver,
         binder: impl Into<crate::ccl::Name>,
         domain: Self,
         codomain: Self,
@@ -3940,7 +4055,7 @@ impl Type {
     ) -> Self {
         let binder = binder.into();
         if crate::ccl::subst::codomain_depends_on(&binder, &codomain) {
-            Type::pi_kinded(binder, domain, codomain, fun_kind)
+            Type::pi_kinded_in(solver, binder, domain, codomain, fun_kind)
         } else {
             Type::Fun {
                 binder: FunBinder::None,
@@ -4002,8 +4117,12 @@ impl Type {
         } else {
             binder.unread()
         };
-        let codomain =
-            crate::ccl::subst::close_at_binder(&binder, &codomain, crate::ccl::Ids::Fresh);
+        let codomain = crate::ccl::subst::close_at_binder(
+            &mut Solver::none(),
+            &binder,
+            &codomain,
+            crate::ccl::Ids::Fresh,
+        );
         Type::Fun {
             binder,
             fun_kind,
@@ -4013,21 +4132,33 @@ impl Type {
         }
     }
 
+    /// [`Self::fun_over_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn fun_over(
+        binder: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+        fun_kind: FunKind,
+    ) -> Self {
+        Self::fun_over_in(&mut Solver::none(), binder, domain, codomain, fun_kind)
+    }
+
     /// The family `\\𝑘₀: 𝐾₀, … -> body` ([`Type::Family`]), closing the body's references
     /// to the binders by name into indices, as [`Type::pi`] closes a codomain.
-    pub fn family(binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {
-        Self::family_with_ids(binders, body, crate::ccl::Ids::Fresh)
+    pub fn family(solver: &mut Solver, binders: Vec<(crate::ccl::Name, Self)>, body: Self) -> Self {
+        Self::family_with_ids(solver, binders, body, crate::ccl::Ids::Fresh)
     }
 
     /// [`Type::family`], the terms its closing copies copied as `ids` says.
     pub(crate) fn family_with_ids(
+        solver: &mut Solver,
         binders: Vec<(crate::ccl::Name, Self)>,
         body: Self,
         ids: crate::ccl::Ids,
     ) -> Self {
         let names: Vec<Option<crate::ccl::Name>> =
             binders.iter().map(|(n, _)| Some(n.clone())).collect();
-        let body = crate::ccl::subst::close_pi_binders(&names, &body, ids);
+        let body = crate::ccl::subst::close_pi_binders(solver, &names, &body, ids);
         Type::Family {
             binders: binders.into_iter().map(|(n, t)| (Some(n), t)).collect(),
             body: Box::new(body),
@@ -4065,13 +4196,14 @@ impl Type {
     /// A history whose value at position `key` may read `key`: the function
     /// `(key : domain) ⤇ value`, closed over `key` as [`Type::pi_kinded`] closes.
     pub fn history_keyed(
+        solver: &mut Solver,
         key: impl Into<crate::ccl::Name>,
         domain: Self,
         value: Self,
         history_kind: HistoryKind,
     ) -> Self {
         Self::history_over(
-            Type::pi_kinded(key, domain, value, FunKind::Data(None)),
+            Type::pi_kinded_in(solver, key, domain, value, FunKind::Data(None)),
             history_kind,
         )
     }
@@ -4135,11 +4267,11 @@ impl Type {
 
     /// A **consumer's** collection function: data by construction, polymorphic in the
     /// slot ([`FunKind::fresh_data`]) so a plain collection and a sum satisfy it alike.
-    pub fn consumer_fun(domain: Self, codomain: Self) -> Self {
+    pub fn consumer_fun(solver: &mut Solver, domain: Self, codomain: Self) -> Self {
         let fun_kind = FunKind::fresh_data();
         // The parts sit under the binders the kind may come to have.
-        InferVar::place_parts_under(&domain, &fun_kind);
-        InferVar::place_parts_under(&codomain, &fun_kind);
+        InferVar::place_parts_under(solver, &domain, &fun_kind);
+        InferVar::place_parts_under(solver, &codomain, &fun_kind);
         Type::Fun {
             binder: FunBinder::None,
             fun_kind,
@@ -4161,9 +4293,9 @@ impl Type {
     ///
     /// The domain and codomain still come from `rebuilt`, so a genuine disagreement about
     /// either survives whatever comparison follows.
-    pub fn sum_like(exemplar: &Type, rebuilt: Type) -> Type {
+    pub fn sum_like(solver: &mut Solver, exemplar: &Type, rebuilt: Type) -> Type {
         match (exemplar.sum(), rebuilt.domain(), rebuilt.codomain()) {
-            (Some(_), Some(d), Some(c)) => Type::fun_like(exemplar, d, c),
+            (Some(_), Some(d), Some(c)) => Type::fun_like_in(solver, exemplar, d, c),
             _ => rebuilt,
         }
     }
@@ -4188,7 +4320,7 @@ impl Type {
     /// witness — dropping that binder is the same silent loss as flipping the kind, and
     /// it is worse, because the rebuilt domain is usually the witness itself and a
     /// `WitnessRef` outside its binder means nothing at all.
-    pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
+    pub fn fun_like_in(solver: &mut Solver, exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
             Type::Fun {
                 binder,
@@ -4203,8 +4335,12 @@ impl Type {
                 // its codomain from node types, which reference the binder by
                 // name. Idempotent on a codomain extracted from a closed
                 // function — its references are already indices.
-                let codomain =
-                    crate::ccl::subst::close_at_binder(binder, &codomain, crate::ccl::Ids::Fresh);
+                let codomain = crate::ccl::subst::close_at_binder(
+                    solver,
+                    binder,
+                    &codomain,
+                    crate::ccl::Ids::Fresh,
+                );
                 Type::Fun {
                     binder: binder.clone(),
                     fun_kind: fun_kind.clone(),
@@ -4219,6 +4355,12 @@ impl Type {
             } => Type::data_fun(domain, codomain),
             _ => Type::fun(domain, codomain),
         }
+    }
+
+    /// [`Self::fun_like_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
+        Self::fun_like_in(&mut Solver::none(), exemplar, domain, codomain)
     }
 
     /// Is this a type inference has yet to determine — a [`Type::Hole`] placeholder
@@ -4236,11 +4378,16 @@ impl Type {
     /// The rebuilding passes set a result type only where concrete type information
     /// is available, leaving `Hole` for inference to fill rather than committing to a
     /// type built from one.
-    pub fn fun_like_or_hole(exemplar: &Type, domain: &Type, codomain: &Type) -> Self {
+    pub fn fun_like_or_hole(
+        solver: &mut Solver,
+        exemplar: &Type,
+        domain: &Type,
+        codomain: &Type,
+    ) -> Self {
         if domain.is_unresolved() || codomain.is_unresolved() {
             Type::Hole
         } else {
-            Type::fun_like(exemplar, domain.clone(), codomain.clone())
+            Type::fun_like_in(solver, exemplar, domain.clone(), codomain.clone())
         }
     }
 
@@ -4371,7 +4518,7 @@ impl Type {
     pub fn fun_kind_of(&self) -> Option<FunKind> {
         match self.peel_refinements() {
             Type::Fun { fun_kind, .. } => Some(fun_kind.clone()),
-            Type::Infer(v) => Some(FunKind::Var(Rc::clone(&v.fun_kind))),
+            Type::Infer(v) => Some(FunKind::Var(Rc::clone(v.fun_kind()))),
             _ => None,
         }
     }
@@ -4396,11 +4543,17 @@ impl Type {
     /// (`src/ccl/design/nominal-types.md`, "After inference"). Only the head is replaced:
     /// a nominal type inside the representation is read through again where a walk reaches
     /// it.
-    pub fn structure(&self) -> Cow<'_, Type> {
+    pub fn structure_in(&self, solver: &mut Solver) -> Cow<'_, Type> {
         match self {
-            Type::Nominal(decl, args) => Cow::Owned(decl.representation(args)),
+            Type::Nominal(decl, args) => Cow::Owned(decl.representation(solver, args)),
             _ => Cow::Borrowed(self),
         }
+    }
+
+    /// [`Self::structure_in`] outside every typing run, through
+    /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+    pub fn structure(&self) -> Cow<'_, Type> {
+        self.structure_in(&mut Solver::none())
     }
 
     /// Whether a [`Type::Nominal`] occurs anywhere in this type.
@@ -4599,8 +4752,9 @@ impl Type {
     ///
     /// The binder is **freshly minted**: two annotation sites are two binding sites and the
     /// closure check is a lookup by uid.
-    pub fn full_map_of(key: Type, value: Type) -> Self {
-        Type::pi_kinded(
+    pub fn full_map_of(solver: &mut Solver, key: Type, value: Type) -> Self {
+        Type::pi_kinded_in(
+            solver,
             crate::ccl::Name::fresh("__map_k"),
             key,
             value,
@@ -4906,6 +5060,7 @@ impl Type {
             | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
+            | Type::Undetermined(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
             | Type::WitnessProjection(_)
@@ -4922,8 +5077,8 @@ impl Type {
     /// output), or to provide an unannotated parameter type that inference
     /// will fill in.
     #[cfg(test)]
-    pub fn infer() -> Self {
-        Type::Infer(InferVar::fresh(0))
+    pub fn infer(solver: &mut Solver) -> Self {
+        Type::Infer(InferVar::fresh(solver, 0))
     }
 
     /// Does this type hold a position nothing has resolved yet?
@@ -5026,6 +5181,7 @@ impl Type {
             | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
+            | Type::Undetermined(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
             | Type::WitnessProjection(_)
@@ -5103,6 +5259,7 @@ impl Type {
             | Type::BarrierVar(_)
             | Type::Infer(_)
             | Type::DataSource(_)
+            | Type::Undetermined(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
             | Type::WitnessProjection(_)
@@ -5253,9 +5410,36 @@ pub struct Refinement {
 
 /// A [`Refinement`]'s normal form, computed the first time the refinement is compared or
 /// hashed. It holds the predicate `Rc` it was computed for, and a refinement whose predicate
-/// was re-pointed since computes it again.
+/// was re-pointed since computes it again; and whether the normal form is the same in every
+/// run ([`crate::ccl::ccl_utils::normal_form_detached`]).
 #[derive(Clone, Default)]
-struct NormalFormCache(RefCell<Option<(Rc<TypedExpr>, Rc<TypedExpr>)>>);
+struct NormalFormCache(RefCell<Option<CachedNormal>>);
+
+#[derive(Clone)]
+struct CachedNormal {
+    of: Rc<TypedExpr>,
+    normal: Rc<TypedExpr>,
+    in_every_run: bool,
+}
+
+impl NormalFormCache {
+    /// `term`'s normal form, and whether it is the same in every run.
+    fn get(&self, term: &Rc<TypedExpr>) -> (Rc<TypedExpr>, bool) {
+        if let Some(cached) = &*self.0.borrow()
+            && Rc::ptr_eq(&cached.of, term)
+        {
+            return (Rc::clone(&cached.normal), cached.in_every_run);
+        }
+        let (normal, in_every_run) = ccl_utils::normal_form_detached(term);
+        let normal = Rc::new(normal);
+        *self.0.borrow_mut() = Some(CachedNormal {
+            of: Rc::clone(term),
+            normal: Rc::clone(&normal),
+            in_every_run,
+        });
+        (normal, in_every_run)
+    }
+}
 
 impl fmt::Debug for Refinement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -5268,14 +5452,14 @@ impl fmt::Debug for Refinement {
 impl Refinement {
     /// The predicate's normal form ([`crate::ccl::ccl_utils::normal_form`]).
     pub(crate) fn normal(&self) -> Rc<TypedExpr> {
-        if let Some((for_predicate, normal)) = &*self.normal.0.borrow()
-            && Rc::ptr_eq(for_predicate, &self.predicate)
-        {
-            return Rc::clone(normal);
-        }
-        let normal = Rc::new(ccl_utils::normal_form(&self.predicate));
-        *self.normal.0.borrow_mut() = Some((Rc::clone(&self.predicate), Rc::clone(&normal)));
-        normal
+        self.normal.get(&self.predicate).0
+    }
+
+    /// [`Self::normal`] where it is the same in every run, so a reader of its type slots may take
+    /// it in any.
+    pub(crate) fn normal_in_every_run(&self) -> Option<Rc<TypedExpr>> {
+        let (normal, in_every_run) = self.normal.get(&self.predicate);
+        in_every_run.then_some(normal)
     }
 }
 
@@ -5308,14 +5492,7 @@ impl WitnessProjection {
 
     /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
     pub(crate) fn normal(&self) -> Rc<TypedExpr> {
-        if let Some((for_term, normal)) = &*self.normal.0.borrow()
-            && Rc::ptr_eq(for_term, &self.term)
-        {
-            return Rc::clone(normal);
-        }
-        let normal = Rc::new(ccl_utils::normal_form(&self.term));
-        *self.normal.0.borrow_mut() = Some((Rc::clone(&self.term), Rc::clone(&normal)));
-        normal
+        self.normal.get(&self.term).0
     }
 
     /// The witness this projects, as the term's own type binds it.
@@ -5350,7 +5527,7 @@ pub fn projected_witness(term: &Rc<TypedExpr>, position: usize, witness: &Witnes
 /// The type `unbox(𝑡)` has for a term `𝑡` of the sum type `sum_ty`: the sum's body with each
 /// witness it binds replaced by its projection through `𝑡` (`src/ccl/design/collections.md`,
 /// "Projecting a sum's witness"). `None` when `sum_ty` binds no witness.
-pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
+pub fn unboxed_type_in(solver: &mut Solver, sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
     let witnesses = sum_ty.peel_refinements().sum()?.to_vec();
     Some(
         witnesses
@@ -5358,20 +5535,32 @@ pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
             .enumerate()
             .fold(sum_ty.clone(), |ty, (position, witness)| {
                 let projection = projected_witness(term, position, witness);
-                instantiate_witness(&ty, witness.id(), &projection)
+                instantiate_witness(solver, &ty, witness.id(), &projection)
             }),
     )
+}
+
+/// [`unboxed_type_in`] outside every typing run, through
+/// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
+    unboxed_type_in(&mut Solver::none(), sum_ty, term)
 }
 
 /// The type a use of [`crate::ccl::Builtin::Unbox`] stamps for an argument of type `sum_ty`:
 /// `(𝑐 : sum_ty) ⇒ unboxed_type(sum_ty, 𝑐)`, closed over its binder. `None` when `sum_ty` binds
 /// no witness. The binder's reference lives in a type, so the caller opens the provenance frame
 /// it is minted under.
-pub fn unbox_type(sum_ty: &Type) -> Option<Type> {
+pub fn unbox_type_in(solver: &mut Solver, sum_ty: &Type) -> Option<Type> {
     let boxed = crate::ccl::Name::fresh("__boxed");
     let term = Rc::new(TypedExpr::var(boxed.clone()).with_ty(sum_ty.clone()));
-    let body = unboxed_type(sum_ty, &term)?;
-    Some(Type::pi(boxed, sum_ty.clone(), body))
+    let body = unboxed_type_in(solver, sum_ty, &term)?;
+    Some(Type::pi_in(solver, boxed, sum_ty.clone(), body))
+}
+
+/// [`unbox_type_in`] outside every typing run, through
+/// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
+pub fn unbox_type(sum_ty: &Type) -> Option<Type> {
+    unbox_type_in(&mut Solver::none(), sum_ty)
 }
 
 /// The type every use of [`crate::ccl::Builtin::IntToUint`] stamps:
@@ -5379,7 +5568,7 @@ pub fn unbox_type(sum_ty: &Type) -> Option<Type> {
 ///
 /// The predicate's nodes are minted here and live in a type slot, which no fold over the term
 /// reaches, so `record` receives the predicate to record them.
-pub fn int_to_uint_type(record: impl FnOnce(&TypedExpr)) -> Type {
+pub fn int_to_uint_type(solver: &mut Solver, record: impl FnOnce(&TypedExpr)) -> Type {
     let int = Type::Base(BaseType::Int);
     let uint = Type::Base(BaseType::UInt);
     let x = crate::ccl::Name::fresh("__int");
@@ -5394,7 +5583,8 @@ pub fn int_to_uint_type(record: impl FnOnce(&TypedExpr)) -> Type {
     ));
     let predicate = TypedExpr::apply(pair, relation).with_ty(Type::Base(BaseType::Bool));
     record(&predicate);
-    Type::pi(
+    Type::pi_in(
+        solver,
         x,
         int,
         Type::refined_one(uint, Refinement::born(Rc::new(predicate))),
@@ -5594,7 +5784,12 @@ impl RefinementTemplate {
     /// # Panics
     ///
     /// If `operands` does not hold one term per operand of the operation.
-    pub fn predicate(self, result: &Type, operands: &[TypedExpr]) -> Option<TypedExpr> {
+    pub fn predicate(
+        self,
+        solver: &mut Solver,
+        result: &Type,
+        operands: &[TypedExpr],
+    ) -> Option<TypedExpr> {
         if !matches!(
             result,
             Type::Base(BaseType::Int | BaseType::UInt | BaseType::Bool)
@@ -5603,7 +5798,8 @@ impl RefinementTemplate {
         }
         // The operands move under the refinement the predicate lands in, so an element
         // reference they read free names one refinement further out.
-        let under = |t: &TypedExpr| crate::ccl::subst::shift_elems(t, 1, crate::ccl::Ids::Fresh);
+        let mut under =
+            |t: &TypedExpr| crate::ccl::subst::shift_elems(solver, t, 1, crate::ccl::Ids::Fresh);
         let operation = match (self, operands) {
             (Self::BinOp(op), [a, b]) => TypedExpr::binop(under(a), op.unrefined(), under(b)),
             (Self::UnaryOp(op), [a]) => TypedExpr::unary(op.unrefined(), under(a)),
@@ -5624,8 +5820,8 @@ impl RefinementTemplate {
 
     /// `result` refined by [`Self::predicate`], or `result` unchanged where the predicate
     /// states nothing of it.
-    pub fn refine(self, result: Type, operands: &[TypedExpr]) -> Type {
-        match self.predicate(&result, operands) {
+    pub fn refine(self, solver: &mut Solver, result: Type, operands: &[TypedExpr]) -> Type {
+        match self.predicate(solver, &result, operands) {
             Some(predicate) => Type::Refinement(
                 Box::new(result),
                 RefinementSet::one(Refinement::born(Rc::new(predicate))),
@@ -5768,7 +5964,8 @@ impl Refinement {
 
 impl PartialEq for Refinement {
     /// Two refinements match iff they carry structurally equal predicate
-    /// *terms* ([`eq_term_modulo_ty_slots`]). Structural equality makes
+    /// *terms*: [`Ord for Refinement`](#impl-Ord-for-Refinement) answers `Equal`, which is
+    /// [`eq_term_modulo_ty_slots`] of their normal forms. Structural equality makes
     /// refinement-bearing `Type`/`Expr` equality agnostic to *where* a
     /// predicate was constructed, so a `{D | p}` that join planning
     /// re-minted at a marker (`make_iterate` / `make_restrict` /
@@ -5792,29 +5989,44 @@ impl PartialEq for Refinement {
     /// around (a vacuous substitution) keeps sharing its predicate `Rc`, so
     /// the common case never compares structure.
     fn eq(&self, other: &Self) -> bool {
-        if Rc::ptr_eq(&self.predicate, &other.predicate) {
-            return true;
-        }
-        eq_term_modulo_ty_slots(&self.normal(), &other.normal())
+        self.cmp(other).is_eq()
     }
 }
 
 impl Eq for Refinement {}
 
-/// Structural equality on **terms**, ignoring their type slots, and the counterpart
-/// of [`hash_term_modulo_ty_slots`]. It compares node shape, scalar leaves
-/// (operators, builtins, literals, names, tags), binder names, and child `Expr`s
-/// pairwise, but never the embedded `Type`s (`ty` slots, annotations, binding
-/// types). Those are inference metadata, and copies of one term legitimately differ
-/// in them (freshened for a specialization, rebuilt by a discharge, pinned at
-/// different use types). So this is a structural relation chosen for its context,
+impl PartialOrd for Refinement {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Refinement {
+    /// The structural order of the predicates' normal forms ([`cmp_term_modulo_ty_slots`]),
+    /// with pointer-equal predicates equal. `dependency_order` breaks ties between
+    /// refinements by it.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if Rc::ptr_eq(&self.predicate, &other.predicate) {
+            return std::cmp::Ordering::Equal;
+        }
+        cmp_term_modulo_ty_slots(&self.normal(), &other.normal())
+    }
+}
+
+/// Structural order on **terms**, ignoring their type slots. Two terms are equal under it
+/// exactly where [`eq_term_modulo_ty_slots`] holds, and [`hash_term_modulo_ty_slots`] is its
+/// hashing counterpart. It compares node shape, scalar leaves (operators, builtins, literals,
+/// names, tags), binder names, and child `Expr`s pairwise, but never the embedded `Type`s
+/// (`ty` slots, annotations, binding types). Those are inference metadata, and copies of one
+/// term legitimately differ in them (freshened for a specialization, rebuilt by a discharge,
+/// pinned at different use types). So this is a structural relation chosen for its context,
 /// not an approximation of a finer one — there is no plan to make it a derived `==`
 /// (which would wrongly compare those slots).
 ///
-/// [`Refinement`]'s `PartialEq` asks it about predicate terms, where it is the
-/// "same restriction" relation, and `planning::groupby`'s pointful-site match asks it
-/// about two collection paths drawn from one.
-/// [`crate::ccl::subst::Subst::eq_modulo_ty_slots`] asks it about a discharge's
+/// [`Refinement`]'s `Ord` and `PartialEq` ask it about predicate terms, where equality is the
+/// "same restriction" relation and the order breaks ties in `dependency_order`.
+/// `planning::groupby`'s pointful-site match asks about two collection paths drawn from one.
+/// [`crate::ccl::subst::Subst::eq_modulo_ty_slots`] asks about a discharge's
 /// captured argument, which is *any* expression the program wrote — a function body
 /// among them. So every node a program can build needs an arm here, and the
 /// restriction that a predicate is a boolean expression over
@@ -5849,85 +6061,152 @@ impl Eq for Refinement {}
 ///
 /// Everything this distinguishes beyond [`hash_term_modulo_ty_slots`]'s
 /// stream (binder names, `Source` names, a [`TypedExprNode::MutWrite`]'s written
-/// name, record field names, pattern tags, cast-target predicates) makes eq finer
+/// name, record field names, pattern tags, cast-target predicates) makes it finer
 /// than hash, preserving the `Eq`/`Hash` contract.
-pub fn eq_term_modulo_ty_slots(a: &TypedExpr, b: &TypedExpr) -> bool {
-    eq_term_modulo_ty_slots_go(a, b, &mut Vec::new())
+///
+/// The order is a function of the two terms alone. Nodes of different shapes order by
+/// [`shape_rank`]. Within a shape, leaves order by their own order, then children left to
+/// right, and a shorter list orders before a longer one. A reference bound inside the compared
+/// terms orders by its binder's position, before every free reference, and two free references
+/// order by name. A cast target's refinement set orders by its size, then by its members sorted
+/// in this order. Two nominal declarations order by
+/// [`NominalDecl::term_order`](crate::ccl::nominal::NominalDecl::term_order).
+pub fn cmp_term_modulo_ty_slots(a: &TypedExpr, b: &TypedExpr) -> std::cmp::Ordering {
+    cmp_term_modulo_ty_slots_go(a, b, &mut Vec::new())
 }
 
-/// Binders the two sides of an [`eq_term_modulo_ty_slots`] comparison have
-/// introduced, paired and innermost last. Two references match when they
-/// resolve to the same pair, or when neither resolves and they are the same
-/// name; a reference bound on one side only never matches. `rposition` is what
-/// makes shadowing right: the innermost pair spelling a name is the one it
-/// resolves to.
-fn paired_refs_match(
+/// Whether `a` and `b` are structurally equal with their type slots skipped:
+/// [`cmp_term_modulo_ty_slots`] answers `Equal`.
+pub fn eq_term_modulo_ty_slots(a: &TypedExpr, b: &TypedExpr) -> bool {
+    cmp_term_modulo_ty_slots(a, b).is_eq()
+}
+
+/// Binders the two sides of a [`cmp_term_modulo_ty_slots`] comparison have
+/// introduced, paired and innermost last. A reference that resolves to a pair orders by
+/// that pair's position, and before a reference that resolves to none. Two references that
+/// resolve to none order by name. `rposition` is what makes shadowing right: the innermost
+/// pair spelling a name is the one it resolves to.
+fn cmp_paired_refs(
     pairs: &[(crate::ccl::Name, crate::ccl::Name)],
     x: &crate::ccl::Name,
     y: &crate::ccl::Name,
-) -> bool {
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Greater, Less};
     match (
         pairs.iter().rposition(|(l, _)| l == x),
         pairs.iter().rposition(|(_, r)| r == y),
     ) {
-        (Some(i), Some(j)) => i == j,
-        (None, None) => x == y,
-        _ => false,
+        (Some(i), Some(j)) => i.cmp(&j),
+        (None, None) => x.cmp(y),
+        (Some(_), None) => Less,
+        (None, Some(_)) => Greater,
     }
 }
 
-/// Compare `a` and `b` with `(l, r)` paired over them, restoring `pairs` before
-/// returning — the binder scopes over these children and nothing after them.
-fn eq_under_binder(
+/// The first of `orders` that is not `Equal`, or `Equal`. `orders` runs lazily, so the
+/// comparison stops at the first child that decides it.
+fn first_unequal(mut orders: impl Iterator<Item = std::cmp::Ordering>) -> std::cmp::Ordering {
+    orders
+        .find(|order| order.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Compare `xs` and `ys` pairwise, a shorter list before a longer one.
+fn cmp_term_lists(
+    xs: &[TypedExpr],
+    ys: &[TypedExpr],
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+) -> std::cmp::Ordering {
+    xs.len().cmp(&ys.len()).then_with(|| {
+        first_unequal(
+            xs.iter()
+                .zip(ys)
+                .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, pairs)),
+        )
+    })
+}
+
+/// Compare two optional children, an absent one before a present one.
+fn cmp_optional_terms(
+    x: Option<&TypedExpr>,
+    y: Option<&TypedExpr>,
+    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match (x, y) {
+        (None, None) => Equal,
+        (None, Some(_)) => Less,
+        (Some(_), None) => Greater,
+        (Some(x), Some(y)) => cmp_term_modulo_ty_slots_go(x, y, pairs),
+    }
+}
+
+/// Compare `children` pairwise with `(l, r)` paired over them, restoring `pairs` before
+/// returning: the binder scopes over these children and nothing after them.
+fn cmp_under_binder(
     pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
     l: &crate::ccl::Name,
     r: &crate::ccl::Name,
     children: &[(&TypedExpr, &TypedExpr)],
-) -> bool {
+) -> std::cmp::Ordering {
     pairs.push((l.clone(), r.clone()));
-    let matched = children
-        .iter()
-        .all(|(x, y)| eq_term_modulo_ty_slots_go(x, y, pairs));
+    let order = first_unequal(
+        children
+            .iter()
+            .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, pairs)),
+    );
     pairs.pop();
-    matched
+    order
 }
 
 /// Compare two cast targets' domain-refinement predicates term-wise (see
-/// [`eq_term_modulo_ty_slots`]). Pointer-equal predicates short-circuit;
-/// otherwise the comparison recurses structurally (acyclic terms, so it
-/// terminates without a cycle guard).
-fn eq_cast_target_predicates(
+/// [`cmp_term_modulo_ty_slots`]): a target with none before one with some, then by the
+/// number of predicates, then by the predicates of each sorted in this order.
+///
+/// Each set is sorted **under the enclosing pairing**: a nested predicate may reference a
+/// binder the outer predicate introduced (a comprehension inside a filter), and that
+/// reference resolves by position like any other, so the comparison cannot start a fresh
+/// pairing the way `RefinementSet`'s own `PartialEq` does. A side sorts under the pairing of
+/// its own binders with themselves, which orders its members as the other side's
+/// counterparts order. Equal sorted lists are then exactly equal sets. Members compare by
+/// normal form, as every predicate does (`src/ccl/design/type-inference.md`, "Predicates are
+/// compared by normal form"). The mutual recursion terminates on tree shape: predicates are
+/// acyclic `Rc<TypedExpr>`s, so a cast target cannot contain the term comparing it.
+fn cmp_cast_target_predicates(
     t1: &Type,
     t2: &Type,
     pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
-) -> bool {
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
     match (
         ccl_utils::cast_target_refinement(t1),
         ccl_utils::cast_target_refinement(t2),
     ) {
-        (None, None) => true,
-        // Set equality, whose member comparison is `Refinement`'s own, run
-        // **under the enclosing pairing**: a nested predicate may reference a
-        // binder the outer predicate introduced (a comprehension inside a
-        // filter), and that reference resolves by position like any other, so
-        // the comparison cannot start a fresh pairing the way
-        // `RefinementSet`'s own `PartialEq` does. Deduplicated on both sides
-        // ([`RefinementSet::insert`]), so equal cardinality plus one-way
-        // containment is mutual containment — the same argument that impl
-        // makes. The mutual recursion terminates on tree shape: predicates are
-        // acyclic `Rc<TypedExpr>`s, so a cast target cannot contain the term
-        // comparing it. Members compare by normal form, as every predicate does
-        // (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
-        (Some(s1), Some(s2)) => {
-            s1.len() == s2.len()
-                && s1.iter().all(|r1| {
-                    s2.iter().any(|r2| {
-                        Rc::ptr_eq(&r1.predicate, &r2.predicate)
-                            || eq_term_modulo_ty_slots_go(&r1.normal(), &r2.normal(), pairs)
-                    })
-                })
-        }
-        _ => false,
+        (None, None) => Equal,
+        (None, Some(_)) => Less,
+        (Some(_), None) => Greater,
+        (Some(s1), Some(s2)) => s1.len().cmp(&s2.len()).then_with(|| {
+            let sorted =
+                |set: &RefinementSet, mut own: Vec<(crate::ccl::Name, crate::ccl::Name)>| {
+                    let mut normals: Vec<Rc<TypedExpr>> =
+                        set.iter().map(Refinement::normal).collect();
+                    normals.sort_by(|x, y| cmp_term_modulo_ty_slots_go(x, y, &mut own));
+                    normals
+                };
+            let left = sorted(
+                &s1,
+                pairs.iter().map(|(l, _)| (l.clone(), l.clone())).collect(),
+            );
+            let right = sorted(
+                &s2,
+                pairs.iter().map(|(_, r)| (r.clone(), r.clone())).collect(),
+            );
+            first_unequal(
+                left.iter()
+                    .zip(&right)
+                    .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, pairs)),
+            )
+        }),
     }
 }
 
@@ -6010,8 +6289,13 @@ pub fn free_witness_refs(ty: &Type, in_scope: &[WitnessId]) -> Vec<WitnessId> {
 /// occurrences with no binder to strip. A slot may equally still hold the **whole sum**,
 /// which this opens at `candidate` rather than walking through
 /// ([`WitnessMapping::Discharge`](crate::ccl::subst::WitnessMapping::Discharge)).
-pub fn instantiate_witness(ty: &Type, binder: &WitnessId, candidate: &Type) -> Type {
-    crate::ccl::subst::Subst::discharge_witness(binder, candidate).apply_type(ty)
+pub fn instantiate_witness(
+    solver: &mut Solver,
+    ty: &Type,
+    binder: &WitnessId,
+    candidate: &Type,
+) -> Type {
+    crate::ccl::subst::Subst::discharge_witness(binder, candidate).apply_type_in(solver, ty)
 }
 
 /// Whether `ty` mentions `binder` anywhere. Binder ids are globally unique, so any
@@ -6023,87 +6307,167 @@ pub(crate) fn mentions_witness(ty: &Type, binder: &WitnessId) -> bool {
 /// A renaming of witness references, applied by [`Type::rename_witnesses`].
 pub type WitnessRenaming = std::collections::BTreeMap<WitnessId, WitnessId>;
 
-/// Whether [`eq_term_modulo_ty_slots_go`] has an arm for this node's shape.
+/// The order [`cmp_term_modulo_ty_slots`] gives nodes of different shapes.
 ///
 /// Exhaustive, with no `_`: a variant added to [`TypedExprNode`] stops this compiling,
-/// which is the signal to give it an arm. Without that, a new variant reaches the
-/// pairwise match's catch-all and two copies of it compare unequal — a run-time failure
-/// where the type system can give a compile-time one, and the way a variant goes missing.
-fn eq_has_arm(node: &TypedExprNode) -> bool {
+/// which is the signal to give it a rank and an arm in [`cmp_term_modulo_ty_slots_go`].
+fn shape_rank(node: &TypedExprNode) -> u8 {
     use TypedExprNode as N;
     match node {
-        // A refinement predicate is assembled from already-lowered terms, so a
-        // comprehension never reaches one as a `Comprehension` node.
-        N::Comprehension { .. } => unreachable!("a Comprehension reached a refinement predicate"),
-        N::DefGroup { .. } => unreachable!("a DefGroup reached a refinement predicate"),
-        N::Lit(_)
-        | N::Var(_)
-        | N::Builtin(_)
-        | N::Apply { .. }
-        | N::Cast { .. }
-        | N::BinOp { .. }
-        | N::UnaryOp(..)
-        | N::Borrow(_)
-        | N::Lambda { .. }
-        | N::Aggregate { .. }
-        | N::Let { .. }
-        | N::List(_)
-        | N::Case { .. }
-        | N::Raise { .. }
-        | N::Try { .. }
-        | N::VariantCtor { .. }
-        | N::NominalCtor { .. }
-        | N::Method { .. }
-        | N::TraitFn { .. }
-        | N::For { .. }
-        | N::MutDecl { .. }
-        | N::MutWrite { .. }
-        | N::Tuple(_)
-        | N::Arguments(_)
-        | N::Proj(_)
-        | N::Record(_)
-        | N::Source(..)
-        | N::Compose(_)
-        | N::Copair(_)
-        | N::DisjointJoin(_)
-        | N::Realized { .. }
-        | N::ExprStmt { .. }
-        | N::Feed { .. }
-        | N::Define { .. }
-        | N::Defer
-        | N::Abstract
-        | N::Begin { .. }
-        | N::LoadFrom(_)
-        | N::Reading(_)
-        | N::Error => true,
-        // The two shapes a term this walk compares never holds; the catch-all says why.
-        N::LetRec { .. } | N::Transact { .. } | N::LetType { .. } | N::Run { .. } => false,
+        N::Lit(_) => 0,
+        N::Var(_) => 1,
+        N::Builtin(_) => 2,
+        N::Apply { .. } => 3,
+        N::Cast { .. } => 4,
+        N::BinOp { .. } => 5,
+        N::UnaryOp(..) => 6,
+        N::Borrow(_) => 7,
+        N::Lambda { .. } => 8,
+        N::Aggregate { .. } => 9,
+        N::Let { .. } => 10,
+        N::List(_) => 11,
+        N::Case { .. } => 12,
+        N::Raise { .. } => 13,
+        N::Try { .. } => 14,
+        N::VariantCtor { .. } => 15,
+        N::NominalCtor { .. } => 16,
+        N::Method { .. } => 17,
+        N::TraitFn { .. } => 18,
+        N::For { .. } => 19,
+        N::MutDecl { .. } => 20,
+        N::MutWrite { .. } => 21,
+        N::Tuple(_) => 22,
+        N::Arguments(_) => 23,
+        N::Proj(_) => 24,
+        N::Record(_) => 25,
+        N::Source(..) => 26,
+        N::Compose(_) => 27,
+        N::Copair(_) => 28,
+        N::DisjointJoin(_) => 29,
+        N::Realized { .. } => 30,
+        N::ExprStmt { .. } => 31,
+        N::Feed { .. } => 32,
+        N::Define { .. } => 33,
+        N::Defer => 34,
+        N::Abstract => 35,
+        N::Begin { .. } => 36,
+        N::LoadFrom(_) => 37,
+        N::Reading(_) => 38,
+        N::Error => 39,
+        // The shapes no term this walk compares holds. They have a rank, so a comparison
+        // with another shape is answered, and no arm, so two of one shape panic.
+        N::Comprehension { .. } => 40,
+        N::DefGroup { .. } => 41,
+        N::LetRec { .. } => 42,
+        N::Transact { .. } => 43,
+        N::LetType { .. } => 44,
+        N::Run { .. } => 45,
     }
 }
 
-/// Recursive worker for [`eq_term_modulo_ty_slots`].
-fn eq_term_modulo_ty_slots_go(
+/// The order [`cmp_term_modulo_ty_slots`] gives builtins: by variant, then by payload. A
+/// constructor's declaration orders by
+/// [`NominalDecl::term_order`](crate::ccl::nominal::NominalDecl::term_order),
+/// since a nominal type has no order of its own. Exhaustive like [`shape_rank`].
+fn cmp_builtins(a: &crate::ccl::Builtin, b: &crate::ccl::Builtin) -> std::cmp::Ordering {
+    use crate::ccl::Builtin as B;
+    fn rank(builtin: &B) -> u8 {
+        match builtin {
+            B::Id => 0,
+            B::Box => 1,
+            B::Unbox => 2,
+            B::EmptyMap => 3,
+            B::Curry => 4,
+            B::CurryOver => 5,
+            B::StrengthOver => 6,
+            B::Const => 7,
+            B::Zip => 8,
+            B::Apply => 9,
+            B::Map => 10,
+            B::MapDomain => 11,
+            B::Compose => 12,
+            B::Converse => 13,
+            B::Uncurry(_) => 14,
+            B::Restrict => 15,
+            B::Iterate => 16,
+            B::PermuteDomain => 17,
+            B::FlattenDomain => 18,
+            B::BinOp(_) => 19,
+            B::Neg => 20,
+            B::NotFn => 21,
+            B::FilterValues => 22,
+            B::Sum => 23,
+            B::Max => 24,
+            B::Min => 25,
+            B::Drain => 26,
+            B::Sole => 27,
+            B::FinalOrDefault => 28,
+            B::GetPrevSeq => 29,
+            B::GetPrevTxn => 30,
+            B::BeginTxn => 31,
+            B::AwaitFinal => 32,
+            B::Copair => 33,
+            B::FinalRead => 34,
+            B::VariantProject(_) => 35,
+            B::VariantWrap(_) => 36,
+            B::CollectionContains => 37,
+            B::LookupChecked => 38,
+            B::Insert => 39,
+            B::VariantIs(_) => 40,
+            B::IntToUint => 41,
+            B::IntEqUint => 42,
+            B::Reading(_) => 43,
+            B::CtorIs(_) => 44,
+            B::CtorPayload(_) => 45,
+        }
+    }
+    match (a, b) {
+        (B::Uncurry(x), B::Uncurry(y)) => x.cmp(y),
+        (B::BinOp(x), B::BinOp(y)) => x.cmp(y),
+        (B::VariantProject(x), B::VariantProject(y))
+        | (B::VariantWrap(x), B::VariantWrap(y))
+        | (B::VariantIs(x), B::VariantIs(y)) => x.cmp(y),
+        (B::Reading(x), B::Reading(y)) => x.cmp(y),
+        (B::CtorIs(x), B::CtorIs(y)) | (B::CtorPayload(x), B::CtorPayload(y)) => {
+            x.decl.term_order(&y.decl).then_with(|| x.ctor.cmp(&y.ctor))
+        }
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// The order [`cmp_term_modulo_ty_slots`] gives two branch heads: a tag before a
+/// constructor, tags by label, and constructors by
+/// [`NominalDecl::term_order`](crate::ccl::nominal::NominalDecl::term_order)
+/// then name.
+fn cmp_pattern_heads(
+    a: &crate::ccl::expr::PatternHead,
+    b: &crate::ccl::expr::PatternHead,
+) -> std::cmp::Ordering {
+    use crate::ccl::expr::PatternHead as H;
+    use std::cmp::Ordering::{Greater, Less};
+    match (a, b) {
+        (H::Tag(x), H::Tag(y)) => x.cmp(y),
+        (H::Constructor { decl: d1, ctor: c1 }, H::Constructor { decl: d2, ctor: c2 }) => {
+            d1.term_order(d2).then_with(|| c1.cmp(c2))
+        }
+        (H::Tag(_), H::Constructor { .. }) => Less,
+        (H::Constructor { .. }, H::Tag(_)) => Greater,
+    }
+}
+
+/// Recursive worker for [`cmp_term_modulo_ty_slots`].
+fn cmp_term_modulo_ty_slots_go(
     a: &TypedExpr,
     b: &TypedExpr,
     pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
-) -> bool {
+) -> std::cmp::Ordering {
     use TypedExprNode as N;
-    fn all_eq(
-        xs: &[TypedExpr],
-        ys: &[TypedExpr],
-        pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
-    ) -> bool {
-        xs.len() == ys.len()
-            && xs
-                .iter()
-                .zip(ys)
-                .all(|(x, y)| eq_term_modulo_ty_slots_go(x, y, pairs))
-    }
+    use std::cmp::Ordering::Equal;
     match (&a.node, &b.node) {
-        (N::Lit(x), N::Lit(y)) => x == y,
-        (N::Var(x), N::Var(y)) => paired_refs_match(pairs, x, y),
-        (N::Borrow(x), N::Borrow(y)) => eq_term_modulo_ty_slots_go(x, y, pairs),
-        (N::Builtin(x), N::Builtin(y)) => x == y,
+        (N::Lit(x), N::Lit(y)) => x.cmp(y),
+        (N::Var(x), N::Var(y)) => cmp_paired_refs(pairs, x, y),
+        (N::Borrow(x), N::Borrow(y)) => cmp_term_modulo_ty_slots_go(x, y, pairs),
+        (N::Builtin(x), N::Builtin(y)) => cmp_builtins(x, y),
         (
             N::TraitFn {
                 trait_: t1,
@@ -6115,17 +6479,17 @@ fn eq_term_modulo_ty_slots_go(
                 function: f2,
                 ..
             },
-        ) => t1 == t2 && f1 == f2,
-        (N::Proj(x), N::Proj(y)) => x == y,
-        (N::Source(x, p), N::Source(y, q)) => x == y && p == q,
+        ) => t1.cmp(t2).then_with(|| f1.cmp(f2)),
+        (N::Proj(x), N::Proj(y)) => x.cmp(y),
+        (N::Source(x, p), N::Source(y, q)) => x.cmp(y).then_with(|| p.cmp(q)),
         // A `LoadFrom` name is not a reference to a binder the compared term introduces:
         // it addresses a variable the *retired* version declared, so it is that source's
         // own spelling and compares as one (`src/ccl/scope.rs`, where it is a leaf rather
         // than a `VarRef`). Resolving it through the pairing would equate two spellings
         // that name different predecessors' variables.
-        (N::LoadFrom(x), N::LoadFrom(y)) => x == y,
-        (N::Reading(x), N::Reading(y)) => x == y,
-        (N::Defer, N::Defer) | (N::Abstract, N::Abstract) | (N::Error, N::Error) => true,
+        (N::LoadFrom(x), N::LoadFrom(y)) => x.cmp(y),
+        (N::Reading(x), N::Reading(y)) => x.cmp(y),
+        (N::Defer, N::Defer) | (N::Abstract, N::Abstract) | (N::Error, N::Error) => Equal,
         (
             N::Apply {
                 function: f1,
@@ -6135,7 +6499,8 @@ fn eq_term_modulo_ty_slots_go(
                 function: f2,
                 argument: a2,
             },
-        ) => eq_term_modulo_ty_slots_go(f1, f2, pairs) && eq_term_modulo_ty_slots_go(a1, a2, pairs),
+        ) => cmp_term_modulo_ty_slots_go(f1, f2, pairs)
+            .then_with(|| cmp_term_modulo_ty_slots_go(a1, a2, pairs)),
         (
             N::Cast {
                 value: v1,
@@ -6145,7 +6510,8 @@ fn eq_term_modulo_ty_slots_go(
                 value: v2,
                 target: t2,
             },
-        ) => eq_term_modulo_ty_slots_go(v1, v2, pairs) && eq_cast_target_predicates(t1, t2, pairs),
+        ) => cmp_term_modulo_ty_slots_go(v1, v2, pairs)
+            .then_with(|| cmp_cast_target_predicates(t1, t2, pairs)),
         (
             N::BinOp {
                 left: l1,
@@ -6157,14 +6523,13 @@ fn eq_term_modulo_ty_slots_go(
                 op: o2,
                 right: r2,
             },
-        ) => {
-            o1 == o2
-                && eq_term_modulo_ty_slots_go(l1, l2, pairs)
-                && eq_term_modulo_ty_slots_go(r1, r2, pairs)
-        }
-        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => {
-            k1 == k2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)
-        }
+        ) => o1
+            .cmp(o2)
+            .then_with(|| cmp_term_modulo_ty_slots_go(l1, l2, pairs))
+            .then_with(|| cmp_term_modulo_ty_slots_go(r1, r2, pairs)),
+        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => k1
+            .cmp(k2)
+            .then_with(|| cmp_term_modulo_ty_slots_go(e1, e2, pairs)),
         (
             N::Lambda {
                 params: p1,
@@ -6177,19 +6542,17 @@ fn eq_term_modulo_ty_slots_go(
             // A lambda's parameters are binders the predicate introduces: pair
             // them in order and compare the bodies under the pairing, so the bodies'
             // references to them match by position.
-        ) => {
-            p1.len() == p2.len() && {
-                let base = pairs.len();
-                pairs.extend(
-                    p1.iter()
-                        .zip(p2)
-                        .map(|(a, b)| (a.name.clone(), b.name.clone())),
-                );
-                let matched = eq_term_modulo_ty_slots_go(b1, b2, pairs);
-                pairs.truncate(base);
-                matched
-            }
-        }
+        ) => p1.len().cmp(&p2.len()).then_with(|| {
+            let base = pairs.len();
+            pairs.extend(
+                p1.iter()
+                    .zip(p2)
+                    .map(|(a, b)| (a.name.clone(), b.name.clone())),
+            );
+            let order = cmp_term_modulo_ty_slots_go(b1, b2, pairs);
+            pairs.truncate(base);
+            order
+        }),
         (
             N::Aggregate {
                 input: i1,
@@ -6199,7 +6562,9 @@ fn eq_term_modulo_ty_slots_go(
                 input: i2,
                 kind: k2,
             },
-        ) => k1 == k2 && eq_term_modulo_ty_slots_go(i1, i2, pairs),
+        ) => k1
+            .cmp(k2)
+            .then_with(|| cmp_term_modulo_ty_slots_go(i1, i2, pairs)),
         // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
         // `body`.
         (
@@ -6225,10 +6590,8 @@ fn eq_term_modulo_ty_slots_go(
                 init: e2,
                 body: b2,
             },
-        ) => {
-            eq_term_modulo_ty_slots_go(e1, e2, pairs)
-                && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
-        }
+        ) => cmp_term_modulo_ty_slots_go(e1, e2, pairs)
+            .then_with(|| cmp_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])),
         (
             N::For {
                 position: p1,
@@ -6244,14 +6607,12 @@ fn eq_term_modulo_ty_slots_go(
             },
             // The source is evaluated outside the loop; the position and target are bound over
             // the body.
-        ) => {
-            eq_term_modulo_ty_slots_go(it1, it2, pairs) && {
-                pairs.push(((**p1).clone(), (**p2).clone()));
-                let equal = eq_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)]);
-                pairs.pop();
-                equal
-            }
-        }
+        ) => cmp_term_modulo_ty_slots_go(it1, it2, pairs).then_with(|| {
+            pairs.push(((**p1).clone(), (**p2).clone()));
+            let order = cmp_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)]);
+            pairs.pop();
+            order
+        }),
         (
             N::MutWrite {
                 name_occurrence: _,
@@ -6267,15 +6628,9 @@ fn eq_term_modulo_ty_slots_go(
             },
             // The written name is a *use* of the binder the introduction made, so it
             // resolves through the pairing exactly as a `Feed`/`Define` name does.
-        ) => {
-            paired_refs_match(pairs, n1, n2)
-                && match (k1, k2) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => eq_term_modulo_ty_slots_go(x, y, pairs),
-                    _ => false,
-                }
-                && eq_term_modulo_ty_slots_go(v1, v2, pairs)
-        }
+        ) => cmp_paired_refs(pairs, n1, n2)
+            .then_with(|| cmp_optional_terms(k1.as_deref(), k2.as_deref(), pairs))
+            .then_with(|| cmp_term_modulo_ty_slots_go(v1, v2, pairs)),
         (
             N::Begin {
                 body: b1,
@@ -6285,14 +6640,16 @@ fn eq_term_modulo_ty_slots_go(
                 body: b2,
                 commits_on: c2,
             },
-        ) => c1 == c2 && eq_term_modulo_ty_slots_go(b1, b2, pairs),
+        ) => c1
+            .cmp(c2)
+            .then_with(|| cmp_term_modulo_ty_slots_go(b1, b2, pairs)),
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Arguments(x), N::Arguments(y))
         | (N::Compose(x), N::Compose(y))
         | (N::Copair(x), N::Copair(y))
         | (N::DisjointJoin(x), N::DisjointJoin(y))
-        | (N::Realized { legs: x, .. }, N::Realized { legs: y, .. }) => all_eq(x, y, pairs),
+        | (N::Realized { legs: x, .. }, N::Realized { legs: y, .. }) => cmp_term_lists(x, y, pairs),
         (
             N::Case {
                 scrutinee: s1,
@@ -6304,39 +6661,32 @@ fn eq_term_modulo_ty_slots_go(
                 branches: br2,
                 refuted: r2,
             },
-        ) => {
-            let scrutinee_eq = match (s1, s2) {
-                (None, None) => true,
-                (Some(x), Some(y)) => eq_term_modulo_ty_slots_go(x, y, pairs),
-                _ => false,
-            };
-            scrutinee_eq
-                && r1 == r2
-                && br1.len() == br2.len()
-                && br1
-                    .iter()
-                    .zip(br2)
-                    .all(|(x, y)| match (&x.pattern, &y.pattern) {
+        ) => cmp_optional_terms(s1.as_deref(), s2.as_deref(), pairs)
+            .then_with(|| r1.cmp(r2))
+            .then_with(|| br1.len().cmp(&br2.len()))
+            .then_with(|| {
+                first_unequal(br1.iter().zip(br2).map(|(x, y)| {
+                    use std::cmp::Ordering::{Greater, Less};
+                    match (&x.pattern, &y.pattern) {
                         // A payload binder scopes over the guard and the body
                         // both, so both compare under the pairing.
-                        (Some(p), Some(q)) => {
-                            p.head == q.head
-                                && eq_under_binder(
-                                    pairs,
-                                    &p.binding.name,
-                                    &q.binding.name,
-                                    &[(&x.guard, &y.guard), (&x.body, &y.body)],
-                                )
-                        }
-                        (None, None) => {
-                            eq_term_modulo_ty_slots_go(&x.guard, &y.guard, pairs)
-                                && eq_term_modulo_ty_slots_go(&x.body, &y.body, pairs)
-                        }
-                        _ => false,
-                    })
-        }
+                        (Some(p), Some(q)) => cmp_pattern_heads(&p.head, &q.head).then_with(|| {
+                            cmp_under_binder(
+                                pairs,
+                                &p.binding.name,
+                                &q.binding.name,
+                                &[(&x.guard, &y.guard), (&x.body, &y.body)],
+                            )
+                        }),
+                        (None, None) => cmp_term_modulo_ty_slots_go(&x.guard, &y.guard, pairs)
+                            .then_with(|| cmp_term_modulo_ty_slots_go(&x.body, &y.body, pairs)),
+                        (None, Some(_)) => Less,
+                        (Some(_), None) => Greater,
+                    }
+                }))
+            }),
         (N::Raise { value: v1 }, N::Raise { value: v2 }) => {
-            eq_term_modulo_ty_slots_go(v1, v2, pairs)
+            cmp_term_modulo_ty_slots_go(v1, v2, pairs)
         }
         // Each clause binds its exception in its body; which type it catches is a type slot.
         (
@@ -6348,18 +6698,18 @@ fn eq_term_modulo_ty_slots_go(
                 body: b2,
                 handlers: h2,
             },
-        ) => {
-            eq_term_modulo_ty_slots_go(b1, b2, pairs)
-                && h1.len() == h2.len()
-                && h1.iter().zip(h2).all(|(x, y)| {
-                    eq_under_binder(
+        ) => cmp_term_modulo_ty_slots_go(b1, b2, pairs)
+            .then_with(|| h1.len().cmp(&h2.len()))
+            .then_with(|| {
+                first_unequal(h1.iter().zip(h2).map(|(x, y)| {
+                    cmp_under_binder(
                         pairs,
                         &x.binding.name,
                         &y.binding.name,
                         &[(&x.body, &y.body)],
                     )
-                })
-        }
+                }))
+            }),
         (
             N::VariantCtor {
                 tag_occurrence: _,
@@ -6371,7 +6721,9 @@ fn eq_term_modulo_ty_slots_go(
                 tag: t2,
                 payload: p2,
             },
-        ) => t1 == t2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
+        ) => t1
+            .cmp(t2)
+            .then_with(|| cmp_term_modulo_ty_slots_go(p1, p2, pairs)),
         (
             N::NominalCtor {
                 decl: d1,
@@ -6383,7 +6735,10 @@ fn eq_term_modulo_ty_slots_go(
                 ctor: c2,
                 payload: p2,
             },
-        ) => d1 == d2 && c1 == c2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
+        ) => d1
+            .term_order(d2)
+            .then_with(|| c1.cmp(c2))
+            .then_with(|| cmp_term_modulo_ty_slots_go(p1, p2, pairs)),
         (
             N::Method {
                 name: m1,
@@ -6397,25 +6752,29 @@ fn eq_term_modulo_ty_slots_go(
                 candidates: c2,
                 deferred: d2,
             },
-        ) => {
-            m1 == m2
-                && a1 == a2
-                && d1 == d2
-                && c1.len() == c2.len()
-                && c1.iter().zip(c2).all(|(x, y)| {
-                    x.decl == y.decl
-                        && x.params == y.params
-                        && eq_term_modulo_ty_slots_go(&x.function, &y.function, pairs)
-                })
-        }
-        (N::Record(f1), N::Record(f2)) => {
-            f1.len() == f2.len()
-                && f1.iter().zip(f2).all(|(x, y)| {
-                    x.label == y.label && eq_term_modulo_ty_slots_go(&x.value, &y.value, pairs)
-                })
-        }
+        ) => m1
+            .cmp(m2)
+            .then_with(|| a1.cmp(a2))
+            .then_with(|| d1.as_ref().map(|d| d.uid).cmp(&d2.as_ref().map(|d| d.uid)))
+            .then_with(|| c1.len().cmp(&c2.len()))
+            .then_with(|| {
+                first_unequal(c1.iter().zip(c2).map(|(x, y)| {
+                    x.decl
+                        .term_order(&y.decl)
+                        .then_with(|| x.params.cmp(&y.params))
+                        .then_with(|| cmp_term_modulo_ty_slots_go(&x.function, &y.function, pairs))
+                }))
+            }),
+        (N::Record(f1), N::Record(f2)) => f1.len().cmp(&f2.len()).then_with(|| {
+            first_unequal(f1.iter().zip(f2).map(|(x, y)| {
+                x.label
+                    .cmp(&y.label)
+                    .then_with(|| cmp_term_modulo_ty_slots_go(&x.value, &y.value, pairs))
+            }))
+        }),
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
-            eq_term_modulo_ty_slots_go(e1, e2, pairs) && eq_term_modulo_ty_slots_go(b1, b2, pairs)
+            cmp_term_modulo_ty_slots_go(e1, e2, pairs)
+                .then_with(|| cmp_term_modulo_ty_slots_go(b1, b2, pairs))
         }
         (
             N::Feed {
@@ -6444,33 +6803,25 @@ fn eq_term_modulo_ty_slots_go(
             },
             // A `Feed`/`Define` name is a *use* of the binder that introduced
             // the place (`ccl::scope`), so it resolves like any reference.
-        ) => paired_refs_match(pairs, n1, n2) && eq_term_modulo_ty_slots_go(v1, v2, pairs),
+        ) => {
+            cmp_paired_refs(pairs, n1, n2).then_with(|| cmp_term_modulo_ty_slots_go(v1, v2, pairs))
+        }
         _ => {
-            // **A missing arm is not "unequal", it is unanswered.** Falling through with
-            // two nodes of the *same* shape means this function has no rule for that
-            // shape, and reporting `false` makes a term compare unequal to a structural
-            // copy of itself — reflexivity, quietly lost. It surfaces far away as a type
-            // mismatch whose two sides print identically, since a predicate is the one
-            // part of a type `Display` does not show.
-            //
-            // `LetRec` and `Transact` are the shapes deliberately left out. A
-            // predicate never acquires one: the phases that mint them do not rewrite
-            // inside a predicate (`debug_assert_predicate_shape`). Neither does a
-            // discharge's captured argument, taken during inference, before those
-            // phases run. One reaching here is a violation of that boundary rather
-            // than a missing arm.
-            debug_assert!(
-                std::mem::discriminant(&a.node) != std::mem::discriminant(&b.node),
-                "two nodes of one shape compared unequal, so a rebuilt term no longer \
-                 equals itself: {:?} is {}",
+            // Two nodes of one shape that reach here are a shape with no arm, which has no
+            // order, and answering one would make a term compare unequal to a structural
+            // copy of itself. `LetRec`, `Transact`, `LetType`, `Run`, `Comprehension` and
+            // `DefGroup` are the shapes left out. A predicate never acquires one: the phases
+            // that mint them do not rewrite inside a predicate
+            // (`debug_assert_predicate_shape`). Neither does a discharge's captured argument,
+            // taken during inference, before those phases run.
+            let (x, y) = (shape_rank(&a.node), shape_rank(&b.node));
+            assert_ne!(
+                x,
+                y,
+                "two nodes of shape {:?} compared, which no term this walk compares holds",
                 std::mem::discriminant(&a.node),
-                if eq_has_arm(&a.node) {
-                    "handled above, so the arm did not match what it claims to"
-                } else {
-                    "a shape a predicate must not hold"
-                },
             );
-            false
+            x.cmp(&y)
         }
     }
 }
@@ -6604,7 +6955,7 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
 }
 
 /// Hash `children` with `binder` in scope, restoring `scope` afterwards — the
-/// hashing counterpart of [`eq_under_binder`]. The binder's own name is not
+/// hashing counterpart of [`cmp_under_binder`]. The binder's own name is not
 /// hashed: `eq` compares it by position too, so hashing it would make the hash
 /// finer than `eq` for no gain.
 fn hash_under_binder<H: std::hash::Hasher>(
@@ -6940,12 +7291,12 @@ impl RefinementSet {
 ///
 /// **The first compilation stamps the order.** The three sites that need an order (the
 /// `restrict` chain, the predicates compiled for it, and the check that re-derives both) run
-/// at different points of the pipeline, and compiling a predicate rewrites its rendered term.
-/// `dependency_order` breaks ties on rendered predicates, but planning's
+/// at different points of the pipeline, and compiling a predicate rewrites its term.
+/// `dependency_order` breaks ties by the predicates' structural order, but planning's
 /// `compile_refinements` types each predicate at its stage type, so a compiled predicate
 /// carries every refinement applied before it in its own types, and the tie becomes a
 /// dependency. Every site after the first compilation recovers that order from the
-/// dependencies, whatever the predicates render to. See `src/ccl/design/type-inference.md`,
+/// dependencies, whatever the compiled terms are. See `src/ccl/design/type-inference.md`,
 /// "Materializing a refinement set is a pipeline, and a pipeline is ordered".
 ///
 /// Nothing in the type system may read that order back: [`RefinementSet`]'s equality is
@@ -6966,8 +7317,9 @@ pub fn application_order<'a>(
 
 /// `refinements`, with each one placed after any it reads a value already narrowed by.
 ///
-/// Most pairs are independent and are ordered by their rendered predicates, so the answer
-/// is a function of the set's members and not of how they accumulated. Some are not: the
+/// Most pairs are independent and are ordered by their predicates' structural order
+/// ([`Ord for Refinement`](Refinement#impl-Ord-for-Refinement)), so the answer is a function
+/// of the set's members and not of how they accumulated. Some are not: the
 /// outer filter of `[y for y in [x for x in xs if p] if q]` reads the `p`-filtered
 /// collection, so `q`'s predicate carries `{𝐷 | p}` in its own types and `q` cannot be
 /// applied to elements `p` has not yet removed. That is the program's nesting rather than
@@ -7003,12 +7355,10 @@ fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
     // physical order carries no meaning, so letting it decide between two *independent*
     // predicates makes the compiled term a function of how the refinements accumulated —
     // which is exactly what `CAMBRA_REFINEMENT_ORDER=reverse` exists to catch. Sorting
-    // first makes the selection below pick the content-smallest ready member, so the
-    // dependency constraint decides where it applies and the rendering decides the rest.
-    //
-    // `sort_by_cached_key`, not `sort_by_key`: rendering a predicate walks its whole term
-    // tree and allocates, and `sort_by_key` recomputes the key at every comparison.
-    remaining.sort_by_cached_key(|r| symbolic::symbolic(&r.predicate));
+    // first makes the selection below pick the least ready member in the structural order,
+    // so the dependency constraint decides where it applies and the structural order decides
+    // the rest.
+    remaining.sort();
     let mut ordered = Vec::with_capacity(remaining.len());
     while !remaining.is_empty() {
         // The first whose dependencies are all placed. A cycle is unrepresentable — a
@@ -7150,52 +7500,58 @@ mod tests {
 
     #[test]
     fn cached_witness_positions_read_new_names_edges_and_copies() {
-        let a = FunKindVar::fresh();
-        let b = FunKindVar::fresh();
-        a.record(FunKind::Var(Rc::clone(&b)), true);
+        let solver = &mut Solver::new();
+        let a = FunKindVar::fresh(solver);
+        let b = FunKindVar::fresh(solver);
+        a.record(solver, FunKind::Var(Rc::clone(&b)), true);
         let absent = *Witness::mint(TypeKind::UIntRanges).id();
-        assert_eq!(a.binder_position(&absent), None);
-        let first = b.binder_id_at(0);
-        assert_eq!(a.binder_position(&first), Some(0));
+        assert_eq!(a.binder_position(solver, &absent), None);
+        let first = b.binder_id_at(solver, 0);
+        assert_eq!(a.binder_position(solver, &first), Some(0));
 
-        let c = FunKindVar::fresh();
-        let second = c.binder_id_at(1);
-        assert_eq!(a.binder_position(&second), None);
-        b.record(FunKind::Var(Rc::clone(&c)), false);
-        assert_eq!(a.binder_position(&second), Some(1));
+        let c = FunKindVar::fresh(solver);
+        let second = c.binder_id_at(solver, 1);
+        assert_eq!(a.binder_position(solver, &second), None);
+        b.record(solver, FunKind::Var(Rc::clone(&c)), false);
+        assert_eq!(a.binder_position(solver, &second), Some(1));
 
-        let original = FunKindVar::fresh();
-        let third = original.binder_id_at(2);
-        assert_eq!(a.binder_position(&third), None);
-        c.copied_from(&original);
-        assert_eq!(a.binder_position(&third), Some(2));
+        let original = FunKindVar::fresh(solver);
+        let third = original.binder_id_at(solver, 2);
+        assert_eq!(a.binder_position(solver, &third), None);
+        c.copied_from(solver, &original);
+        assert_eq!(a.binder_position(solver, &third), Some(2));
 
         let bound = Witness::mint(TypeKind::UIntRanges);
-        assert_eq!(a.binder_position(bound.id()), None);
-        c.record(FunKind::Data(Some(vec![bound.clone()].into())), true);
-        assert_eq!(a.binder_position(bound.id()), Some(0));
+        assert_eq!(a.binder_position(solver, bound.id()), None);
+        c.record(
+            solver,
+            FunKind::Data(Some(vec![bound.clone()].into())),
+            true,
+        );
+        assert_eq!(a.binder_position(solver, bound.id()), Some(0));
     }
 
     #[test]
     fn a_cached_kind_component_reads_new_binders_and_edges() {
-        let a = FunKindVar::fresh();
-        let b = FunKindVar::fresh();
-        a.record(FunKind::Var(Rc::clone(&b)), true);
-        assert!(a.component_binder_ids().is_empty());
+        let solver = &mut Solver::new();
+        let a = FunKindVar::fresh(solver);
+        let b = FunKindVar::fresh(solver);
+        a.record(solver, FunKind::Var(Rc::clone(&b)), true);
+        assert!(a.component_binder_ids(solver).is_empty());
 
-        let first = b.binder_id_at(0);
-        assert_eq!(a.component_binder_ids(), vec![first]);
+        let first = b.binder_id_at(solver, 0);
+        assert_eq!(a.component_binder_ids(solver), vec![first]);
 
-        let c = FunKindVar::fresh();
-        let second = c.binder_id_at(0);
-        b.record(FunKind::Var(Rc::clone(&c)), true);
-        assert!(a.same_component(&c));
-        assert_eq!(a.component_binder_ids(), vec![first, second]);
+        let c = FunKindVar::fresh(solver);
+        let second = c.binder_id_at(solver, 0);
+        b.record(solver, FunKind::Var(Rc::clone(&c)), true);
+        assert!(a.same_component(solver, &c));
+        assert_eq!(a.component_binder_ids(solver), vec![first, second]);
 
-        let original = FunKindVar::fresh();
-        let third = original.binder_id_at(0);
-        c.copied_from(&original);
-        assert_eq!(a.component_binder_ids(), vec![first, second, third]);
+        let original = FunKindVar::fresh(solver);
+        let third = original.binder_id_at(solver, 0);
+        c.copied_from(solver, &original);
+        assert_eq!(a.component_binder_ids(solver), vec![first, second, third]);
     }
     use crate::ccl::Annotation;
     use crate::ccl::Duplicate;
@@ -7206,11 +7562,13 @@ mod tests {
     /// `groupby`'s key predicate is such an operand.
     #[test]
     fn an_operator_predicate_shifts_the_elements_its_operands_read() {
+        let solver = &mut Solver::new();
         let int = Type::Base(BaseType::Int);
         let add = RefinementTemplate::BinOp(BinOpKind::Arithmetic(
             crate::ccl::ArithmeticKind::AddRefined,
         ));
         let refined = add.refine(
+            solver,
             int.clone(),
             &[
                 TypedExpr::var(Name::elem()).with_ty(int.clone()),
@@ -7301,6 +7659,7 @@ mod tests {
     /// denotes nothing, so every later comparison reads it as a concrete leaf.
     #[test]
     fn fun_like_rebuilds_under_a_sum_exemplar() {
+        let solver = &mut Solver::new();
         let int = Type::Base(BaseType::Int);
         let exemplar = Type::sum_over(
             TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
@@ -7308,7 +7667,8 @@ mod tests {
             int.clone(),
         );
         let ex = exemplar.sum().expect("built as a sum")[0].clone();
-        let rebuilt = Type::fun_like(
+        let rebuilt = Type::fun_like_in(
+            solver,
             &exemplar,
             Type::WitnessRef(*ex.id()),
             Type::Base(BaseType::Bool),
@@ -7633,7 +7993,7 @@ mod tests {
     /// A reference the binder captures is not a free reference that happens to
     /// share its spelling. `λ p → p > 1` and `λ q → p > 1` pair `p` with `q`, so
     /// the left `p` resolves to the binder while the right `p` resolves outside
-    /// it — [`paired_refs_match`]'s mixed arm, and the one that makes the
+    /// it — [`cmp_paired_refs`]'s mixed arms, and the one that makes the
     /// relation *sound* rather than merely coarse: equating these would let a
     /// refinement mentioning an enclosing binder be deduped against one that
     /// binds the name itself, capturing the free reference.
@@ -7757,18 +8117,19 @@ mod tests {
     /// only this pins their invalidation.
     #[test]
     fn a_resolved_kind_follows_a_later_write_to_a_kind_it_reaches() {
-        let reaching = || {
-            let (k1, k2) = (FunKindVar::fresh(), FunKindVar::fresh());
-            k1.record(FunKind::Var(Rc::clone(&k2)), true);
-            assert_eq!(k1.resolved(), KindPin::Unpinned);
+        let solver = &mut Solver::new();
+        let reaching = |solver: &mut Solver| {
+            let (k1, k2) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
+            k1.record(solver, FunKind::Var(Rc::clone(&k2)), true);
+            assert_eq!(k1.resolved_in(solver), KindPin::Unpinned);
             (k1, k2)
         };
-        let (k1, k2) = reaching();
-        k2.stamp_data();
-        assert_eq!(k1.resolved(), KindPin::Data);
-        let (k1, k2) = reaching();
-        k2.contributes_first(FunKind::Data(None));
-        assert_eq!(k1.resolved(), KindPin::Plain);
+        let (k1, k2) = reaching(solver);
+        k2.stamp_data(solver);
+        assert_eq!(k1.resolved_in(solver), KindPin::Data);
+        let (k1, k2) = reaching(solver);
+        k2.contributes_first(solver, FunKind::Data(None));
+        assert_eq!(k1.resolved_in(solver), KindPin::Plain);
     }
 
     /// Two predicates that each contain a [`TypedExprNode::Cast`] and differ
@@ -8135,6 +8496,7 @@ mod tests {
     /// both cases, which is what the assertion on the term checks.
     #[test]
     fn a_dependent_arrow_renders_its_binder_by_name() {
+        let solver = &mut Solver::new();
         let k = Name::raw("k");
         let refined = Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
@@ -8145,7 +8507,7 @@ mod tests {
             )))
             .into(),
         );
-        let ty = Type::pi(k.clone(), Type::Base(BaseType::Int), refined);
+        let ty = Type::pi_in(solver, k.clone(), Type::Base(BaseType::Int), refined);
         assert_eq!(ty.to_string(), "((k: Int) ⇒ {Int | __elem == k})");
 
         // Detached from the function, the reference still reads as the binder —
@@ -8243,12 +8605,13 @@ mod witness_identity_tests {
     /// halves moved together.
     #[test]
     fn alpha_convert_moves_the_body_with_the_binder() {
+        let solver = &mut Solver::new();
         let sum = Type::sum_over(
             TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
             None,
             Type::Base(BaseType::Int),
         );
-        let converted = sum.alpha_convert_sum();
+        let converted = sum.alpha_convert_sum(solver);
         let old = &sum.sum().expect("a sum")[0];
         let new = converted.sum().expect("a sum")[0].clone();
         assert_ne!(old.id().clone(), new.id().clone(), "a fresh binder");
@@ -8291,13 +8654,14 @@ mod witness_subst_tests {
     /// rebuild it around a body that no longer mentions its witness.
     #[test]
     fn instantiating_a_sum_at_its_own_binder_opens_it() {
+        let solver = &mut Solver::new();
         let elem = Type::Base(BaseType::Int);
         let whole = sum(TypeKind::Enumerated(vec![range(2)]), |w| {
             Type::data_fun(Type::WitnessRef(*w.id()), elem.clone())
         });
         let binder = whole.sum().expect("a sum")[0].id();
         assert_eq!(
-            instantiate_witness(&whole, binder, &range(2)),
+            instantiate_witness(solver, &whole, binder, &range(2)),
             Type::data_fun(range(2), elem),
             "the sum is opened at the candidate, not rebuilt around it"
         );
@@ -8307,11 +8671,12 @@ mod witness_subst_tests {
     /// residue — untouched.
     #[test]
     fn an_arrow_body_instantiates_only_its_domain() {
+        let solver = &mut Solver::new();
         let s = sum(TypeKind::UIntRanges, |w| {
             Type::data_fun(Type::WitnessRef(*w.id()), Type::Base(BaseType::Int))
         });
         assert_eq!(
-            s.instantiate_sum(&range(2)),
+            s.instantiate_sum_in(solver, &range(2)),
             Type::data_fun(range(2), Type::Base(BaseType::Int))
         );
     }
@@ -8378,6 +8743,7 @@ mod witness_subst_tests {
     /// deeply the inner sum sits, and would hold even if it did not nest at all.
     #[test]
     fn a_nested_sums_body_is_not_captured() {
+        let solver = &mut Solver::new();
         let inner = sum(TypeKind::UIntRanges, |w| {
             Type::data_fun(Type::WitnessRef(*w.id()), Type::Base(BaseType::Int))
         });
@@ -8385,7 +8751,7 @@ mod witness_subst_tests {
             Type::data_fun(Type::WitnessRef(*w.id()), inner.clone())
         });
         assert_eq!(
-            outer.instantiate_sum(&range(1)),
+            outer.instantiate_sum_in(solver, &range(1)),
             Type::data_fun(range(1), inner.clone()),
             "the outer binder is substituted; the inner sum's domain is untouched"
         );
@@ -8396,6 +8762,7 @@ mod witness_subst_tests {
     /// while the inner sum's own body is untouched in the same pass.
     #[test]
     fn a_nested_sums_candidates_are_in_the_outer_scope() {
+        let solver = &mut Solver::new();
         let outer_witness = Witness::mint(TypeKind::Enumerated(vec![range(4)]));
         let inner = sum(
             TypeKind::Enumerated(vec![Type::WitnessRef(*outer_witness.id())]),
@@ -8403,7 +8770,7 @@ mod witness_subst_tests {
         );
         let inner_binder = *inner.sum().expect("a sum")[0].id();
         let outer = Type::sum_binding(outer_witness, inner);
-        let got = outer.instantiate_sum(&range(4));
+        let got = outer.instantiate_sum_in(solver, &range(4));
         let Some([w]) = got.sum() else {
             panic!("instantiating the outer binder keeps the inner sum, got {got}");
         };

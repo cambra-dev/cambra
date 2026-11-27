@@ -335,15 +335,15 @@ which its writes still constrain.
 After any emission error, the run stops before the operand-requirement sweep and Pass 2. The graph
 holds the constraints a failed statement recorded before its rule failed, and lacks the rest, so
 neither pass can read it: an obligation a failed constraint emptied is no requirement the program
-states, and a variable only the failed statement would have bound is no gap in it. Inference
-instead starts over (`run_with_params`), in a restarted arena, on a copy of the tree as it was
-before emission (`clone_preserving_ids`), in which the expression of each statement recovered from
-is the `Error` stand-in: a `let`'s right-hand side, an expression statement's expression, a `:=`'s
-initializer, a `def` group member's definition. A statement rule types a stand-in as it types a
-failed expression, without reporting it (`Typing::stand_in`): the `let` retains its annotation's
-constraints or binds at a poison, and the `:=` at its declared history. Coalesce does not descend
-into a stand-in. The graph of the second run holds exactly the constraints of the statements that
-typed.
+states, and a variable only the failed statement would have bound is no gap in it. Inference instead
+starts over (`run_with_params`), with a solver of its own and a restarted arena, on a copy of the
+tree as it was before emission (`clone_preserving_ids`), in which the expression of each statement
+recovered from is the `Error` stand-in: a `let`'s right-hand side, an expression statement's
+expression, a `:=`'s initializer, a `def` group member's definition. A statement rule types a
+stand-in as it types a failed expression, without reporting it (`Typing::stand_in`): the `let`
+retains its annotation's constraints or binds at a poison, and the `:=` at its declared history.
+Coalesce does not descend into a stand-in. The graph of the second run holds exactly the constraints
+of the statements that typed.
 
 The two checks that read the whole graph before coalesce stop a run too, each after reporting every
 failure it finds: the barrier check and the [operand-requirement
@@ -1535,7 +1535,7 @@ does.
 
 Normalizing is term-level: it leaves type slots as they are and mints no node identity, so an
 equality can run it. A consumer that reads a predicate as a term rather than comparing it, the SMT
-encoder, takes the normal form as well (`ccl_utils::normal_refinement`).
+encoder, takes the normal form as well (`ccl_utils::normal_refinement_in`).
 
 #### Cast targets and inferred views
 
@@ -1675,40 +1675,99 @@ The Boolean is not a general slot-allocation change report. A cache hit can redi
 to an earlier result and still returns `false`. On a miss, the result combines the callback's
 flag with revision changes during that callback.
 
-### 3.2 The `InferArena`: who owns inference variables
+### 3.2 The solver: who owns inference variables
 
-Inference-variable bounds can form strong-reference cycles. Recording a same-level
-`α <: β` adds `β` to `α`'s upper bounds, not an immediate reciprocal bound on `β`;
-other constraints or recursive bounds can still complete a cycle. Removing variables from the
-expression tree does not break the references between their bound cells.
+Each inference run owns a `Solver` (`infer/solver/state.rs`), which holds what the run records on
+its variables. `run_once` creates the run's solver. A typing run of its own creates another:
+`case_result_ty`, and each check in `infer/check.rs`.
 
-`InferArena` in `infer/api.rs` owns the teardown of each inference run. Its thread-local
-capture records a strong handle to every variable minted while the arena is active.
-The type itself carries the variable handle. The arena keeps these handles in allocation order
-for cleanup and indexes their positions by variable id. Compaction can then recover the variable
-behind a recorded id without scanning the whole run's allocation list at each compact position.
+An inference, funkind or barrier variable is a handle: `InferVar`, `FunKindVar`, `BarrierVar` ([One
+solver variable](#one-solver-variable)). The handle holds what is fixed when the variable is minted:
+its identity, its telescope, its sort's own part, and its home, which is the solver that minted it
+and the variable's slot in that solver's tables. What the run learns is the state at that slot: an
+inference variable's bounds, trait watches and suspensions, a funkind variable's facts, and a
+barrier variable's bounds. A function that records takes `&mut Solver`, and so does one that
+resolves a type, which records as it compacts: a suspension, a funkind variable's binder ids, a
+memoized answer. A read that records nothing takes `&Solver`.
 
-On drop, the arena takes the captured variables and clears both their bound lists and trait-watch
-lists. Watches can form another cycle: a variable watches an obligation whose output type refers
-back to a variable. Clearing only bounds would leave those references intact.
+Bounds and watches form cycles. A bound names another variable, and a variable watches an obligation
+whose output type names a variable. Each cycle runs through the solver's tables rather than through
+reference counts, so dropping the solver releases every variable's state, on success and error
+returns alike. An obligation copy holds a strong reference to its parent; these links form an
+acyclic chain, so the watches the solver drops release the copies and the parents they hold
+(`copied_requirements_release_their_ancestors_with_the_solver`).
 
-An obligation copy holds a strong reference to its parent. These ancestry links form an acyclic
-chain; clearing every variable's watches also releases the copies and the parents they retain.
-`copied_requirements_release_their_ancestors_with_the_arena` checks this teardown.
+A handle the solver did not mint is foreign: one minted outside every run
+(`FunKindVar::unowned_data`, `BarrierVar::placeholder`). A foreign handle reads as unrecorded until
+this run records on it, and what this run records stays in this solver. A type operation outside
+every run takes `Solver::none()`, which panics on reaching an inference or barrier variable, or a
+funkind variable that a solver minted. A funkind variable no solver minted reads as unrecorded
+through it. The type operations most used outside a run have a form that passes it: `Type::pi`
+takes no solver, and `Type::pi_in` takes the run's. A rendering without its run, a type's
+`Display`, takes `Solver::detached()`, through which each variable reads as minted, with nothing
+recorded on it. The rendering may mint variables of its own, as resolving a type does, and record
+on those; recording on any other variable through it panics.
 
-No borrow of a captured variable's bounds or watches may remain live across teardown, which mutably
-borrows both cells. Successful materialization creates fresh unresolved placeholders rather than
-reusing bound-bearing solver variables, so clearing the graph does not remove constraints needed by
-the successful result. Weak edges would require a separate owner and fallible upgrades; the arena
-retains strong references during solving and performs one linear cleanup.
+#### A run closes what it hands back
 
-`infer` constructs the arena before running inference, so both success and error returns execute
-the same cleanup. Variables retained in an error-path expression no longer have a live solver graph
-after that teardown.
+No variable of a run outlives it. As a run ends, on success and on failure, it closes what it hands
+back (`solve::Closer`): its tree, its errors with their labels, its type, its schemes and its top
+level's capabilities. Each inference or barrier variable left in them becomes the
+`Type::Undetermined` it stands for, and each funkind variable the run minted an unowned one minted
+alike, which every solver reads as nothing recorded. Closing reads nothing a run recorded: coalesce
+has decided every type a node holds, and an error's types are reported as found. So a pass after
+inference, and a respelling of a failed run's errors, takes `Solver::none()`.
 
-The arena is thread-local and non-reentrant: at most one is active on a thread, with a debug
-assertion on nested entry. The guard is neither `Send` nor `Sync`, so it cannot be moved to
-another thread for teardown.
+A run leaves a type undetermined where nothing in the program fixes it: an induction accumulator's
+domain, which the unified phase erases unread; a definition nothing applies; a feed nothing feeds; a
+failed statement's poisoned binding. One reachable from the program's root output type is an
+ambiguous-type error, `UnresolvedInfer`. A later run that reads an undetermined type takes it as
+imposing nothing: a check of the typed tree or planning relates it to anything
+(`constrain_go`), and a run that imports one through a module's interface reads it as "infer this",
+one variable for each id (`normalize_annotation`). A small run after inference, the join of a
+`Case` built after it (`case_result_ty`) or a check of the typed tree (`check_located`), closes
+what it hands back as every run does.
+
+A comparison of two predicates during a run reduces each as its run would close it
+(`ccl_utils::normal_form_detached`), so their normal forms read no variable's state, and the same
+predicate compares alike in every run.
+
+The solver indexes the inference variables it minted by identity, so a caller holding only a
+recorded id, compaction materializing a position say, finds the variable without a scan
+(`Solver::lookup`).
+
+In debug builds, dropping a run's solver checks that no substitution entry `Subst::acting_on`
+dropped acts on its variable (`subst::check_dropped_entries`).
+
+Capability variables keep their state on their handles. `InferArena` in `infer/api.rs` scopes the
+state of a run that its solver does not hold: the capability variables given an upper bound, the
+edges out of `try` bodies, the ordering requirements, the predicate derivations coalesce reads
+(`ccl_utils::record_derivation`), and the debug audits of trait narrowing. At most one arena is
+active on a thread, which debug builds check.
+
+#### One solver variable
+
+An inference variable, a funkind variable and a barrier variable are one structure, `SolverVar<𝑉>`
+(`infer/solver/var.rs`), whose parameter is the variable's sort: `Type`, `FunKind` or `Barrier`.
+`InferVar`, `FunKindVar` and `BarrierVar` name its three instances. What every variable has is
+written once:
+
+- an identity, printed by its sort's sigil (`?3`, `κ3`, `:>3`), and equality and hashing by
+  identity alone;
+- its home, which is `None` for a variable minted outside every run (`SolverVar::unowned`, as
+  lowering mints a funkind variable);
+- its telescope, the binders in scope where it stands. A funkind variable's and a barrier
+  variable's are empty: no fact recorded on one is read against a scope.
+
+A sort supplies the rest (`Solved`): its identities, and what its handle carries besides. That is
+an inference variable's level and funkind variable (`TypeVarFixed`), a funkind variable's hole mark
+and construction stamp (`FunKindVarFixed`), and a barrier variable's opaque binders
+(`BarrierVarFixed`). A sort a run records on supplies its table in the solver, what a read and a
+write of it check, and the count a write moves (`Recorded`). `Solver::var_state` and
+`Solver::var_state_mut` reach any sort's state.
+
+A barrier variable stands for a type, as an inference variable does, and is a sort of its own: its
+upper bounds are checked against its resolution rather than closed against its lower bounds.
 
 ---
 
@@ -2034,8 +2093,9 @@ predicate paired with that element type.
 
 `dependency_order` inspects predicate type slots to find references to sibling refinements.
 For nested filters, the outer predicate can read a collection already narrowed by the inner
-predicate; the inner restriction must then precede it. The function sorts candidates by their
-rendered predicate and repeatedly selects the first whose dependencies have been placed.
+predicate; the inner restriction must then precede it. The function sorts candidates by the
+structural order of their predicates (`cmp_term_modulo_ty_slots`, the order whose `Equal` is
+refinement equality) and repeatedly selects the first whose dependencies have been placed.
 Independent predicates therefore use a content-based tie-breaker, not physical insertion order.
 If no candidate is ready, the implementation takes the first remaining member; that fallback is
 not a cycle diagnostic or a proof that arbitrary dependency cycles are supported.
@@ -2046,9 +2106,8 @@ predicate at its stage type, so a compiled predicate's type slots carry `{𝐷 |
 refinement applied before it. `dependency_order` reads those slots back as dependencies. Every
 later site that orders the set (map-filter insertion, a correlated site's `filter_values` chain in
 `planning/correlated.rs`, re-compilation, and the post-planning check) therefore recovers the order
-of the first compilation, whatever the compiled terms render to. The
-rendered-predicate tie-break decides only among predicates that had no dependency before their
-first compilation. The argument rests on one equality: the copy of an earlier refinement inside a
+of the first compilation, whatever the compiled terms are. The structural tie-break decides
+only among predicates that had no dependency before their first compilation. The argument rests on one equality: the copy of an earlier refinement inside a
 later predicate's types compares equal to its sibling in the set, which the shared
 `PredMemo<Type>` provides. The order is not part of `RefinementSet` equality.
 
@@ -2435,10 +2494,10 @@ several paths, each composing the binders of the dependent applications and lamb
 through, is one edge, recorded once.
 
 The restriction reads the variable's scopes when the edge arrives, and nothing restores a dropped
-entry. It is exact under two premises: an opaque binder is entered into the shared opaque set
-before any substitution names it, and a witness entry or respelling reaches a variable only after
-the kind edge that puts its witness or kind in the variable's scope. Debug builds record every
-dropped entry and assert at arena teardown that none acts on its variable then.
+entry. It is exact under two premises: an opaque binder is entered into the shared opaque set before
+any substitution names it, and a witness entry or respelling reaches a variable only after the kind
+edge that puts its witness or kind in the variable's scope. Debug builds record every dropped entry
+and assert, when the run's solver drops, that none acts on its variable then.
 
 When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
 
@@ -4603,11 +4662,11 @@ whichever variable the pass reaches it from and however many rounds it takes.
 An obligation records the obligation it copied (`TraitObligation::copied_from`). A copy with the
 same candidate rows carries the parent's requirement (`TraitObligation::requirement_source`);
 narrowing those rows establishes a distinct requirement for that instantiation. The sweep identifies
-an unsatisfiable intersection by these
-requirement identities and operand positions, combining the variables of its copies before finding
-the node that owns the failure. A conflict containing every requirement of another conflict is a
-carrier too. Smaller conflicting sets are grouped first, independently of arena traversal order.
-Distinct instantiations that narrow the same source requirements differently remain distinct.
+an unsatisfiable intersection by these requirement identities and operand positions, combining the
+variables of its copies before finding the node that owns the failure. A conflict containing every
+requirement of another conflict is a carrier too. Smaller conflicting sets are grouped first,
+independently of the order the solver minted the variables in. Distinct instantiations that narrow
+the same source requirements differently remain distinct.
 
 The attribution walk reads the grouped variables from the emitted tree. Failing to find any is an
 attribution bug, not a reason to blame the program root: that root can be an unrelated definition
@@ -5640,7 +5699,8 @@ These definitions summarize the linked contracts rather than restating their alg
 | `ccl::Type` | The AST's type representation, also used by the solver; it can contain inference unknowns during solving. |
 | Refinement | A base type restricted by predicate terms. See [Refinements on the lattice](#refinements-on-the-lattice). |
 | Let binding resolution | Resolve a binding and its uses, specializing generalized uses independently. See [Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation). |
-| `InferArena` | Owns inference variables for one run and clears bounds on drop to break reference cycles. See [Variable lifetime](#32-the-inferarena-who-owns-inference-variables). |
+| `Solver` | Owns what one run records on its inference, funkind and barrier variables, released when it drops. See [Variable lifetime](#32-the-solver-who-owns-inference-variables). |
+| `InferArena` | Scopes a run's capability lists, predicate derivations and debug audits, which the solver does not hold. See [Variable lifetime](#32-the-solver-who-owns-inference-variables). |
 | Pi type | A function type binding a term name in its codomain. See [Dependent refinements](#45-dependent-refinements-via-pi-types). |
 | Dependent tuple | A tuple whose components read the ones before it. See [Dependent tuples](#48-dependent-tuples). |
 | Telescope | The term binders an inference variable may name, in the order entered; also a dependent tuple, whose components bind in order. See [The invariant](#the-invariant). |

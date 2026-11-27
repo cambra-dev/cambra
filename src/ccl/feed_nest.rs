@@ -16,6 +16,7 @@
 //! indexed form builds a level at a time.
 
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::subst::Subst;
 use std::rc::Rc;
 
@@ -77,7 +78,7 @@ impl FeedValue {
     pub(crate) fn discharge_env(self, env: &std::collections::HashMap<Name, Expr>) -> Self {
         Self::new(
             Subst::discharge_env_in_place(self.value, env, crate::ccl::Ids::Fresh),
-            Subst::discharge_env_in_type(&self.row, env),
+            Subst::discharge_env_in_type(&mut Solver::none(), &self.row, env),
         )
     }
 
@@ -92,7 +93,12 @@ impl FeedValue {
     }
 
     pub(crate) fn bind_let(&mut self, binding: TypedBinding, definition: Expr) {
-        self.row = crate::ccl::ccl_utils::closed_let_type(&binding, &definition, self.row.clone());
+        self.row = crate::ccl::ccl_utils::closed_let_type(
+            &mut Solver::none(),
+            &binding,
+            &definition,
+            self.row.clone(),
+        );
         self.value = Expr::let_in(binding, definition, std::mem::take(&mut self.value));
     }
 
@@ -167,7 +173,13 @@ impl FeedValue {
                 self.row
             )
         };
-        let codomain = crate::ccl::subst::codomain_renamed(binder, domain, position, codomain);
+        let codomain = crate::ccl::subst::codomain_renamed(
+            &mut Solver::none(),
+            binder,
+            domain,
+            position,
+            codomain,
+        );
         let codomain = Subst::rename(original.clone(), position.clone()).apply_type(&codomain);
         self.row = Type::fun_over(
             position.clone(),
@@ -520,7 +532,12 @@ fn rebuild_let(
     let capabilities =
         crate::ccl::capabilities::of_parts(&[&bound_expr.capabilities, &body.capabilities]);
     TypedExpr {
-        ty: crate::ccl::ccl_utils::closed_let_type(&binding, &bound_expr, body.ty.clone()),
+        ty: crate::ccl::ccl_utils::closed_let_type(
+            &mut Solver::none(),
+            &binding,
+            &bound_expr,
+            body.ty.clone(),
+        ),
         node: TypedExprNode::Let {
             binding,
             bound_expr,
@@ -859,7 +876,12 @@ fn lets_into_position(expr: Expr) -> Expr {
     let body = lets_into_position(*body);
     // The position lambda moves out from under the `let`, so its type reads the binding as the
     // `let`'s own type would.
-    let lambda_ty = crate::ccl::ccl_utils::closed_let_type(&binding, &bound_expr, body.ty.clone());
+    let lambda_ty = crate::ccl::ccl_utils::closed_let_type(
+        &mut Solver::none(),
+        &binding,
+        &bound_expr,
+        body.ty.clone(),
+    );
     let name = binding.name.clone();
     let rebind = |body: Expr| rebuild_let(binding, bound_expr, user_annotation, node_id, body);
     match body.node {

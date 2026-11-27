@@ -65,8 +65,10 @@ Each binding opens its `Poly` for itself, so two bindings annotated with one ali
 of their own. Only an opened parameter reaches the solver: `TypeParam::level` panics on a declared
 one, as normalization does on a declared parameter whose `Poly` is not open.
 
-A `Param`'s bound can hold inference variables whose bounds hold the `Param`. Arena teardown clears
-every variable's bounds, which breaks that cycle as it breaks the cycles among variables.
+A `Param`'s bound can hold inference variables whose bounds hold the `Param`. Those bounds are the
+run's solver's, so the cycle runs through its tables, as the cycles among variables do, and dropping
+the solver releases it
+([type-inference.md](type-inference.md#32-the-solver-who-owns-inference-variables)).
 
 ---
 

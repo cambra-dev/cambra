@@ -275,12 +275,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         ictx.register_source_type(name, elem_ty.clone());
     }
     let mut expr = lower_uniquified(code, &mut lctx);
-    let out = infer(&mut expr, &mut ictx);
-    #[cfg(debug_assertions)]
-    if std::env::var_os("DUMP_KINDS").is_some() {
-        eprintln!("=== kind graph ===\n{}", cambra::ccl::dump_kind_vars());
-    }
-    out.expect("inference failed")
+    infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
 /// Like [`infer_program`] but expects inference to fail and returns all errors.
@@ -3336,7 +3331,7 @@ fn test_lambda_unapplied(
             "a single surviving instance determines the operand too",
         ),
         None => assert!(
-            matches!(**domain, Type::Infer(_)),
+            matches!(**domain, Type::Undetermined(_)),
             "an operand no single row determines stays open, got {domain}",
         ),
     }
@@ -3354,7 +3349,7 @@ fn an_undetermined_operand_stays_open() {
         panic!("expected a tuple domain, got {domain}");
     };
     assert!(
-        params.iter().all(|p| matches!(p, Type::Infer(_))),
+        params.iter().all(|p| matches!(p, Type::Undetermined(_))),
         "`a + b` leaves every Addable row standing, so neither operand is pinned; \
          got {domain}",
     );
@@ -3373,8 +3368,8 @@ fn test_generic_identity() {
         ..
     } = ty
     {
-        assert!(matches!(*dom, Type::Infer(_)));
-        assert!(matches!(*cod, Type::Infer(_)));
+        assert!(matches!(*dom, Type::Undetermined(_)));
+        assert!(matches!(*cod, Type::Undetermined(_)));
     } else {
         panic!("expected Fun type, got {ty}");
     }
@@ -6379,10 +6374,12 @@ fn a_key_dependent_lookup_discharges_the_key_binder() {
     );
     let errs = infer(&mut expr, &mut ictx).expect_err("expected inference error");
     let temps = anf::temp_respelling(&expr, cambra::ccl::Ids::Fresh);
+    // The run closed what its errors hold, so the respelling reads no variable of it.
+    let solver = &mut cambra::ccl::infer::solver::Solver::none();
     let errs: Vec<String> = errs
         .into_iter()
         .map(|mut e| {
-            e.respell(&temps);
+            e.respell(solver, &temps);
             format!("{:?}", e.error)
         })
         .collect();

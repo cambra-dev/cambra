@@ -7,6 +7,7 @@
 //! integration — without depending on CHL surface syntax for variants
 //! (which is a separate workstream).
 
+use crate::ccl::infer::solver::Solver;
 use cambra::ccl::Annotation;
 use cambra::ccl::ArithmeticKind;
 use cambra::ccl::Occurrence;
@@ -224,6 +225,7 @@ fn variant_extra_tag_rejected() {
 /// unlisted tag falls in canonical tag order.
 #[test]
 fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
+    let solver = &mut Solver::new();
     use cambra::ccl::infer::solver::ConstrainCache;
     use cambra::ccl::infer::solver::constrain_subtype;
 
@@ -241,7 +243,7 @@ fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
     ]);
     let mut cache = ConstrainCache::new();
     assert!(
-        constrain_subtype(&subtype, &open_demand, &mut cache).is_ok(),
+        constrain_subtype(solver, &subtype, &open_demand, &mut cache).is_ok(),
         "an open arm set admits tags it does not list"
     );
 
@@ -252,7 +254,7 @@ fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
     ]);
     let mut cache = ConstrainCache::new();
     assert!(
-        constrain_subtype(&subtype, &closed_demand, &mut cache).is_err(),
+        constrain_subtype(solver, &subtype, &closed_demand, &mut cache).is_err(),
         "a closed arm set rejects a tag it does not list"
     );
 
@@ -264,7 +266,7 @@ fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
     ]);
     let mut cache = ConstrainCache::new();
     assert!(
-        constrain_subtype(&bad, &open_demand, &mut cache).is_err(),
+        constrain_subtype(solver, &bad, &open_demand, &mut cache).is_err(),
         "openness relaxes the tag set, not the shared payloads"
     );
 }

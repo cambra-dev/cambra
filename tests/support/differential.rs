@@ -4,6 +4,7 @@
 //! Compiled into the two differential suites: the hand-written cases
 //! (`tests/it/differential_interp.rs`) and the generated grid (`tests/it/generated_pairs.rs`).
 
+use crate::ccl::infer::solver::Solver;
 use cambra::ccl::Type;
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::interpreter::{Consumer, SinkReadError, Value as TileValue};
@@ -111,7 +112,7 @@ pub fn convert(v: TileValue, ty: &Type) -> Value {
             let ctor = tag.to_string();
             let payload = decl
                 .ctor(&ctor)
-                .map(|c| decl.instantiate(&c.payload(), args))
+                .map(|c| decl.instantiate(&mut Solver::none(), &c.payload(), args))
                 .unwrap_or(Type::Hole);
             Value::Nominal {
                 ty: decl.name.to_string(),

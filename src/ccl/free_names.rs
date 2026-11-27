@@ -287,6 +287,7 @@ impl<'m> Walk<'m> {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Undetermined(_)
             | Type::ChanDom(..)
             | Type::Txn
             | Type::Hole

@@ -272,6 +272,7 @@ pub(crate) fn paired_parts<'a>(left: &'a Type, right: &'a Type) -> Option<Pairin
         | Type::BoundedHole(_)
         | Type::BarrierVar(_)
         | Type::Infer(_)
+        | Type::Undetermined(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn

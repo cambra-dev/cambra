@@ -74,6 +74,7 @@
 //! [`Feed`]: crate::ccl::TypedExprNode::Feed
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::{
     BindingTransparency, Expr, FunKind, HistoryKind, Lit, Name, ProjKey, Refinement, Type,
     TypedBinding, TypedExprNode,
@@ -547,8 +548,13 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 fn is_mut_written(name: &Name, expr: &Expr) -> bool {
     use crate::ccl::capabilities::{Capability, Effect};
     if expr.capabilities.set().items().any(|c| {
-        c.may_include(&Capability::Causes(Effect::Write(name.clone())))
-            || c.may_include(&Capability::Causes(Effect::WriteTxn(name.clone())))
+        c.may_include(
+            &mut Solver::none(),
+            &Capability::Causes(Effect::Write(name.clone())),
+        ) || c.may_include(
+            &mut Solver::none(),
+            &Capability::Causes(Effect::WriteTxn(name.clone())),
+        )
     }) {
         return true;
     }
@@ -1052,7 +1058,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
         } => {
             let scrutinee = scrutinee.map(|s| Box::new(inline_impl(*s, scope)));
             let facts = match scrutinee.as_deref() {
-                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                Some(s) => crate::ccl::nominal::typed_case_facts(&mut Solver::none(), s, &branches),
                 None => std::iter::repeat_with(Vec::new)
                     .take(branches.len())
                     .collect(),
@@ -1393,7 +1399,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope) -> Expr {
 /// `e`'s capabilities answer: a lambda raises where it is applied, so its body's `Raise` is not
 /// the lambda's, and a call holds what its function causes.
 fn may_raise(e: &Expr) -> bool {
-    e.capabilities.set().may_raise()
+    e.capabilities.set().may_raise(&mut Solver::none())
 }
 
 /// Whether moving `definiens`, which causes something, to its use in `body` could carry its
@@ -1579,7 +1585,7 @@ fn inline_and_beta_reduce(
             let scrutinee =
                 scrutinee.map(|s| Box::new(inline_and_beta_reduce(*s, name, lambda, scope, memo)));
             let facts = match scrutinee.as_deref() {
-                Some(s) => crate::ccl::nominal::typed_case_facts(s, &branches),
+                Some(s) => crate::ccl::nominal::typed_case_facts(&mut Solver::none(), s, &branches),
                 None => std::iter::repeat_with(Vec::new)
                     .take(branches.len())
                     .collect(),
@@ -1757,7 +1763,7 @@ fn beta_reduce(
             1 => (argument.clone_preserving_ids(), param.ty.clone()),
             _ => {
                 // The call built its argument list, so each argument is in hand.
-                let passed = crate::ccl::ccl_utils::predicate_term(&argument);
+                let passed = crate::ccl::ccl_utils::predicate_term(&mut Solver::none(), &argument);
                 let TypedExprNode::Tuple(built) = &passed.node else {
                     unreachable!(
                         "a call of a lambda of {} parameters passes the list of its arguments",
@@ -1772,7 +1778,11 @@ fn beta_reduce(
                     .collect();
                 (
                     part(i),
-                    crate::ccl::subst::Subst::discharge_env_in_type(&param.ty, &earlier),
+                    crate::ccl::subst::Subst::discharge_env_in_type(
+                        &mut Solver::none(),
+                        &param.ty,
+                        &earlier,
+                    ),
                 )
             }
         };
@@ -2074,7 +2084,7 @@ fn refinement_discharged_by(argument: &Expr, param_ty: &Type, scope: &dyn ScopeE
     // The base the query runs over is the argument's value, so the `Mut` stamp comes
     // off here for the reason it does above.
     let base = arg_ty.mut_value_type().unwrap_or(arg_ty).peel_refinements();
-    match smt_sub(base, &supplied, &demanded, scope) {
+    match smt_sub(&mut Solver::none(), base, &supplied, &demanded, scope) {
         Ok(entailed) => entailed,
         // A predicate the encoder cannot read leaves the entailment undecided, which
         // is the structural answer: the demand is not discharged, and the caller's

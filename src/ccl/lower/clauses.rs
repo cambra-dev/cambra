@@ -8,6 +8,7 @@
 //! A name in `Write(x)`, `Append(x)` or `Read(x)` is lowered raw, and `uniquify` resolves it
 //! against the scope the clause is written in.
 
+use crate::ccl::infer::solver::Solver;
 use chl_parser::ast::{
     Clause, Expr as ChlExpr, Requirement as ChlRequirement, Span, Spanned, TraitType,
 };
@@ -185,8 +186,8 @@ pub(super) fn lower_clauses(
             .iter()
             .filter(|i| i.of_causes() == t.of_causes)
             .cloned();
-        let less = t.less(taken);
-        if less.is_taken() {
+        let less = t.less(&mut Solver::none(), taken);
+        if less.is_taken(&mut Solver::none()) {
             let items = if t.of_causes {
                 causes.except.iter().map(|e| e.span).collect::<Vec<_>>()
             } else {
@@ -206,7 +207,7 @@ pub(super) fn lower_clauses(
         .map(|p| {
             let taken = except.iter().filter(|i| i.of_causes() == p.of_causes);
             ClauseParam {
-                except: pruned(p.except.iter().chain(taken).cloned()),
+                except: pruned(&mut Solver::none(), p.except.iter().chain(taken).cloned()),
                 ..p
             }
         })
@@ -306,6 +307,7 @@ fn scope<T>(
             Lowered::Param(p) => {
                 set.params.insert(ClauseParam {
                     except: pruned(
+                        &mut Solver::none(),
                         p.except
                             .iter()
                             .cloned()
@@ -327,8 +329,8 @@ fn scope<T>(
         return Err(takes_nothing(*at, taken));
     }
     for top in tops {
-        let less = top.less(own.iter().map(|(_, i)| i.clone()));
-        if less.is_taken() {
+        let less = top.less(&mut Solver::none(), own.iter().map(|(_, i)| i.clone()));
+        if less.is_taken(&mut Solver::none()) {
             return Err(takes_everything(span, &top));
         }
         set.add_every(less);
@@ -496,7 +498,7 @@ fn unlisted<T>(
                 Lowered::Every(other) => Capability::Every(other.clone()),
                 Lowered::Param(_) | Lowered::Hole => continue,
             };
-            if i != j && top.holds(&held) {
+            if i != j && top.holds(&mut Solver::none(), &held) {
                 return Err(LoweringError::unsupported(
                     *span,
                     format!(

@@ -4,6 +4,7 @@
 use super::*;
 use crate::ccl::constant::{ConstParam, ConstTerm};
 use crate::ccl::infer::Contract;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::lower::constants::Refused;
 
 /// What a module declares, for the modules that reach it (`docs/modules.md`,
@@ -489,6 +490,7 @@ impl TraitMember {
             );
             let requires: Vec<String> = signature.requires.iter().map(|r| requirement(r)).collect();
             line.push_str(&crate::ccl::capabilities::clauses(
+                &mut Solver::none(),
                 requires,
                 &signature.capabilities,
             ));
@@ -615,7 +617,7 @@ impl Interface {
     fn written_contract(&self, contract: &Contract) -> String {
         contract
             .map_type(|ty| {
-                crate::ccl::capabilities::own_state_as_module(ty, &|x| {
+                crate::ccl::capabilities::own_state_as_module(&mut Solver::none(), ty, &|x| {
                     x.home().is_some() || !(self.is_public(x.base()) || x.base().contains("::"))
                 })
             })

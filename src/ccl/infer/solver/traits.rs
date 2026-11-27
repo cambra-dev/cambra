@@ -70,6 +70,7 @@
 //! rather than an associated one, is `schemes.rs`'s business, not this module's.
 
 use crate::ccl::Occurrence;
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::ty::TraitRequirement;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -890,20 +891,24 @@ impl TraitInstance {
     /// Whether this instance accepts `operands`, the types at every operand position: each
     /// matches the head's pattern there, with each type variable standing for one type
     /// throughout.
-    pub fn matches(&self, operands: &[Type]) -> bool {
-        self.bind(operands).is_some()
+    pub fn matches(&self, solver: &mut Solver, operands: &[Type]) -> bool {
+        self.bind(solver, operands).is_some()
     }
 
     /// What each of the head's type variables stands for where the head matches `operands`,
     /// or `None` where it does not ([`matches`](Self::matches)).
-    pub fn bind(&self, operands: &[Type]) -> Option<HashMap<TypeParamId, Type>> {
+    pub fn bind(
+        &self,
+        solver: &mut Solver,
+        operands: &[Type],
+    ) -> Option<HashMap<TypeParamId, Type>> {
         let mut bound = HashMap::new();
         (self.operands.len() == operands.len()
             && self
                 .operands
                 .iter()
                 .zip(operands)
-                .all(|(pattern, ty)| match_pattern(pattern, ty, &mut bound)))
+                .all(|(pattern, ty)| match_pattern(solver, pattern, ty, &mut bound)))
         .then_some(bound)
     }
 
@@ -985,7 +990,7 @@ pub enum InstanceBody {
 impl InstanceBody {
     /// The function as a term of `ty`, the type its call resolved to: `𝐴 ⇒ 𝑂` for one
     /// parameter, `(𝐴, 𝐵) ⇒ 𝑂` for two, the primitive reading its parameters by name.
-    pub fn build(&self, ty: &Type) -> TypedExpr {
+    pub fn build(&self, solver: &mut Solver, ty: &Type) -> TypedExpr {
         let Type::Fun {
             domain, codomain, ..
         } = ty.peel_refinements()
@@ -995,7 +1000,10 @@ impl InstanceBody {
         let domain = (**domain).clone();
         let codomain = (**codomain).clone();
         let read = |name: &Name, ty: &Type| TypedExpr::var(name.clone()).with_ty(ty.clone());
-        match (self, crate::ccl::ccl_utils::strip_refinements(&domain)) {
+        match (
+            self,
+            crate::ccl::ccl_utils::strip_refinements_in(solver, &domain),
+        ) {
             (InstanceBody::Binary(op), Type::Tuple(parts)) => {
                 let [left, right]: [Type; 2] = parts
                     .try_into()
@@ -1045,11 +1053,16 @@ enum PatternAt {
 
 /// Whether `ty` matches `pattern`, binding each of the pattern's type variables in `bound`
 /// to the type it stands for, refinements peeled.
-fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Type>) -> bool {
+fn match_pattern(
+    solver: &mut Solver,
+    pattern: &Type,
+    ty: &Type,
+    bound: &mut HashMap<TypeParamId, Type>,
+) -> bool {
     let ty = ty.peel_refinements();
     match pattern {
         Type::Param(p) => {
-            let stated = crate::ccl::ccl_utils::strip_refinements(ty);
+            let stated = crate::ccl::ccl_utils::strip_refinements_in(solver, ty);
             match bound.get(&p.id) {
                 Some(b) => *b == stated,
                 None => {
@@ -1063,7 +1076,7 @@ fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Typ
             Type::Nominal(other, args) if other == decl && args.len() == pargs.len() => pargs
                 .iter()
                 .zip(args)
-                .all(|(p, a)| match_pattern(p, a, bound)),
+                .all(|(p, a)| match_pattern(solver, p, a, bound)),
             _ => false,
         },
         _ => false,
@@ -1144,14 +1157,15 @@ pub fn apply_unifier(ty: &Type, subst: &HashMap<TypeParamId, Type>) -> Type {
 /// writes for a record it writes is checked where the type's instance is declared, against
 /// that declaration.
 pub fn compares_by_value(
+    solver: &mut Solver,
     trait_: &Trait,
     ty: &Type,
     requires: &[Rc<TraitRequirement>],
     instances: &InstanceTable,
 ) -> bool {
-    let ty = crate::ccl::ccl_utils::strip_refinements(ty);
+    let ty = crate::ccl::ccl_utils::strip_refinements_in(solver, ty);
     let pair = [ty.clone(), ty.clone()];
-    let each = |t: &Type| compares_by_value(trait_, t, requires, instances);
+    let mut each = |t: &Type| compares_by_value(solver, trait_, t, requires, instances);
     match &ty {
         Type::Tuple(_) | Type::Record(_) if !trait_.admits_product(&ty) => false,
         Type::Tuple(elems) => elems.iter().all(each),
@@ -1160,12 +1174,12 @@ pub fn compares_by_value(
             .iter()
             .any(|r| r.trait_ == *trait_ && r.args == pair),
         _ => instances.instances(trait_).iter().any(|i| {
-            i.bind(&pair).is_some_and(|bound| {
+            i.bind(solver, &pair).is_some_and(|bound| {
                 i.requires.iter().all(|r| {
                     let r = r.map_types(|t| replace_params(t, &bound));
                     r.args.first().is_some_and(|t| {
                         r.args.iter().all(|a| a == t)
-                            && compares_by_value(&r.trait_, t, requires, instances)
+                            && compares_by_value(solver, &r.trait_, t, requires, instances)
                     })
                 })
             })
@@ -1404,6 +1418,7 @@ impl InstanceTable {
     /// does not have the signature's shape.
     pub fn specialization_arguments(
         &self,
+        solver: &mut Solver,
         binding: &Name,
         resolved: &Type,
     ) -> Option<Vec<(SmolStr, Type)>> {
@@ -1425,8 +1440,9 @@ impl InstanceTable {
             &at_instance,
         );
         let mut bound = HashMap::new();
-        if !crate::ccl::infer::solver::containment::bind_parameters(&pattern, resolved, &mut bound)
-        {
+        if !crate::ccl::infer::solver::containment::bind_parameters(
+            solver, &pattern, resolved, &mut bound,
+        ) {
             return None;
         }
         instance
@@ -1461,7 +1477,13 @@ impl InstanceTable {
     /// (`src/ccl/design/type-parameters.md`, "Specialization"). `None` where no instance
     /// accepts them or the one that does associates no `name`. No two instances accept one
     /// list of operands, so the first that accepts them is the one.
-    pub fn associated_at(&self, trait_: &Trait, args: &[Type], name: &Assoc) -> Option<Type> {
+    pub fn associated_at(
+        &self,
+        solver: &mut Solver,
+        trait_: &Trait,
+        args: &[Type],
+        name: &Assoc,
+    ) -> Option<Type> {
         if let [operand] = args
             && trait_.reads_places()
             && *name == Assoc::output()
@@ -1472,7 +1494,7 @@ impl InstanceTable {
         // The collection rule answers a structural collection, which is its own `Elements`.
         if let [operand] = args
             && trait_.reads_collections()
-            && is_structural_collection(operand)
+            && is_structural_collection(solver, operand)
         {
             return Some(operand.clone());
         }
@@ -1824,6 +1846,7 @@ impl TraitObligation {
     /// `function`: an obligation of [`Trait::method`] with a candidate for each of the call's
     /// rows, which `table`'s conditions answer the selected method's requirements by.
     pub fn new_method(
+        solver: &mut Solver,
         table: &Rc<InstanceTable>,
         name: &str,
         call: MethodCall,
@@ -1839,27 +1862,26 @@ impl TraitObligation {
             "infer.method_receiver",
             provenance::Nature::Machinery,
         );
-        let candidates = call
-            .rows
-            .iter()
-            .map(|row| {
-                let operands = vec![
-                    row.decl
-                        .applied_to_params(&mut |n, ty| crate::ccl::Expr::var(n).with_ty(ty)),
-                ];
-                Rc::new(TraitInstance {
-                    params: row.decl.params.clone(),
-                    heads: operands.iter().map(InstanceHead::of_pattern).collect(),
-                    operands,
-                    assoc: Vec::new(),
-                    effect_assocs: Vec::new(),
-                    requires: Vec::new(),
-                    bounds: Vec::new(),
-                    functions: Vec::new(),
-                    declared: None,
+        let candidates =
+            call.rows
+                .iter()
+                .map(|row| {
+                    let operands = vec![row.decl.applied_to_params(solver, &mut |n, ty| {
+                        crate::ccl::Expr::var(n).with_ty(ty)
+                    })];
+                    Rc::new(TraitInstance {
+                        params: row.decl.params.clone(),
+                        heads: operands.iter().map(InstanceHead::of_pattern).collect(),
+                        operands,
+                        assoc: Vec::new(),
+                        effect_assocs: Vec::new(),
+                        requires: Vec::new(),
+                        bounds: Vec::new(),
+                        functions: Vec::new(),
+                        declared: None,
+                    })
                 })
-            })
-            .collect();
+                .collect();
         Self::with_candidates(
             table,
             Trait::method(name),
@@ -1932,7 +1954,10 @@ impl TraitObligation {
     /// [`set_assoc_types`](Self::set_assoc_types)). Their deposited flags copy too — a
     /// deposit already made rides the freshened bound onto the copy, so redoing it
     /// would record the same fact twice.
-    pub(super) fn new_from(original: &Rc<TraitObligation>) -> Rc<TraitObligation> {
+    pub(super) fn new_from(
+        solver: &mut Solver,
+        original: &Rc<TraitObligation>,
+    ) -> Rc<TraitObligation> {
         // A provenance recording for the cloning of the refinement's operands into the copy.
         let _f = provenance::copy_frame("infer.freshen_obligation");
         let copy = Rc::new(TraitObligation {
@@ -1974,7 +1999,7 @@ impl TraitObligation {
             .values()
             .any(|h| matches!(h, Held::AtOneKey { .. }))
         {
-            hold(&copy);
+            hold(solver, &copy);
         }
         copy
     }
@@ -2063,7 +2088,7 @@ impl TraitObligation {
     /// `ty` must be an inference variable: an operator's rule mints one per operand
     /// precisely so the operand's *own* type flows in as a bound rather than being
     /// read at emission, when it is not yet known.
-    pub fn watch(self: &Rc<Self>, ty: &Type, pos: u8) {
+    pub fn watch(self: &Rc<Self>, solver: &mut Solver, ty: &Type, pos: u8) {
         let Type::Infer(v) = ty else {
             debug_assert!(
                 false,
@@ -2072,11 +2097,9 @@ impl TraitObligation {
             );
             return;
         };
-        {
-            let mut watches = v.watches.borrow_mut();
-            if !watches.iter().any(|(o, p)| o.uid == self.uid && *p == pos) {
-                watches.push((Rc::clone(self), pos));
-            }
+        let watches = v.watches_mut(solver);
+        if !watches.iter().any(|(o, p)| o.uid == self.uid && *p == pos) {
+            watches.push((Rc::clone(self), pos));
         }
         {
             let mut operands = self.operands.borrow_mut();
@@ -2093,6 +2116,7 @@ impl TraitObligation {
     /// Watches propagated below that operand carry a frame but do not replace the operand.
     pub(super) fn copy_watch(
         self: &Rc<Self>,
+        solver: &mut Solver,
         original: &TraitObligation,
         pos: u8,
         from: InferVarId,
@@ -2104,9 +2128,9 @@ impl TraitObligation {
             Some(Some(Type::Infer(var))) if var.uid == from
         );
         if is_operand {
-            self.watch(&Type::Infer(Rc::clone(to)), pos);
+            self.watch(solver, &Type::Infer(Rc::clone(to)), pos);
         } else {
-            let mut watches = to.watches.borrow_mut();
+            let watches = to.watches_mut(solver);
             if !watches.iter().any(|(o, p)| o.uid == self.uid && *p == pos) {
                 watches.push((Rc::clone(self), pos));
             }
@@ -2258,6 +2282,7 @@ impl TraitObligation {
     /// those bounds.
     pub(crate) fn redeliver(
         self: &Rc<Self>,
+        solver: &mut Solver,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
         let operands = self.operands.borrow().clone();
@@ -2274,16 +2299,20 @@ impl TraitObligation {
                 if !seen.insert(v.uid) {
                     continue;
                 }
-                for bound in v.bounds.borrow().lower().iter() {
+                let lowers = Rc::clone(v.bounds(solver).lower());
+                for bound in lowers.iter() {
                     match &bound.ty {
-                        Type::Infer(below) => stack.push((
-                            Rc::clone(below),
-                            crate::ccl::subst::Subst::then(&bound.render_subst(), &frame),
-                        )),
+                        Type::Infer(below) => {
+                            let rendered = bound.render_subst(solver);
+                            let into = crate::ccl::subst::Subst::then(solver, &rendered, &frame);
+                            stack.push((Rc::clone(below), into));
+                        }
                         app @ Type::FamilyApp(_) => {
-                            let into =
-                                crate::ccl::subst::Subst::then(&bound.render_subst(), &frame);
-                            let at = into.copying(crate::ccl::Ids::Kept).apply_type(app);
+                            let rendered = bound.render_subst(solver);
+                            let into = crate::ccl::subst::Subst::then(solver, &rendered, &frame);
+                            let at = into
+                                .copying(crate::ccl::Ids::Kept)
+                                .apply_type_in(solver, app);
                             contributions.push((at, bound.origin));
                         }
                         other => contributions.push((other.clone(), bound.origin)),
@@ -2291,7 +2320,7 @@ impl TraitObligation {
                 }
             }
             for (contribution, origin) in contributions {
-                deliver(self, pos as u8, &contribution, origin, cache)?;
+                deliver(solver, self, pos as u8, &contribution, origin, cache)?;
             }
         }
         Ok(())
@@ -2312,11 +2341,12 @@ impl TraitObligation {
     /// family parameter applied to terms; `offer` decides which contributions reach this.
     fn narrow_to_variables(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         contribution: &Type,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
-        let stated = crate::ccl::ccl_utils::strip_refinements(contribution);
+        let stated = crate::ccl::ccl_utils::strip_refinements_in(solver, contribution);
         self.assumptions
             .borrow_mut()
             .retain(|a| a.args.get(pos as usize) == Some(&stated));
@@ -2324,7 +2354,7 @@ impl TraitObligation {
             .borrow_mut()
             .retain(|i| i.accepts_anything_at(pos));
         self.narrowed.set(true);
-        self.try_deposit(cache)
+        self.try_deposit(solver, cache)
     }
 
     /// Whether `pos` is an argument position rather than one of the trait's operands.
@@ -2400,6 +2430,7 @@ impl TraitObligation {
     /// type variable alone, since a pattern names no other type.
     fn narrow_arg(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         contribution: &Type,
         cache: &mut ConstrainCache,
@@ -2412,15 +2443,15 @@ impl TraitObligation {
                 .assumptions
                 .borrow()
                 .iter()
-                .any(|a| a.at_application(&self.path(pos), app).is_some())
+                .any(|a| a.at_application(solver, &self.path(pos), app).is_some())
         {
-            return self.narrow_family(pos, app, cache);
+            return self.narrow_family(solver, pos, app, cache);
         }
         let path = self.path(pos);
         let head = offered_head(contribution);
         let (operand, around) = self.operand_around(pos, contribution);
         let accepted = self.accepted_types_at(operand);
-        let stated = crate::ccl::ccl_utils::strip_refinements(contribution);
+        let stated = crate::ccl::ccl_utils::strip_refinements_in(solver, contribution);
         self.assumptions.borrow_mut().retain(|a| {
             a.args
                 .get(path[0] as usize)
@@ -2444,9 +2475,9 @@ impl TraitObligation {
             });
         }
         if let Type::Nominal(decl, args) = contribution.peel_refinements() {
-            self.expand(pos, decl, args, cache)?;
+            self.expand(solver, pos, decl, args, cache)?;
         }
-        self.try_deposit(cache)
+        self.try_deposit(solver, cache)
     }
 
     /// Open an argument position for each argument of the nominal type `decl(args…)`
@@ -2457,6 +2488,7 @@ impl TraitObligation {
     /// reaches it later narrows the candidates too; one already determined is offered now.
     fn expand(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         decl: &Rc<NominalDecl>,
         args: &[Type],
@@ -2479,23 +2511,21 @@ impl TraitObligation {
             match arg.peel_refinements() {
                 Type::Infer(var) => {
                     let watched = Type::Infer(Rc::clone(var));
-                    self.watch(&watched, slot);
+                    self.watch(solver, &watched, slot);
                     // What the variable already carries arrived before the watch.
-                    let lower: Vec<(Type, crate::ccl::subst::Subst)> = var
-                        .bounds
-                        .borrow()
-                        .lower()
-                        .iter()
-                        .map(|b| (b.ty.clone(), b.render_subst()))
-                        .collect();
+                    let lower: Vec<(Type, crate::ccl::subst::Subst)> =
+                        Rc::clone(var.bounds(solver).lower())
+                            .iter()
+                            .map(|b| (b.ty.clone(), b.render_subst(solver)))
+                            .collect();
                     for (bound, into) in lower {
                         match &bound {
-                            Type::Infer(below) => link_watches(below, var, &into, cache)?,
-                            other => deliver(self, slot, other, None, cache)?,
+                            Type::Infer(below) => link_watches(solver, below, var, &into, cache)?,
+                            other => deliver(solver, self, slot, other, None, cache)?,
                         }
                     }
                 }
-                other => deliver(self, slot, other, None, cache)?,
+                other => deliver(solver, self, slot, other, None, cache)?,
             }
         }
         Ok(())
@@ -2511,6 +2541,7 @@ impl TraitObligation {
     /// under assumptions").
     fn narrow_param(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         param: &Rc<TypeParam>,
         cache: &mut ConstrainCache,
@@ -2527,12 +2558,12 @@ impl TraitObligation {
             self.assumptions
                 .borrow_mut()
                 .retain(|a| a.args.get(pos as usize) == Some(&stated));
-            return self.try_deposit(cache);
+            return self.try_deposit(solver, cache);
         }
         match &param.bound {
             // The operand is this parameter, so a requirement missing further up its bound
             // chain is missing of it.
-            Some(bound) => deliver(self, pos, bound, None, cache).map_err(|e| match e {
+            Some(bound) => deliver(solver, self, pos, bound, None, cache).map_err(|e| match e {
                 ConstrainError::MissingRequirement {
                     trait_, position, ..
                 } => ConstrainError::MissingRequirement {
@@ -2568,11 +2599,12 @@ impl TraitObligation {
     /// arrived ([`settle_held_answers`]).
     fn narrow_family(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         app: &crate::ccl::ty::FamilyApp,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
-        let bound = crate::ccl::subst::family_bound_at(app);
+        let bound = crate::ccl::subst::family_bound_at(solver, app);
         if bound.is_some() {
             let held = self.held.borrow().get(&pos).cloned().unwrap_or_default();
             match held {
@@ -2581,9 +2613,9 @@ impl TraitObligation {
                 Held::Settled { app: first } if first == *app => return Ok(()),
                 Held::AtOneKey { .. } => {
                     self.held.borrow_mut().insert(pos, Held::AtTheBound);
-                    return self.offer_family_bound(pos, app, cache);
+                    return self.offer_family_bound(solver, pos, app, cache);
                 }
-                Held::AtTheBound => return self.offer_family_bound(pos, app, cache),
+                Held::AtTheBound => return self.offer_family_bound(solver, pos, app, cache),
                 Held::Settled { app: first } => panic!(
                     "an obligation answered at {} was offered {} after its answer was \
                      settled: every application of a family reaches an obligation inside the \
@@ -2597,27 +2629,27 @@ impl TraitObligation {
             .assumptions
             .borrow()
             .iter()
-            .filter_map(|a| a.at_application(&self.path(pos), app).map(Rc::new))
+            .filter_map(|a| a.at_application(solver, &self.path(pos), app).map(Rc::new))
             .collect();
         if !answering.is_empty() {
             if bound.is_some() {
                 self.held
                     .borrow_mut()
                     .insert(pos, Held::AtOneKey { app: app.clone() });
-                hold(self);
+                hold(solver, self);
                 return Ok(());
             }
             self.candidates.borrow_mut().clear();
             self.rule_out_product_rule();
             *self.assumptions.borrow_mut() = answering;
-            return self.try_deposit(cache);
+            return self.try_deposit(solver, cache);
         }
         // The rows already read a quantified assumption at the terms of an application that
         // arrived first. One arriving at the same terms is answered there.
         let quantified_answers = self.context.borrow().iter().any(|a| {
             a.trait_ == self.trait_
                 && !a.binders.is_empty()
-                && a.at_application(&self.path(pos), app).is_some()
+                && a.at_application(solver, &self.path(pos), app).is_some()
         });
         if quantified_answers
             && self.candidates.borrow().is_empty()
@@ -2643,13 +2675,14 @@ impl TraitObligation {
                 types: vec![first, Type::FamilyApp(app.clone())],
             });
         }
-        self.offer_family_bound(pos, app, cache)
+        self.offer_family_bound(solver, pos, app, cache)
     }
 
     /// Offer the bound on the values of `app`'s family at its terms, in its place at `pos`; a
     /// family with none supports nothing.
     fn offer_family_bound(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         app: &crate::ccl::ty::FamilyApp,
         cache: &mut ConstrainCache,
@@ -2659,10 +2692,10 @@ impl TraitObligation {
             position: pos,
             param: Rc::clone(&app.param),
         };
-        match crate::ccl::subst::family_bound_at(app) {
+        match crate::ccl::subst::family_bound_at(solver, app) {
             // The operand is this application, so a requirement missing of its bound is
             // missing of the family.
-            Some(bound) => deliver(self, pos, &bound, None, cache).map_err(|e| match e {
+            Some(bound) => deliver(solver, self, pos, &bound, None, cache).map_err(|e| match e {
                 ConstrainError::MissingRequirement { .. } => missing(),
                 other => other,
             }),
@@ -2672,7 +2705,11 @@ impl TraitObligation {
 
     /// Deposit the answer held at one set of terms, which no application at other terms
     /// followed ([`Held`]).
-    fn settle_held(self: &Rc<Self>, cache: &mut ConstrainCache) -> Result<(), ConstrainError> {
+    fn settle_held(
+        self: &Rc<Self>,
+        solver: &mut Solver,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
         let held = self.held.borrow().clone();
         for (pos, held) in held {
             let Held::AtOneKey { app } = held else {
@@ -2685,17 +2722,17 @@ impl TraitObligation {
                 .assumptions
                 .borrow()
                 .iter()
-                .filter_map(|a| a.at_application(&self.path(pos), &app).map(Rc::new))
+                .filter_map(|a| a.at_application(solver, &self.path(pos), &app).map(Rc::new))
                 .collect();
             if answering.is_empty() {
-                self.offer_family_bound(pos, &app, cache)?;
+                self.offer_family_bound(solver, pos, &app, cache)?;
             } else {
                 self.candidates.borrow_mut().clear();
                 self.rule_out_product_rule();
                 *self.assumptions.borrow_mut() = answering;
             }
         }
-        self.try_deposit(cache)
+        self.try_deposit(solver, cache)
     }
 
     /// Whether every held family's declaration is among `params`.
@@ -2889,6 +2926,7 @@ impl TraitObligation {
     /// reaching a variable and its extrusion proxy) harmless.
     fn narrow(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         head: &InstanceHead,
         cache: &mut ConstrainCache,
@@ -2968,7 +3006,7 @@ impl TraitObligation {
                 });
             }
         }
-        self.try_deposit(cache)
+        self.try_deposit(solver, cache)
     }
 
     /// Answer a **product** contribution at `pos`: by an assumption stating that product
@@ -2986,6 +3024,7 @@ impl TraitObligation {
     /// [`apply_product_rule`]: Self::apply_product_rule
     fn narrow_product(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         product: &Type,
         cache: &mut ConstrainCache,
@@ -3006,8 +3045,8 @@ impl TraitObligation {
                 .zip(product_components(&arg))
             {
                 if matches!(component, Type::Infer(_)) {
-                    constrain_subtype(component, &stated_component, cache)?;
-                    constrain_subtype(&stated_component, component, cache)?;
+                    constrain_subtype(solver, component, &stated_component, cache)?;
+                    constrain_subtype(solver, &stated_component, component, cache)?;
                 }
             }
             stated = arg;
@@ -3058,9 +3097,9 @@ impl TraitObligation {
             return self.reject(pos, product);
         }
         if let Some(at) = apply {
-            self.apply_product_rule(&at, cache)?;
+            self.apply_product_rule(solver, &at, cache)?;
         }
-        self.try_deposit(cache)
+        self.try_deposit(solver, cache)
     }
 
     /// The one assumption stating, at `pos`, a product of `stated`'s shape whose every
@@ -3106,6 +3145,7 @@ impl TraitObligation {
     /// [`narrow_product`]: Self::narrow_product
     fn apply_product_rule(
         self: &Rc<Self>,
+        solver: &mut Solver,
         product: &Type,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
@@ -3123,12 +3163,12 @@ impl TraitObligation {
                 operands
                     .iter()
                     .map(|operand| {
-                        let level = operand.as_ref().map_or(0, super::type_level);
+                        let level = operand.as_ref().map_or(0, |x| super::type_level(solver, x));
                         match operand {
                             Some(Type::Infer(v)) => {
-                                Type::Infer(InferVar::fresh_in(level, &v.telescope))
+                                Type::Infer(InferVar::fresh_in(solver, level, &v.telescope))
                             }
-                            _ => crate::ccl::infer::solver::fresh_var(level),
+                            _ => crate::ccl::infer::solver::fresh_var(solver, level),
                         }
                     })
                     .collect()
@@ -3146,7 +3186,7 @@ impl TraitObligation {
             // `Equatable({T, U}, {V, W})` is stated through its components too.
             condition.assume(&self.context.borrow());
             for (pos, slot) in at_field.iter().enumerate() {
-                condition.watch(slot, pos as u8);
+                condition.watch(solver, slot, pos as u8);
             }
         }
         for (pos, operand) in operands.iter().enumerate() {
@@ -3154,7 +3194,7 @@ impl TraitObligation {
                 continue;
             };
             let shape = with_components(product, slots.iter().map(|at| at[pos].clone()));
-            constrain_subtype(operand, &shape, cache)?;
+            constrain_subtype(solver, operand, &shape, cache)?;
         }
         Ok(())
     }
@@ -3169,6 +3209,7 @@ impl TraitObligation {
     /// binder free.
     fn narrow_structural(
         self: &Rc<Self>,
+        solver: &mut Solver,
         pos: u8,
         contribution: &Type,
         cache: &mut ConstrainCache,
@@ -3204,7 +3245,7 @@ impl TraitObligation {
             "infer.apply_structural_rule",
             provenance::Nature::Machinery,
         );
-        constrain_subtype(&operand, &elements, cache)
+        constrain_subtype(solver, &operand, &elements, cache)
     }
 
     /// Whether a structural rule answers this obligation.
@@ -3236,8 +3277,12 @@ impl TraitObligation {
     /// there is no stale-read hazard and no reason to defer the write to a later
     /// phase. The [`Cell`] is set before constraining, so a re-entrant narrow reached
     /// through this very edge cannot deposit twice.
-    pub fn try_deposit(self: &Rc<Self>, cache: &mut ConstrainCache) -> Result<(), ConstrainError> {
-        self.try_select(cache)?;
+    pub fn try_deposit(
+        self: &Rc<Self>,
+        solver: &mut Solver,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        self.try_select(solver, cache)?;
         for position in &self.assoc {
             if position.deposited.get() {
                 continue;
@@ -3253,10 +3298,12 @@ impl TraitObligation {
             );
             let target = position.ty.borrow().clone();
             let ty = match &*self.output_refinement.borrow() {
-                Some(r) if r.assoc == position.name => r.template.refine(settled, &r.operands),
+                Some(r) if r.assoc == position.name => {
+                    r.template.refine(solver, settled, &r.operands)
+                }
                 _ => settled,
             };
-            constrain_subtype(&ty, &target, cache)?;
+            constrain_subtype(solver, &ty, &target, cache)?;
         }
         Ok(())
     }
@@ -3276,7 +3323,11 @@ impl TraitObligation {
     /// only candidate before anything is known about the operands has not chosen it, and a
     /// definition that uses the trait on a parameter states the requirement rather than
     /// the instance.
-    fn try_select(self: &Rc<Self>, cache: &mut ConstrainCache) -> Result<(), ConstrainError> {
+    fn try_select(
+        self: &Rc<Self>,
+        solver: &mut Solver,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
         if self.selected.get() || !self.narrowed.get() || !self.assumptions.borrow().is_empty() {
             return Ok(());
         }
@@ -3299,24 +3350,24 @@ impl TraitObligation {
             provenance::Nature::Machinery,
         );
         if let Some(call) = &self.method {
-            return self.select_method(call, &declared, cache);
+            return self.select_method(solver, call, &declared, cache);
         }
         let operands = self.operands.borrow().clone();
         let level = operands
             .iter()
             .flatten()
-            .map(super::type_level)
+            .map(|x| super::type_level(solver, x))
             .max()
             .unwrap_or(0);
         let fresh: HashMap<TypeParamId, Type> = declared
             .params
             .iter()
-            .map(|p| (p.id, crate::ccl::infer::solver::fresh_var(level)))
+            .map(|p| (p.id, crate::ccl::infer::solver::fresh_var(solver, level)))
             .collect();
         let open = |ty: &Type| replace_params(ty, &fresh);
         for (operand, stated) in operands.iter().zip(&declared.operands) {
             if let Some(operand) = operand {
-                constrain_subtype(operand, &open(stated), cache)?;
+                constrain_subtype(solver, operand, &open(stated), cache)?;
             }
         }
         for position in &self.assoc {
@@ -3328,13 +3379,18 @@ impl TraitObligation {
             };
             position.deposited.set(true);
             let target = position.ty.borrow().clone();
-            constrain_subtype(&open(stated), &target, cache)?;
+            constrain_subtype(solver, &open(stated), &target, cache)?;
         }
         for requirement in &declared.requires {
-            self.require_condition(&requirement.map_types(&open), level, cache)?;
+            self.require_condition(solver, &requirement.map_types(&open), level, cache)?;
         }
         for (param, bound) in &declared.bounds {
-            constrain_subtype(&open(&Type::Param(Rc::clone(param))), &open(bound), cache)?;
+            constrain_subtype(
+                solver,
+                &open(&Type::Param(Rc::clone(param))),
+                &open(bound),
+                cache,
+            )?;
         }
         Ok(())
     }
@@ -3344,13 +3400,14 @@ impl TraitObligation {
     /// function of a block emission has yet to emit, leave that to emission.
     fn select_method(
         self: &Rc<Self>,
+        solver: &mut Solver,
         call: &MethodCall,
         selected: &TraitInstance,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
         match self.selected_row(selected) {
             Err(error) => Err(ConstrainError::MethodCall(error.clone())),
-            Ok(MethodTarget::Scheme(scheme)) => self.instantiate_method(scheme, cache),
+            Ok(MethodTarget::Scheme(scheme)) => self.instantiate_method(solver, scheme, cache),
             Ok(MethodTarget::Member(_)) => {
                 call.selected.borrow_mut().push(Rc::clone(self));
                 Ok(())
@@ -3396,6 +3453,7 @@ impl TraitObligation {
     /// condition, as an instance's do.
     pub fn instantiate_method(
         &self,
+        solver: &mut Solver,
         scheme: &super::scheme::PolyScheme,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
@@ -3404,19 +3462,20 @@ impl TraitObligation {
             .as_ref()
             .expect("only a method call's obligation instantiates a method");
         let (level, telescope) = call.at.borrow().clone();
-        let instance = scheme.instantiate_with_params(level, &telescope, self.operator_node_id);
+        let instance =
+            scheme.instantiate_with_params(solver, level, &telescope, self.operator_node_id);
         for (instantiation, bound, _) in &instance.bounds {
-            constrain_subtype(instantiation, bound, cache)?;
+            constrain_subtype(solver, instantiation, bound, cache)?;
         }
         for requirement in &instance.requires {
-            self.require_condition(requirement, level, cache)?;
+            self.require_condition(solver, requirement, level, cache)?;
         }
         let [position] = self.assoc.as_slice() else {
             unreachable!("a method's trait associates the function its call reaches")
         };
         position.deposited.set(true);
         let function = position.ty.borrow().clone();
-        constrain_subtype(&instance.ty, &function, cache)
+        constrain_subtype(solver, &instance.ty, &function, cache)
     }
 
     /// The function a method call reaches: the type its selected method's flows into.
@@ -3454,6 +3513,7 @@ impl TraitObligation {
     /// (`src/ccl/design/type-inference.md`, "Selecting a declared instance").
     fn require_condition(
         &self,
+        solver: &mut Solver,
         requirement: &TraitRequirement,
         level: crate::ccl::Level,
         cache: &mut ConstrainCache,
@@ -3461,12 +3521,17 @@ impl TraitObligation {
         let positions: Vec<Type> = requirement
             .args
             .iter()
-            .map(|_| crate::ccl::infer::solver::fresh_var(level))
+            .map(|_| crate::ccl::infer::solver::fresh_var(solver, level))
             .collect();
         let assoc: Vec<(Assoc, Type)> = requirement
             .assoc
             .iter()
-            .map(|(name, _)| (name.clone(), crate::ccl::infer::solver::fresh_var(level)))
+            .map(|(name, _)| {
+                (
+                    name.clone(),
+                    crate::ccl::infer::solver::fresh_var(solver, level),
+                )
+            })
             .collect();
         let condition = TraitObligation::new_in(
             &self.table,
@@ -3477,14 +3542,14 @@ impl TraitObligation {
         );
         condition.assume(&self.context.borrow());
         for (pos, position) in positions.iter().enumerate() {
-            condition.watch(position, pos as u8);
+            condition.watch(solver, position, pos as u8);
         }
-        condition.try_deposit(cache)?;
+        condition.try_deposit(solver, cache)?;
         for (arg, position) in requirement.args.iter().zip(&positions) {
-            constrain_subtype(arg, position, cache)?;
+            constrain_subtype(solver, arg, position, cache)?;
         }
         for ((_, settled), (_, named)) in assoc.iter().zip(&requirement.assoc) {
-            constrain_subtype(settled, named, cache)?;
+            constrain_subtype(solver, settled, named, cache)?;
         }
         Ok(())
     }
@@ -3611,26 +3676,20 @@ fn register_watch(obligation: &Rc<TraitObligation>, pos: u8, ty: &Type) {
     });
 }
 
-thread_local! {
-    /// Every obligation holding an answer from a quantified assumption about a bounded family
-    /// ([`Held`]), which [`settle_held_answers`] deposits. Per inference run.
-    static HELD: RefCell<Vec<Rc<TraitObligation>>> = const { RefCell::new(Vec::new()) };
-}
-
 /// Record that `obligation` holds an answer for [`settle_held_answers`] to deposit.
-fn hold(obligation: &Rc<TraitObligation>) {
-    HELD.with(|held| held.borrow_mut().push(Rc::clone(obligation)));
+fn hold(solver: &mut Solver, obligation: &Rc<TraitObligation>) {
+    solver.held_answers.push(Rc::clone(obligation));
 }
 
-/// Forget every held answer. Called when an inference run begins.
-pub fn clear_held_answers() {
-    HELD.with(|held| held.borrow_mut().clear());
+/// Forget every held answer of the run, whose emission failed.
+pub fn clear_held_answers(solver: &mut Solver) {
+    solver.held_answers.clear();
 }
 
-pub(crate) fn discard_held_answers(params: &[TypeParamId]) {
-    HELD.with(|held| {
-        held.borrow_mut().retain(|o| !o.held_families_are(params));
-    });
+/// Forget the answers held at families `params` declares, whose definition was left
+/// incomplete.
+pub(crate) fn discard_held_answers(solver: &mut Solver, params: &[TypeParamId]) {
+    solver.held_answers.retain(|o| !o.held_families_are(params));
 }
 
 /// Deposit every answer held at one set of terms of a family `params` names, or of any family
@@ -3641,19 +3700,16 @@ pub(crate) fn discard_held_answers(params: &[TypeParamId]) {
 /// method calls it deferred are closed. What a specialization's copy holds after its pin is
 /// settled once it has been redelivered.
 pub fn settle_held_answers(
+    solver: &mut Solver,
     params: Option<&[TypeParamId]>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    let settling: Vec<Rc<TraitObligation>> = HELD.with(|held| {
-        let mut held = held.borrow_mut();
-        let (settling, kept) = std::mem::take(&mut *held)
-            .into_iter()
-            .partition(|o| params.is_none_or(|ps| o.held_families_are(ps)));
-        *held = kept;
-        settling
-    });
+    let (settling, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut solver.held_answers)
+        .into_iter()
+        .partition(|o| params.is_none_or(|ps| o.held_families_are(ps)));
+    solver.held_answers = kept;
     for obligation in settling {
-        obligation.settle_held(cache)?;
+        obligation.settle_held(solver, cache)?;
     }
     Ok(())
 }
@@ -3696,10 +3752,13 @@ pub fn clear_watch_log() {
 /// *read* of the graph (`compact` → `simplify` → `coalesce`), never something that
 /// records a bound, or the check would perturb what it is checking.
 #[cfg(debug_assertions)]
-pub fn verify_narrowing_is_complete(resolve: impl Fn(&Type) -> Option<Type>) {
+pub fn verify_narrowing_is_complete(
+    solver: &mut Solver,
+    resolve: impl Fn(&mut Solver, &Type) -> Option<Type>,
+) {
     WATCH_LOG.with(|log| {
         for (obligation, pos, operand) in log.borrow().iter() {
-            let Some(resolved) = resolve(operand) else {
+            let Some(resolved) = resolve(solver, operand) else {
                 // A position the program left conflicting: coalesce reports it, and
                 // there is no single base narrowing could have been offered.
                 continue;
@@ -3743,8 +3802,8 @@ thread_local! {
 /// Open the narrowing window, discarding any previous run's mark.
 ///
 /// Called from [`InferArena::new`](crate::ccl::infer::InferArena::new), which is the
-/// construct whose lifetime this state shares: the mark is per-run for the same reason
-/// the variable capture is. Resetting it is not optional bookkeeping. The mark is a
+/// construct whose lifetime this state shares: the mark is per-run. Resetting it is not
+/// optional bookkeeping. The mark is a
 /// high-water mark of a *process-global* counter, so a stale one left by an earlier run
 /// on this thread sits below every obligation the current run mints, and
 /// [`assert_post_emission_narrowing_selects`] would pass vacuously instead of being inert —
@@ -3864,7 +3923,10 @@ pub struct OperandRequirement {
 /// and in the order the sweep reached them; the caller supplies blame, because node
 /// identity belongs to the tree and not to the solver. A place that fails deposits
 /// nothing, and the sweep goes on to the others.
-pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Vec<OperandFailure> {
+pub fn resolve_operand_requirements(
+    solver: &mut Solver,
+    cache: &mut ConstrainCache,
+) -> Vec<OperandFailure> {
     // A deposit is an ordinary `constrain_subtype`, so it can deliver a base to another
     // variable's watches and shrink *their* candidate sets — which can determine a
     // value that was open when this pass looked at it. So the sweep runs to a fixpoint
@@ -3880,15 +3942,17 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Vec<OperandFa
     let mut reported = HashMap::new();
     loop {
         let before = deposited.len();
-        // Re-read the arena every pass rather than snapshotting once. Every variable
+        // Re-read the solver's variables every pass rather than snapshotting once. Every variable
         // being a root is what makes the sweep complete — it is why a function's domain
         // needs no traversal of its own — and a deposit is an ordinary
         // `constrain_subtype`, which is entitled to mint variables (an extrusion proxy,
-        // which `copy_watches` gives the original's requirements). Measured, the arena
+        // which `copy_watches` gives the original's requirements). Measured, the list
         // does not currently grow here; re-reading makes that irrelevant instead of
         // load-bearing.
+        let vars = solver.infer_vars().to_vec();
         resolve_pass(
-            &crate::ccl::infer_var::arena_vars(),
+            solver,
+            &vars,
             cache,
             &mut deposited,
             &mut failed,
@@ -3902,7 +3966,8 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Vec<OperandFa
 }
 
 /// A carried conflict reports nothing when it contains every requirement of an earlier
-/// conflict. Process smaller sets first so a carrier cannot hide its cause by arena order.
+/// conflict. Process smaller sets first so a carrier cannot hide its cause by the order the
+/// solver minted its variables in.
 fn group_operand_failures(
     mut failures: Vec<OperandFailure>,
     reported: HashMap<Vec<(TraitObligationId, u8)>, usize>,
@@ -3955,22 +4020,23 @@ fn group_operand_failures(
 /// Runs after [`resolve_operand_requirements`], whose deposits are upper bounds too, and before
 /// the emission seal, since it narrows a definition's obligations.
 pub fn deliver_resolutions(
+    solver: &mut Solver,
     cache: &mut ConstrainCache,
-    resolve: impl Fn(&Type) -> Option<Type>,
+    resolve: impl Fn(&mut Solver, &Type) -> Option<Type>,
 ) -> Result<(), (ConstrainError, provenance::NodeId)> {
-    for var in crate::ccl::infer_var::arena_vars() {
-        let watches = var.watches.borrow().clone();
-        if watches.is_empty() || !var.bounds.borrow().lower().is_empty() {
+    for var in solver.infer_vars().to_vec() {
+        let watches = var.watches(solver).to_vec();
+        if watches.is_empty() || !var.bounds(solver).lower().is_empty() {
             continue;
         }
-        let Some(resolved) = resolve(&Type::Infer(Rc::clone(&var))) else {
+        let Some(resolved) = resolve(solver, &Type::Infer(Rc::clone(&var))) else {
             continue;
         };
         if matches!(offered(&resolved), Offered::Unknown) {
             continue;
         }
         for (obligation, pos) in watches {
-            deliver(&obligation, pos, &resolved, None, cache)
+            deliver(solver, &obligation, pos, &resolved, None, cache)
                 .map_err(|e| (e, obligation.operator_node_id))?;
         }
     }
@@ -4061,7 +4127,7 @@ fn peel_refinements(ty: &Type) -> &Type {
 /// inference (a self-call is an unbound variable) and `LetRec` is born after it — so
 /// this is a precondition to re-check when recursive definitions arrive, not a live
 /// hazard.
-fn places_under(root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
+fn places_under(solver: &mut Solver, root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
     let mut out: BTreeMap<StepPath, Place> = Default::default();
     let mut seen: std::collections::HashSet<(InferVarId, StepPath)> = Default::default();
     let mut frontier = vec![(Rc::clone(root), StepPath::new())];
@@ -4071,7 +4137,7 @@ fn places_under(root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
         }
         let entry = out.entry(path.clone()).or_default();
         entry.vars.push(Rc::clone(&var));
-        for (obligation, pos) in var.watches.borrow().iter() {
+        for (obligation, pos) in var.watches(solver).iter() {
             // An obligation answered by a product is answered off the table, so its
             // `accepted_at` is the untouched row set and intersecting it would deposit a
             // base at a place holding a product ([`TraitObligation::narrow_product`]).
@@ -4094,7 +4160,7 @@ fn places_under(root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
                 entry.reqs.push((Rc::clone(obligation), *pos));
             }
         }
-        for bound in var.bounds.borrow().upper().iter() {
+        for bound in var.bounds(solver).upper().iter() {
             // Refinements are peeled at every step, for the same reason `offered` peels
             // them: `{𝑇 | 𝑝}` constrains a place exactly as `𝑇` does, so a refined
             // bound must not hide the structure underneath it.
@@ -4160,6 +4226,7 @@ fn places_under(root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
                 | Type::BarrierVar(_)
                 | Type::SharedHole(_)
                 | Type::DataSource(_)
+                | Type::Undetermined(_)
                 | Type::ChanDom(_, _)
                 | Type::Param(_)
                 | Type::Txn => {}
@@ -4195,8 +4262,12 @@ fn places_under(root: &Rc<InferVar>) -> BTreeMap<StepPath, Place> {
 /// Bases only. A non-base lower bound reaches the obligation through `deliver`, which
 /// narrows by it or rejects it ([`Offered`]); this function does not read a non-base upper
 /// bound.
-fn conflicting_base(var: &Rc<InferVar>, required: &BaseType) -> Option<BaseType> {
-    let bounds = var.bounds.borrow();
+fn conflicting_base(
+    solver: &mut Solver,
+    var: &Rc<InferVar>,
+    required: &BaseType,
+) -> Option<BaseType> {
+    let bounds = var.bounds(solver);
     bounds
         .lower()
         .iter()
@@ -4216,6 +4287,7 @@ fn descend(ty: &Type, path: &StepPath, step: Step, frontier: &mut Vec<(Rc<InferV
 }
 
 fn resolve_pass(
+    solver: &mut Solver,
     vars: &[Rc<InferVar>],
     cache: &mut ConstrainCache,
     deposited: &mut std::collections::HashSet<(InferVarId, BaseType)>,
@@ -4224,7 +4296,7 @@ fn resolve_pass(
     reported: &mut HashMap<Vec<(TraitObligationId, u8)>, usize>,
 ) {
     for root in vars {
-        for place in places_under(root).into_values() {
+        for place in places_under(solver, root).into_values() {
             if place.reqs.is_empty() {
                 continue;
             }
@@ -4344,7 +4416,7 @@ fn resolve_pass(
                     if let Some(found) = place
                         .vars
                         .iter()
-                        .find_map(|var| conflicting_base(var, only))
+                        .find_map(|var| conflicting_base(solver, var, only))
                     {
                         failed.insert(key);
                         failures.push(OperandFailure::ContradictsBound {
@@ -4361,7 +4433,7 @@ fn resolve_pass(
                         }
                         let deposit = Type::Base((*only).clone());
                         if let Err(error) =
-                            constrain_subtype(&Type::Infer(Rc::clone(var)), &deposit, cache)
+                            constrain_subtype(solver, &Type::Infer(Rc::clone(var)), &deposit, cache)
                         {
                             failures.push(OperandFailure::Conflict {
                                 vars: blame(),
@@ -4382,7 +4454,7 @@ fn resolve_pass(
                     // with one row, which determines `𝑏` next round.
                     for (obligation, pos) in &place.reqs {
                         let head = InstanceHead::Base(only.clone());
-                        if let Err(error) = obligation.narrow(*pos, &head, cache) {
+                        if let Err(error) = obligation.narrow(solver, *pos, &head, cache) {
                             debug_assert!(
                                 false,
                                 "narrowing by a base the intersection just proved \
@@ -4660,20 +4732,21 @@ pub fn offered_head(ty: &Type) -> Option<InstanceHead> {
 /// `into` takes a type in `lower`'s frame to `upper`'s, the edge's substitution: a family
 /// application `lower` carries reads terms, which the obligation reads where `upper` stands.
 pub(super) fn link_watches(
+    solver: &mut Solver,
     lower: &Rc<InferVar>,
     upper: &Rc<InferVar>,
     into: &crate::ccl::subst::Subst,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     let incoming = {
-        let watches = upper.watches.borrow();
+        let watches = upper.watches(solver);
         if watches.is_empty() {
             return Ok(());
         }
-        watches.clone()
+        watches.to_vec()
     };
     let added: Vec<(Rc<TraitObligation>, u8)> = {
-        let mut watches = lower.watches.borrow_mut();
+        let watches = lower.watches_mut(solver);
         incoming
             .into_iter()
             .filter(|(ob, pos)| {
@@ -4689,7 +4762,7 @@ pub(super) fn link_watches(
         return Ok(());
     }
     for (obligation, pos) in &added {
-        let frame = crate::ccl::subst::Subst::then(into, &obligation.frame_of(*pos, upper));
+        let frame = crate::ccl::subst::Subst::then(solver, into, &obligation.frame_of(*pos, upper));
         if !frame.is_id() {
             obligation
                 .frames
@@ -4703,24 +4776,25 @@ pub(super) fn link_watches(
     // with the bases: missing one would leave an operator on an unbounded parameter
     // unchecked.
     let (known, params, products, collections, nominal_above, below, barriers_below) = {
-        let bounds = lower.bounds.borrow();
-        let known: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
-            .lower()
+        let (lowers, uppers) = {
+            let bounds = lower.bounds(solver);
+            (Rc::clone(bounds.lower()), Rc::clone(bounds.upper()))
+        };
+        let known: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = lowers
             .iter()
             .filter(|b| offered_head(&b.ty).is_some())
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
-        let params: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
-            .lower()
+        let params: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = lowers
             .iter()
             .filter(|b| matches!(offered(&b.ty), Offered::Param(_) | Offered::Family(_)))
             // A family application reads terms, rendered where `lower` stands and read by each
             // obligation in its operand's frame ([`deliver_in_frame`]).
             .map(|b| match &b.ty {
                 Type::FamilyApp(_) => (
-                    b.render_subst()
+                    b.render_subst(solver)
                         .copying(crate::ccl::Ids::Kept)
-                        .apply_type(&b.ty),
+                        .apply_type_in(solver, &b.ty),
                     b.origin,
                 ),
                 _ => (b.ty.clone(), b.origin),
@@ -4728,38 +4802,33 @@ pub(super) fn link_watches(
             .collect();
         // A product no product rule reads is refused as it is when it arrives after the edge: a
         // record reaching `Orderable`, the keys of a map an ordered loop runs over.
-        let products: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
-            .lower()
+        let products: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = lowers
             .iter()
             .filter(|b| matches!(offered(&b.ty), Offered::Product(_)))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
         // A collection offers no head, and the collection rule reads it all the same, from
         // either side ([`notify_upper`]).
-        let collections: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
-            .lower()
+        let collections: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = lowers
             .iter()
-            .chain(bounds.upper().iter())
-            .filter(|b| is_structural_collection(&b.ty) || b.ty.is_place())
+            .chain(uppers.iter())
+            .filter(|b| is_structural_collection(solver, &b.ty) || b.ty.is_place())
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
         // A method call reads a nominal type from above too ([`notify_upper`]).
-        let nominal_above: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
-            .upper()
+        let nominal_above: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = uppers
             .iter()
             .filter(|b| matches!(b.ty.peel_refinements(), Type::Nominal(..)))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
-        let below: Vec<(Rc<InferVar>, crate::ccl::subst::Subst)> = bounds
-            .lower()
+        let below: Vec<(Rc<InferVar>, crate::ccl::subst::Subst)> = lowers
             .iter()
             .filter_map(|b| match &b.ty {
-                Type::Infer(v) => Some((Rc::clone(v), b.render_subst())),
+                Type::Infer(v) => Some((Rc::clone(v), b.render_subst(solver))),
                 _ => None,
             })
             .collect();
-        let barriers_below: Vec<Rc<BarrierVar>> = bounds
-            .lower()
+        let barriers_below: Vec<Rc<BarrierVar>> = lowers
             .iter()
             .filter_map(|b| match &b.ty {
                 Type::BarrierVar(barrier) => Some(Rc::clone(barrier)),
@@ -4778,35 +4847,36 @@ pub(super) fn link_watches(
     };
     for (obligation, pos) in &added {
         for (known, origin) in &known {
-            deliver(obligation, *pos, known, *origin, cache)?;
+            deliver(solver, obligation, *pos, known, *origin, cache)?;
         }
         for (param, origin) in &params {
-            deliver_in_frame(obligation, *pos, lower, param, *origin, cache)?;
+            deliver_in_frame(solver, obligation, *pos, lower, param, *origin, cache)?;
         }
         for (product, origin) in &products {
             if !obligation.trait_.admits_product(product) {
-                deliver(obligation, *pos, product, *origin, cache)?;
+                deliver(solver, obligation, *pos, product, *origin, cache)?;
             }
         }
         for (collection, origin) in &collections {
-            if (obligation.trait_.reads_collections() && is_structural_collection(collection))
+            if (obligation.trait_.reads_collections()
+                && is_structural_collection(solver, collection))
                 || (obligation.trait_.reads_places() && collection.is_place())
             {
-                deliver(obligation, *pos, collection, *origin, cache)?;
+                deliver(solver, obligation, *pos, collection, *origin, cache)?;
             }
         }
         if obligation.trait_.is_method() {
             for (nominal, origin) in &nominal_above {
-                deliver(obligation, *pos, nominal, *origin, cache)?;
+                deliver(solver, obligation, *pos, nominal, *origin, cache)?;
             }
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
     for (v, into) in below {
-        link_watches(&v, lower, &into, cache)?;
+        link_watches(solver, &v, lower, &into, cache)?;
     }
     for barrier in barriers_below {
-        link_barrier_watches(&barrier, lower, cache)?;
+        link_barrier_watches(solver, &barrier, lower, cache)?;
     }
     Ok(())
 }
@@ -4822,13 +4892,14 @@ pub(super) fn link_watches(
 /// obligations. Lower bounds arriving after the edge are delivered by
 /// [`notify_barrier_lower`].
 pub(super) fn link_barrier_watches(
+    solver: &mut Solver,
     lower: &Rc<BarrierVar>,
     upper: &Rc<InferVar>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    let incoming = upper.watches.borrow().clone();
+    let incoming = upper.watches(solver).to_vec();
     let added: Vec<(Rc<TraitObligation>, u8)> = {
-        let mut watches = lower.watches.borrow_mut();
+        let watches = lower.watches_mut(solver);
         incoming
             .into_iter()
             .filter(|(ob, pos)| {
@@ -4844,10 +4915,10 @@ pub(super) fn link_barrier_watches(
         return Ok(());
     }
     // Snapshot: a delivery re-enters `constrain_go`, which can add a lower bound here.
-    let lowers = lower.lowers.borrow().clone();
+    let lowers = lower.lowers(solver).to_vec();
     for (obligation, pos) in &added {
         for bound in &lowers {
-            deliver(obligation, *pos, &bound.ty, bound.origin, cache)?;
+            deliver(solver, obligation, *pos, &bound.ty, bound.origin, cache)?;
         }
     }
     Ok(())
@@ -4857,14 +4928,15 @@ pub(super) fn link_barrier_watches(
 /// it: the counterpart of [`notify_lower`] for the barrier variable's lower-bound arm in
 /// `constrain_go`.
 pub(super) fn notify_barrier_lower(
+    solver: &mut Solver,
     barrier: &Rc<BarrierVar>,
     contribution: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     // Snapshot: a deposit re-enters `constrain_go`, which can append watches.
-    let watches = barrier.watches.borrow().clone();
+    let watches = barrier.watches(solver).to_vec();
     for (obligation, pos) in watches {
-        deliver(&obligation, pos, contribution, None, cache)?;
+        deliver(solver, &obligation, pos, contribution, None, cache)?;
     }
     Ok(())
 }
@@ -4878,20 +4950,21 @@ pub(super) fn notify_barrier_lower(
 /// morphism the solver can compose. Materializing the bound into the holder's frame
 /// would cost a walk and change nothing.
 pub(super) fn notify_lower(
+    solver: &mut Solver,
     var: &Rc<InferVar>,
     contribution: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     // Snapshot: a deposit re-enters `constrain_go`, which can append watches.
     let watches = {
-        let watches = var.watches.borrow();
+        let watches = var.watches(solver);
         if watches.is_empty() {
             return Ok(());
         }
-        watches.clone()
+        watches.to_vec()
     };
     for (obligation, pos) in watches {
-        deliver_in_frame(&obligation, pos, var, contribution, None, cache)?;
+        deliver_in_frame(solver, &obligation, pos, var, contribution, None, cache)?;
     }
     Ok(())
 }
@@ -4900,6 +4973,7 @@ pub(super) fn notify_lower(
 /// `pos`: a family application's terms are renamed by the edges the watch was carried down
 /// ([`TraitObligation::frames`]). Every other contribution offers what it offers in any frame.
 fn deliver_in_frame(
+    solver: &mut Solver,
     obligation: &Rc<TraitObligation>,
     pos: u8,
     var: &InferVar,
@@ -4912,11 +4986,11 @@ fn deliver_in_frame(
         if !frame.is_id() {
             let at = frame
                 .copying(crate::ccl::Ids::Kept)
-                .apply_type(contribution);
-            return deliver(obligation, pos, &at, value, cache);
+                .apply_type_in(solver, contribution);
+            return deliver(solver, obligation, pos, &at, value, cache);
         }
     }
-    deliver(obligation, pos, contribution, value, cache)
+    deliver(solver, obligation, pos, contribution, value, cache)
 }
 
 /// Deliver an upper bound to every obligation watching `var` that reads it: one that reads
@@ -4930,16 +5004,16 @@ fn deliver_in_frame(
 /// above the receiver settles that the same way: only a nominal type is below it
 /// (`src/ccl/design/nominal-types.md`, "Method calls").
 pub(super) fn notify_upper(
+    solver: &mut Solver,
     var: &Rc<InferVar>,
     bound: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     let watches: Vec<(Rc<TraitObligation>, u8)> = var
-        .watches
-        .borrow()
+        .watches(solver)
         .iter()
         .filter(|(obligation, _)| {
-            (obligation.trait_.reads_collections() && is_structural_collection(bound))
+            (obligation.trait_.reads_collections() && is_structural_collection(solver, bound))
                 || (obligation.trait_.reads_places() && bound.is_place())
                 || (obligation.trait_.is_method()
                     && matches!(bound.peel_refinements(), Type::Nominal(..)))
@@ -4947,7 +5021,7 @@ pub(super) fn notify_upper(
         .cloned()
         .collect();
     for (obligation, pos) in watches {
-        deliver(&obligation, pos, bound, None, cache)?;
+        deliver(solver, &obligation, pos, bound, None, cache)?;
     }
     Ok(())
 }
@@ -4957,13 +5031,14 @@ pub(super) fn notify_upper(
 /// A type parameter offers its bound: a value of a bounded parameter's type is a
 /// value of its bound's type. An unbounded parameter supports no trait.
 fn deliver(
+    solver: &mut Solver,
     obligation: &Rc<TraitObligation>,
     pos: u8,
     contribution: &Type,
     value: Option<crate::ccl::infer_var::Origin>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    let delivered = offer(obligation, pos, contribution, cache);
+    let delivered = offer(solver, obligation, pos, contribution, cache);
     // The obligation is the demand a contribution failed: an edge a deposit drew
     // further in, failing first, has already recorded its own.
     if delivered.is_err() {
@@ -4975,40 +5050,44 @@ fn deliver(
 
 /// [`deliver`]'s reading of `contribution` at position `pos`.
 fn offer(
+    solver: &mut Solver,
     obligation: &Rc<TraitObligation>,
     pos: u8,
     contribution: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     if obligation.is_arg_slot(pos) {
-        return obligation.narrow_arg(pos, contribution, cache);
+        return obligation.narrow_arg(solver, pos, contribution, cache);
     }
     if !obligation.has_variable_at(pos)
-        && ((obligation.trait_.reads_collections() && is_structural_collection(contribution))
+        && ((obligation.trait_.reads_collections()
+            && is_structural_collection(solver, contribution))
             || (obligation.trait_.reads_places() && contribution.is_place()))
     {
-        return obligation.narrow_structural(pos, contribution, cache);
+        return obligation.narrow_structural(solver, pos, contribution, cache);
     }
     match offered(contribution) {
         // A type variable standing as a candidate's whole operand takes what no head names.
         Offered::Product(_) | Offered::NotABase | Offered::Param(_) | Offered::Family(_)
             if obligation.has_variable_at(pos) =>
         {
-            obligation.narrow_to_variables(pos, contribution, cache)
+            obligation.narrow_to_variables(solver, pos, contribution, cache)
         }
-        Offered::Base(base) => obligation.narrow(pos, &InstanceHead::Base(base.clone()), cache),
+        Offered::Base(base) => {
+            obligation.narrow(solver, pos, &InstanceHead::Base(base.clone()), cache)
+        }
         // A nominal type narrows by its declaration, then by its arguments where the
         // instances left tell apart by them.
         Offered::Nominal(decl) => obligation
-            .narrow(pos, &InstanceHead::Nominal(Rc::clone(decl)), cache)
+            .narrow(solver, pos, &InstanceHead::Nominal(Rc::clone(decl)), cache)
             .and_then(|()| match contribution.peel_refinements() {
-                Type::Nominal(decl, args) => obligation.expand(pos, decl, args, cache),
+                Type::Nominal(decl, args) => obligation.expand(solver, pos, decl, args, cache),
                 _ => Ok(()),
             }),
-        Offered::Product(product) => obligation.narrow_product(pos, product, cache),
+        Offered::Product(product) => obligation.narrow_product(solver, pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
-        Offered::Param(param) => obligation.narrow_param(pos, param, cache),
-        Offered::Family(app) => obligation.narrow_family(pos, app, cache),
+        Offered::Param(param) => obligation.narrow_param(solver, pos, param, cache),
+        Offered::Family(app) => obligation.narrow_family(solver, pos, app, cache),
         Offered::Unknown => Ok(()),
     }
 }
@@ -5016,9 +5095,11 @@ fn offer(
 /// Whether `ty`, refinements peeled, is a structural collection: a data function, a sum over
 /// one. A function whose kind is not settled
 /// yet counts, and a compute function does not: a function that is only called is no collection.
-pub fn is_structural_collection(ty: &Type) -> bool {
+pub fn is_structural_collection(solver: &Solver, ty: &Type) -> bool {
     match ty.peel_refinements() {
-        Type::Fun { fun_kind, .. } => fun_kind.resolved() != crate::ccl::ty::KindPin::Compute,
+        Type::Fun { fun_kind, .. } => {
+            fun_kind.resolved_in(solver) != crate::ccl::ty::KindPin::Compute
+        }
         _ => false,
     }
 }
@@ -5045,6 +5126,7 @@ fn type_at<'t>(ty: &'t Type, path: &[u8]) -> Option<&'t Type> {
 /// conditions are no deeper than its head and shallower unless they name an earlier trait
 /// (`src/ccl/design/type-inference.md`, "An instance's conditions end").
 pub fn entailed(
+    solver: &mut Solver,
     requirement: &TraitRequirement,
     assumptions: &[Rc<TraitRequirement>],
     table: &InstanceTable,
@@ -5052,13 +5134,13 @@ pub fn entailed(
     let args: Vec<Type> = requirement
         .args
         .iter()
-        .map(crate::ccl::ccl_utils::strip_refinements)
+        .map(|x| crate::ccl::ccl_utils::strip_refinements_in(solver, x))
         .collect();
-    let assoc_agrees = |stated: &dyn Fn(&Assoc) -> Option<Type>| {
+    let assoc_agrees = |solver: &mut Solver, stated: &dyn Fn(&Assoc) -> Option<Type>| {
         requirement.assoc.iter().all(|(name, t)| {
             stated(name).is_none_or(|s| {
-                crate::ccl::ccl_utils::strip_refinements(&s)
-                    == crate::ccl::ccl_utils::strip_refinements(t)
+                crate::ccl::ccl_utils::strip_refinements_in(solver, &s)
+                    == crate::ccl::ccl_utils::strip_refinements_in(solver, t)
             })
         })
     };
@@ -5066,9 +5148,9 @@ pub fn entailed(
         a.trait_ == requirement.trait_
             && a.args
                 .iter()
-                .map(crate::ccl::ccl_utils::strip_refinements)
+                .map(|x| crate::ccl::ccl_utils::strip_refinements_in(solver, x))
                 .eq(args.iter().cloned())
-            && assoc_agrees(&|n| a.assoc_ty(n).cloned())
+            && assoc_agrees(solver, &|n| a.assoc_ty(n).cloned())
     }) {
         return true;
     }
@@ -5097,16 +5179,17 @@ pub fn entailed(
                 binders: Vec::new(),
                 at: requirement.at,
             };
-            entailed(&at_field, assumptions, table)
+            entailed(solver, &at_field, assumptions, table)
         });
     }
     table.instances(&requirement.trait_).iter().any(|i| {
-        i.bind(&args).is_some_and(|bound| {
-            assoc_agrees(&|n| i.assoc_ty(n).map(|t| replace_params(&t, &bound)))
-                && i.requires.iter().all(|r| {
-                    let r = r.map_types(|t| replace_params(t, &bound));
-                    entailed(&r, assumptions, table)
-                })
+        i.bind(solver, &args).is_some_and(|bound| {
+            assoc_agrees(solver, &|n| {
+                i.assoc_ty(n).map(|t| replace_params(&t, &bound))
+            }) && i.requires.iter().all(|r| {
+                let r = r.map_types(|t| replace_params(t, &bound));
+                entailed(solver, &r, assumptions, table)
+            })
         })
     })
 }
@@ -5148,22 +5231,22 @@ mod tests {
     }
 
     #[test]
-    fn copied_requirements_release_their_ancestors_with_the_arena() {
+    fn copied_requirements_release_their_ancestors_with_the_solver() {
         let (original, copied) = {
-            let _arena = crate::ccl::infer::InferArena::new();
+            let solver = &mut Solver::new();
             let node = provenance::NodeId::fresh();
-            let original_value = fresh_var(0);
-            let copied_value = fresh_var(0);
+            let original_value = fresh_var(solver, 0);
+            let copied_value = fresh_var(solver, 0);
             let original = TraitObligation::new(
                 std_trait(StdTrait::Addable),
                 vec![(Assoc::output(), original_value.clone())],
                 node,
                 crate::ccl::infer_var::Origin::Node(node),
             );
-            original.watch(&original_value, 0);
-            let copied = TraitObligation::new_from(&original);
+            original.watch(solver, &original_value, 0);
+            let copied = TraitObligation::new_from(solver, &original);
             copied.set_assoc_types(vec![copied_value.clone()]);
-            copied.watch(&copied_value, 0);
+            copied.watch(solver, &copied_value, 0);
             (Rc::downgrade(&original), Rc::downgrade(&copied))
         };
         // The debug audit retains its own handles until the next run starts.
@@ -5179,8 +5262,9 @@ mod tests {
     #[case(&[(0, BaseType::Int), (1, BaseType::Int)])]
     #[case(&[(1, BaseType::Int), (0, BaseType::Int)])]
     fn narrowing_is_order_independent(#[case] steps: &[(u8, BaseType)]) {
+        let solver = &mut Solver::new();
         let node_id = provenance::NodeId::fresh();
-        let out = fresh_var(0);
+        let out = fresh_var(solver, 0);
         let ob = TraitObligation::new(
             std_trait(StdTrait::Addable),
             vec![(Assoc::output(), out.clone())],
@@ -5190,15 +5274,14 @@ mod tests {
         let mut cache = ConstrainCache::new();
 
         for (pos, base) in steps {
-            ob.narrow(*pos, &InstanceHead::Base(base.clone()), &mut cache)
+            ob.narrow(solver, *pos, &InstanceHead::Base(base.clone()), &mut cache)
                 .expect("Int + Int is addable");
         }
 
         assert_eq!(ob.candidates().len(), 1);
         let Type::Infer(v) = &out else { unreachable!() };
         assert!(
-            v.bounds
-                .borrow()
+            v.bounds(solver)
                 .lower()
                 .iter()
                 .any(|b| b.ty.peel_refinements() == &Type::Base(BaseType::Int)),
@@ -5211,8 +5294,9 @@ mod tests {
     /// operand, which stays open for a future heterogeneous instance.
     #[test]
     fn one_known_operand_settles_an_agreed_output() {
+        let solver = &mut Solver::new();
         let node_id = provenance::NodeId::fresh();
-        let out = fresh_var(0);
+        let out = fresh_var(solver, 0);
         let ob = TraitObligation::new(
             std_trait(StdTrait::Addable),
             vec![(Assoc::output(), out.clone())],
@@ -5221,7 +5305,7 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
 
-        ob.narrow(1, &InstanceHead::Base(BaseType::Int), &mut cache)
+        ob.narrow(solver, 1, &InstanceHead::Base(BaseType::Int), &mut cache)
             .expect("Int is addable");
 
         assert!(
@@ -5251,9 +5335,10 @@ mod tests {
     /// pins it.
     #[test]
     fn only_the_refining_addition_carries_a_predicate() {
-        let deposited = |trait_: Trait, refined: bool| {
+        let solver = &mut Solver::new();
+        let mut deposited = |trait_: Trait, refined: bool| {
             let node_id = provenance::NodeId::fresh();
-            let out = fresh_var(0);
+            let out = fresh_var(solver, 0);
             let ob = TraitObligation::new(
                 trait_,
                 vec![(Assoc::output(), out.clone())],
@@ -5270,13 +5355,14 @@ mod tests {
                 });
             }
             ob.narrow(
+                solver,
                 0,
                 &InstanceHead::Base(BaseType::Int),
                 &mut ConstrainCache::new(),
             )
             .expect("Int adds to Int under either trait");
             let Type::Infer(v) = &out else { unreachable!() };
-            let bounds = v.bounds.borrow();
+            let bounds = v.bounds(solver);
             bounds
                 .lower()
                 .iter()
@@ -5300,6 +5386,7 @@ mod tests {
     /// not just here.
     #[test]
     fn a_comparison_associates_nothing() {
+        let solver = &mut Solver::new();
         let node_id = provenance::NodeId::fresh();
         let ob = TraitObligation::new(
             std_trait(StdTrait::Equatable),
@@ -5309,14 +5396,15 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
 
-        ob.try_deposit(&mut cache).expect("nothing to deposit");
+        ob.try_deposit(solver, &mut cache)
+            .expect("nothing to deposit");
         assert_eq!(ob.agreed_assoc(&Assoc::output()), None);
 
         // The requirement half is untouched.
-        ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
+        ob.narrow(solver, 0, &InstanceHead::Base(BaseType::Int), &mut cache)
             .expect("Int is equatable");
         assert!(
-            ob.narrow(1, &InstanceHead::Base(BaseType::String), &mut cache)
+            ob.narrow(solver, 1, &InstanceHead::Base(BaseType::String), &mut cache)
                 .is_err(),
             "nothing equates an Int to a String",
         );
@@ -5326,8 +5414,9 @@ mod tests {
     /// says what the position could still have taken.
     #[test]
     fn incompatible_operands_have_no_instance() {
+        let solver = &mut Solver::new();
         let node_id = provenance::NodeId::fresh();
-        let out = fresh_var(0);
+        let out = fresh_var(solver, 0);
         let ob = TraitObligation::new(
             std_trait(StdTrait::Orderable),
             vec![(Assoc::output(), out)],
@@ -5336,10 +5425,10 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
 
-        ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
+        ob.narrow(solver, 0, &InstanceHead::Base(BaseType::Int), &mut cache)
             .expect("Int is orderable");
         let err = ob
-            .narrow(1, &InstanceHead::Base(BaseType::String), &mut cache)
+            .narrow(solver, 1, &InstanceHead::Base(BaseType::String), &mut cache)
             .expect_err("nothing compares an Int to a String");
 
         let ConstrainError::NoTraitInstance {
@@ -5363,6 +5452,7 @@ mod tests {
     /// variables at one field stand at different positions of the same condition.
     #[test]
     fn the_product_rule_pairs_components_by_field() {
+        let solver = &mut Solver::new();
         use crate::ccl::infer::solver::constrain_subtype;
         let node_id = provenance::NodeId::fresh();
         let ob = TraitObligation::new(
@@ -5371,20 +5461,30 @@ mod tests {
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
         );
-        let (a, b) = (fresh_var(1), fresh_var(1));
-        ob.watch(&a, 0);
-        ob.watch(&b, 1);
+        let (a, b) = (fresh_var(solver, 1), fresh_var(solver, 1));
+        ob.watch(solver, &a, 0);
+        ob.watch(solver, &b, 1);
         let mut cache = ConstrainCache::new();
         let pair = |x: BaseType, y: BaseType| Type::Tuple(vec![Type::Base(x), Type::Base(y)]);
-        constrain_subtype(&pair(BaseType::Int, BaseType::String), &a, &mut cache)
-            .expect("a pair of equatable bases is a product the rule answers");
-        constrain_subtype(&pair(BaseType::Int, BaseType::String), &b, &mut cache)
-            .expect("the same shape over the same bases");
+        constrain_subtype(
+            solver,
+            &pair(BaseType::Int, BaseType::String),
+            &a,
+            &mut cache,
+        )
+        .expect("a pair of equatable bases is a product the rule answers");
+        constrain_subtype(
+            solver,
+            &pair(BaseType::Int, BaseType::String),
+            &b,
+            &mut cache,
+        )
+        .expect("the same shape over the same bases");
 
         // The variables each operand's upper bound holds, by field.
         let slots = |v: &Type| -> Vec<Rc<InferVar>> {
             let Type::Infer(v) = v else { unreachable!() };
-            let upper = Rc::clone(v.bounds.borrow().upper());
+            let upper = Rc::clone(v.bounds(solver).upper());
             let tuples: Vec<Vec<Rc<InferVar>>> = upper
                 .iter()
                 .filter_map(|bound| match &bound.ty {
@@ -5412,11 +5512,7 @@ mod tests {
                 "field {field}: each operand has its own slot"
             );
             let watched = |s: &Rc<InferVar>| -> Vec<(TraitObligationId, u8)> {
-                s.watches
-                    .borrow()
-                    .iter()
-                    .map(|(o, p)| (o.uid, *p))
-                    .collect()
+                s.watches(solver).iter().map(|(o, p)| (o.uid, *p)).collect()
             };
             let (wa, wb) = (watched(sa), watched(sb));
             let [(ca, 0)] = wa.as_slice() else {
@@ -5444,6 +5540,7 @@ mod tests {
     #[case::base_then_product(true)]
     #[case::product_then_base(false)]
     fn a_base_and_a_product_exclude_each_other(#[case] base_first: bool) {
+        let solver = &mut Solver::new();
         let node_id = provenance::NodeId::fresh();
         let ob = TraitObligation::new(
             std_trait(StdTrait::Equatable),
@@ -5451,19 +5548,19 @@ mod tests {
             node_id,
             crate::ccl::infer_var::Origin::Node(node_id),
         );
-        let (a, b) = (fresh_var(1), fresh_var(1));
-        ob.watch(&a, 0);
-        ob.watch(&b, 1);
+        let (a, b) = (fresh_var(solver, 1), fresh_var(solver, 1));
+        ob.watch(solver, &a, 0);
+        ob.watch(solver, &b, 1);
         let mut cache = ConstrainCache::new();
         let product = Type::Tuple(vec![Type::Base(BaseType::Int)]);
         let result = if base_first {
-            ob.narrow(0, &InstanceHead::Base(BaseType::Int), &mut cache)
+            ob.narrow(solver, 0, &InstanceHead::Base(BaseType::Int), &mut cache)
                 .expect("Int is equatable");
-            ob.narrow_product(1, &product, &mut cache)
+            ob.narrow_product(solver, 1, &product, &mut cache)
         } else {
-            ob.narrow_product(0, &product, &mut cache)
+            ob.narrow_product(solver, 0, &product, &mut cache)
                 .expect("a tuple of Int is equatable");
-            ob.narrow(1, &InstanceHead::Base(BaseType::Int), &mut cache)
+            ob.narrow(solver, 1, &InstanceHead::Base(BaseType::Int), &mut cache)
         };
         assert!(
             matches!(result, Err(ConstrainError::NoTraitInstance { .. })),
@@ -5508,8 +5605,9 @@ mod tests {
     /// [`offered_base`].
     #[test]
     fn a_non_base_shape_offers_nothing() {
+        let solver = &mut Solver::new();
         assert_eq!(offered_base(&Type::UIntRange(3)), None);
         assert_eq!(offered_base(&Type::Txn), None);
-        assert_eq!(offered_base(&fresh_var(0)), None);
+        assert_eq!(offered_base(&fresh_var(solver, 0)), None);
     }
 }

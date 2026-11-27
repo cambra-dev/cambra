@@ -7,6 +7,7 @@
 //! [`check_fully_typed`] and [`typecheck`] validate recorded types;
 //! [`TypeInferenceContext`] supplies source registrations.
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -29,22 +30,19 @@ use crate::util::ScopeStack;
 // InferArena
 // ---------------------------------------------------------------------------
 
-/// Break inference-variable reference cycles at the end of a run.
+/// Scope the thread-local state of a run that its [`Solver`] does not hold: the capability
+/// variables given an upper bound, the edges out of `try` bodies and the ordering requirements
+/// ([`crate::ccl::capabilities`]), the predicate derivations coalesce reads, and, in debug
+/// builds, the trait-narrowing audit trail and the requirement sweep's window. Capability
+/// variables keep their state on their handles.
 ///
-/// Captures every fresh variable on this thread and clears its bounds and trait
-/// watches on drop, including error returns. No borrow of either cell may outlive
-/// this guard. Nested arenas on the same thread are unsupported.
-///
-/// Successful results retain no bound-bearing solver graph; failed trees can
-/// retain variables whose graph has been cleared. For ownership and teardown
-/// rationale, see `src/ccl/design/type-inference.md`,
-/// "3.2 The `InferArena`: who owns inference variables".
+/// What a run records on its inference, funkind and barrier variables lives in the run's
+/// [`Solver`] and is released with it; see `src/ccl/design/type-inference.md`, "3.2 The solver:
+/// who owns inference variables". Inference is non-reentrant: at most one arena is active per
+/// thread, which debug builds check.
 pub struct InferArena {
-    /// Zero-sized: the captured variables live in the thread-local buffer
-    /// installed by [`crate::ccl::arena_enter`], not in the guard itself.
-    /// The raw-pointer `PhantomData` suppresses the `Send`/`Sync` auto
-    /// traits — the guard must drop on the thread whose buffer it opened
-    /// (dropping elsewhere would tear down the wrong thread's slot). Also
+    /// The raw-pointer `PhantomData` suppresses the `Send`/`Sync` auto traits: the state the
+    /// guard scopes is this thread's, so it drops on the thread that opened it. Also
     /// unconstructible outside this module's `new`.
     _not_send_sync: std::marker::PhantomData<*const ()>,
     /// The run's predicate derivations, which coalesce reads to share equal copies of one
@@ -52,14 +50,22 @@ pub struct InferArena {
     _derivations: crate::ccl::ccl_utils::RecordingDerivations,
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Whether an [`InferArena`] is open on this thread.
+    static ARENA_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl InferArena {
-    /// Create an arena and begin capturing minted variables on this thread.
-    /// Every [`crate::ccl::InferVar::fresh`] called before this arena is
-    /// dropped registers its variable. Inference is non-reentrant: at most
-    /// one arena is active per thread at a time, and constructing a second one
-    /// while another is live trips a `debug_assert!` (see
-    /// [`crate::ccl::arena_enter`]).
+    /// Open the scope on this thread.
     pub fn new() -> Self {
+        #[cfg(debug_assertions)]
+        ARENA_OPEN.with(|open| {
+            assert!(
+                !open.replace(true),
+                "inference is non-reentrant: an InferArena is already active on this thread"
+            );
+        });
         Self::enter();
         InferArena {
             _derivations: crate::ccl::ccl_utils::RecordingDerivations::start(),
@@ -67,9 +73,8 @@ impl InferArena {
         }
     }
 
-    /// Tear down every variable minted so far and begin capturing again, for a run
-    /// that starts over: inference after a statement failed
-    /// ([`super::run_with_params`]).
+    /// Clear the scoped state and begin again, for a run that starts over: inference after a
+    /// statement failed ([`super::run_with_params`]).
     pub(crate) fn restart(&mut self) {
         Self::exit();
         Self::enter();
@@ -77,56 +82,20 @@ impl InferArena {
     }
 
     fn enter() {
-        crate::ccl::arena_enter();
         crate::ccl::capabilities::upper_arena_enter();
-        // The witness range index is per-run for the same reason the variable capture is:
-        // it maps a binder minted by this run to the domains that run found it ranging
-        // over. Binder ids are globally unique, so a stale entry is unreachable rather
-        // than wrong — dropping it here is a growth bound, and it is what makes the
-        // index's lifetime the arena's.
-        // The trait-narrowing audit trail is per-run, exactly as the variable
-        // capture is: checking one run's obligations against another's graph would
-        // resolve variables that no longer have bounds.
+        // The trait-narrowing audit trail is per-run: checking one run's obligations against
+        // another's graph would resolve variables of a solver that has been dropped.
         #[cfg(debug_assertions)]
         crate::ccl::infer::solver::traits::clear_watch_log();
-        // Held answers are per-run too: each names a family of this run's definitions.
-        crate::ccl::infer::solver::traits::clear_held_answers();
-        // So is the requirement sweep's narrowing window, and for a sharper reason:
-        // its mark indexes a process-global obligation counter, so one left behind by
-        // an earlier run on this thread sits below everything this run mints and would
-        // make the check pass without checking.
+        // So is the requirement sweep's narrowing window, and for a sharper reason: its mark
+        // indexes a process-global obligation counter, so one left behind by an earlier run on
+        // this thread sits below everything this run mints and would make the check pass
+        // without checking.
         #[cfg(debug_assertions)]
         crate::ccl::infer::solver::traits::unseal_emission();
-        #[cfg(debug_assertions)]
-        crate::ccl::subst::clear_dropped_entries();
     }
 
     fn exit() {
-        let vars = crate::ccl::arena_exit();
-        // Solving has ended, so every scope `Subst::acting_on` read has reached its final
-        // size. A panicking run may have stopped mid-solve, with scopes still to grow.
-        #[cfg(debug_assertions)]
-        if !std::thread::panicking() {
-            crate::ccl::subst::check_dropped_entries(&vars);
-        }
-        // Take back every variable minted during the run and sever its bound
-        // edges, so the (otherwise cyclic) refcounts can all reach zero.
-        for var in vars {
-            var.bounds.borrow_mut().clear();
-            // A trait obligation holds its output `Type`, which holds a variable,
-            // which watches the obligation — a cycle of exactly the kind the bound
-            // lists make, and severed the same way.
-            var.watches.borrow_mut().clear();
-            var.suspensions.borrow_mut().clear();
-        }
-        // A barrier variable's bounds, watches and check memo hold types that can reach
-        // it again, through an inference variable or directly.
-        for barrier in crate::ccl::barrier_arena_exit() {
-            barrier.lowers.borrow_mut().clear();
-            barrier.uppers.borrow_mut().clear();
-            barrier.watches.borrow_mut().clear();
-            barrier.checked.borrow_mut().take();
-        }
         crate::ccl::capabilities::upper_arena_exit();
     }
 }
@@ -140,6 +109,8 @@ impl Default for InferArena {
 impl Drop for InferArena {
     fn drop(&mut self) {
         Self::exit();
+        #[cfg(debug_assertions)]
+        ARENA_OPEN.with(|open| open.set(false));
     }
 }
 
@@ -996,7 +967,7 @@ impl InferError {
                 _ => {}
             }
             let types = std::cell::RefCell::new(Vec::new());
-            error.map_types(&|ty| {
+            error.map_types(&mut |ty| {
                 fn erase_binder_spelling(ty: &mut Type) {
                     ty.walk_children_mut(erase_binder_spelling);
                     match ty {
@@ -1103,7 +1074,7 @@ impl InferError {
     /// (see [`read_respelling`](crate::ccl::mut_read::read_respelling)). A
     /// message is the only thing downstream of this: an error has left inference
     /// by the time it arrives, so nothing reasons with the types again.
-    pub(crate) fn respell(&mut self, rename: &Subst) {
+    pub(crate) fn respell(&mut self, solver: &mut Solver, rename: &Subst) {
         if let InferError::NoJoinOverBinder {
             binders,
             reads,
@@ -1121,9 +1092,9 @@ impl InferError {
                 }
                 None => true,
             });
-            *predicate = Rc::new(rename.apply_expr(predicate));
+            *predicate = Rc::new(rename.apply_expr_in(solver, predicate));
         }
-        self.map_types(&|ty| rename.apply_type(ty));
+        self.map_types(&mut |ty| rename.apply_type_in(solver, ty));
     }
 
     /// Rewrite every type this error renders through `f`.
@@ -1132,9 +1103,9 @@ impl InferError {
     /// included. A rewrite that means nothing for a base type costs nothing
     /// there, and the alternative is a list of exceptions each of which has to
     /// stay true as the variants change.
-    pub(crate) fn map_types(&mut self, f: &dyn Fn(&Type) -> Type) {
+    pub(crate) fn map_types(&mut self, f: &mut dyn FnMut(&Type) -> Type) {
         let mut each = |ty: &mut Type| *ty = f(ty);
-        let each_requirement = |r: &mut StatedRequirement| {
+        let mut each_requirement = |r: &mut StatedRequirement| {
             r.accepted.iter_mut().for_each(&mut each);
             for (_, accepted) in r.siblings.iter_mut() {
                 accepted.iter_mut().for_each(&mut each);
@@ -1166,22 +1137,24 @@ impl InferError {
                 each(annotation);
                 inferred.map_types(&mut each);
             }
-            InferError::DomainJoinConflict { domains, .. } => domains.iter_mut().for_each(each),
+            InferError::DomainJoinConflict { domains, .. } => {
+                domains.iter_mut().for_each(&mut each)
+            }
             InferError::NoTraitInstance {
                 found, accepted, ..
             } => {
                 each(found);
-                accepted.iter_mut().for_each(each);
+                accepted.iter_mut().for_each(&mut each);
             }
             InferError::UnsatisfiableOperand { requirements } => {
-                requirements.iter_mut().for_each(each_requirement)
+                requirements.iter_mut().for_each(&mut each_requirement)
             }
             InferError::RequirementContradictsBound {
                 requirements,
                 required,
                 found,
             } => {
-                requirements.iter_mut().for_each(each_requirement);
+                requirements.iter_mut().for_each(&mut each_requirement);
                 each(required);
                 each(found);
             }
@@ -1420,12 +1393,23 @@ impl LocatedInferError {
         }
     }
 
-    /// Respell the types in the diagnostic and its contribution labels together.
-    pub(crate) fn respell(&mut self, rename: &Subst) {
-        self.error.respell(rename);
+    /// Rewrite every type the diagnostic renders through `f`: the error's and its contribution
+    /// labels'.
+    pub(crate) fn map_types(&mut self, f: &mut dyn FnMut(&Type) -> Type) {
+        self.error.map_types(f);
         if let Some(data) = &mut self.related.0 {
             for contribution in &mut data.contributions {
-                contribution.ty = rename.apply_type(&contribution.ty);
+                contribution.ty = f(&contribution.ty);
+            }
+        }
+    }
+
+    /// Respell the types in the diagnostic and its contribution labels together.
+    pub(crate) fn respell(&mut self, solver: &mut Solver, rename: &Subst) {
+        self.error.respell(solver, rename);
+        if let Some(data) = &mut self.related.0 {
+            for contribution in &mut data.contributions {
+                contribution.ty = rename.apply_type_in(solver, &contribution.ty);
             }
         }
     }
@@ -2542,18 +2526,6 @@ pub fn infer(
         &ctx.root_public,
         &ctx.marks,
     );
-    #[cfg(debug_assertions)]
-    if std::env::var_os("DUMP_KINDS").is_some() {
-        eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
-        eprintln!(
-            "=== correspondences ===\n{}",
-            crate::ccl::infer::solver::compact::dump_kind_correspondences()
-        );
-        eprintln!(
-            "=== typed tree ===\n{}",
-            crate::ccl::symbolic::symbolic_typed(expr)
-        );
-    }
     let (ty, inert) = ty?;
     ctx.inert = inert;
     // Every call's arity is checked, so its argument list is the tuple it passes from here on.
@@ -2823,8 +2795,8 @@ impl Contract {
 /// `ty` with each variable a module type parameter with no kind written is opened as
 /// replaced by the parameter, so a contract writes `T` where the module does.
 fn write_opened(ty: &mut Type, opened: &super::OpenedVars) {
-    if let Type::Infer(var) = ty
-        && let Some(param) = opened.get(&var.uid)
+    if let Type::Undetermined(id) = ty
+        && let Some(param) = opened.get(id)
     {
         *ty = Type::Param(Rc::clone(param));
         return;
@@ -3425,15 +3397,19 @@ fn collect_type_errors(
             });
             return;
         }
-        Type::Infer(var) => {
-            // Pre-channelize, an induction accumulator's domain is still `Infer` (a
-            // `Mut(V)` with no annotated domain — the unified phase resolves it
-            // to the writing loop's domain); the relaxation tolerates it (see
-            // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
-            // handled below, not `Infer`.
+        Type::Infer(var) => panic!(
+            "the inference variable ?{} outlived its run at `{context_sym}`: a run closes every \
+             variable it hands back",
+            var.uid
+        ),
+        Type::Undetermined(id) => {
+            // Pre-channelize, an induction accumulator's domain is still undetermined (a
+            // `Mut(V)` with no annotated domain — the unified phase erases it with the
+            // accumulator's history); the relaxation tolerates it (see [`Strictness`]). Feed
+            // channel domains are the rigid `ChanDom` handled below.
             if strictness.rejects_transients() {
                 errors.push(InferError::UnresolvedInfer {
-                    id: var.uid,
+                    id: *id,
                     at: context_sym.to_string(),
                 });
             }
@@ -3509,13 +3485,13 @@ fn collect_type_errors(
         // position nothing reached is written `_`, as a reader would.
         Type::OpenTuple(_) => {
             let mut open = ty.clone();
-            fn hole_for_infer(ty: &mut Type) {
-                if let Type::Infer(_) = ty {
+            fn hole_for_undetermined(ty: &mut Type) {
+                if let Type::Undetermined(_) = ty {
                     *ty = Type::Hole;
                 }
-                ty.walk_children_mut(hole_for_infer);
+                ty.walk_children_mut(hole_for_undetermined);
             }
-            hole_for_infer(&mut open);
+            hole_for_undetermined(&mut open);
             errors.push(InferError::UnresolvedTupleWidth {
                 open: chl_type(&open),
                 at: context_sym.to_string(),
@@ -3825,7 +3801,10 @@ fn effect_on_a_place(ty: &Type) -> Option<crate::ccl::capabilities::Capability> 
             ..
         } = ty
             && !fun_kind.resolved().is_data()
-            && let Some(effect) = capabilities.set().items().find(|c| c.may_act_on_a_place())
+            && let Some(effect) = capabilities
+                .set()
+                .items()
+                .find(|c| c.may_act_on_a_place(&mut Solver::none()))
         {
             return Some(effect);
         }
@@ -3840,7 +3819,7 @@ fn effect_on_a_place(ty: &Type) -> Option<crate::ccl::capabilities::Capability> 
         {
             let identity = Rc::as_ptr(decl) as usize;
             if visiting.insert(identity) {
-                found = go(&decl.representation(args), visiting);
+                found = go(&decl.representation(&mut Solver::none(), args), visiting);
                 visiting.remove(&identity);
             }
         }
@@ -4189,6 +4168,7 @@ mod tests {
 
     #[test]
     fn defect_identity_preserves_kinds_and_free_variables() {
+        let solver = &mut Solver::new();
         let function = |kind| Type::Fun {
             binder: crate::ccl::FunBinder::None,
             fun_kind: kind,
@@ -4203,8 +4183,8 @@ mod tests {
         let compute = error(function(crate::ccl::ty::FunKind::Compute));
         let data = error(function(crate::ccl::ty::FunKind::Data(None)));
         assert!(!compute.same_defect(&data));
-        let a = error(Type::Infer(crate::ccl::InferVar::fresh(0)));
-        let b = error(Type::Infer(crate::ccl::InferVar::fresh(0)));
+        let a = error(Type::Infer(crate::ccl::InferVar::fresh(solver, 0)));
+        let b = error(Type::Infer(crate::ccl::InferVar::fresh(solver, 0)));
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
         assert!(!a.same_defect(&b));
     }
@@ -4244,12 +4224,15 @@ mod tests {
 
     #[test]
     fn a_mismatch_between_two_variables_is_not_called_identical() {
+        let solver = &mut Solver::new();
         let rendered = format!(
             "{:?}",
             InferError::TypeMismatch {
                 ctx: "this call".to_string(),
-                found: Box::new(Type::Infer(crate::ccl::InferVar::fresh(0))),
-                expected: Some(Box::new(Type::Infer(crate::ccl::InferVar::fresh(0)))),
+                found: Box::new(Type::Infer(crate::ccl::InferVar::fresh(solver, 0))),
+                expected: Some(Box::new(Type::Infer(crate::ccl::InferVar::fresh(
+                    solver, 0
+                )))),
             }
         );
         assert_eq!(
@@ -4260,8 +4243,9 @@ mod tests {
 
     #[test]
     fn requirement_lines_share_the_headers_variable_numbering() {
-        let a = Type::Infer(crate::ccl::InferVar::fresh(0));
-        let b = Type::Infer(crate::ccl::InferVar::fresh(0));
+        let solver = &mut Solver::new();
+        let a = Type::Infer(crate::ccl::InferVar::fresh(solver, 0));
+        let b = Type::Infer(crate::ccl::InferVar::fresh(solver, 0));
         let rendered = format!(
             "{:?}",
             InferError::RequirementContradictsBound {
@@ -4287,8 +4271,9 @@ mod tests {
 
     #[test]
     fn independent_requirements_keep_their_variables_distinct() {
-        let a = Type::Infer(crate::ccl::InferVar::fresh(0));
-        let b = Type::Infer(crate::ccl::InferVar::fresh(0));
+        let solver = &mut Solver::new();
+        let a = Type::Infer(crate::ccl::InferVar::fresh(solver, 0));
+        let b = Type::Infer(crate::ccl::InferVar::fresh(solver, 0));
         let requirements = [a, b].map(|ty| StatedRequirement {
             trait_: "Addable".into(),
             position: 0,
@@ -4449,12 +4434,13 @@ mod tests {
 
     #[test]
     fn test_infer_apply_annotates_lambda() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         // Apply(λ x → x, 42) should annotate x : 42 and return 42 — the identity
         // returns its argument, so the argument's own type flows all the way out.
         let mut expr = Expr::apply(
             Expr::lit(Lit::Int(42)),
-            Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+            Expr::lambda("x", Occurrence::mint(), Type::infer(solver), Expr::var("x")),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, int_lit_ty(42));
@@ -4532,10 +4518,11 @@ mod tests {
 
     #[test]
     fn test_infer_cannot_infer_param() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
         // inference permits unconstrained lambdas; returns Fun(Infer, Infer).
-        let mut expr = Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x"));
+        let mut expr = Expr::lambda("x", Occurrence::mint(), Type::infer(solver), Expr::var("x"));
         let ty = infer(&mut expr, &mut ctx).expect("inference allows unconstrained λ x → x");
         assert!(
             matches!(ty, Type::Fun { .. }),
@@ -4584,22 +4571,24 @@ mod tests {
     ///   Apply(λ var (?M) → elt,
     ///         Apply(source, Var(__list_comp_var)))
     /// ```
-    fn list_comp_unannotated(source: Expr, var: &str, elt: Expr) -> Expr {
+    fn list_comp_unannotated(solver: &mut Solver, source: Expr, var: &str, elt: Expr) -> Expr {
         Expr::lambda(
             "__list_comp_var",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::apply(
                 Expr::apply(Expr::var("__list_comp_var"), source),
-                Expr::lambda(var, Occurrence::mint(), Type::infer(), elt),
+                Expr::lambda(var, Occurrence::mint(), Type::infer(solver), elt),
             ),
         )
     }
 
     #[test]
     fn test_infer_outer_lambda_constraint() {
+        let solver = &mut Solver::new();
         // [x for x in [10, 20]] — unannotated; infer should annotate both lambdas.
         let mut expr = list_comp_unannotated(
+            solver,
             Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
             Expr::var("x"),
@@ -4615,8 +4604,10 @@ mod tests {
 
     #[test]
     fn test_infer_const_body_comp() {
+        let solver = &mut Solver::new();
         // [42 for x in [10, 20]]
         let mut expr = list_comp_unannotated(
+            solver,
             Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
             Expr::lit(Lit::Int(42)),
@@ -4632,6 +4623,7 @@ mod tests {
 
     #[test]
     fn test_infer_binop_body_comp() {
+        let solver = &mut Solver::new();
         // [x + 2 for x in [10, 20]]
         let body = Expr::binop(
             Expr::var("x"),
@@ -4639,6 +4631,7 @@ mod tests {
             Expr::lit(Lit::Int(2)),
         );
         let mut expr = list_comp_unannotated(
+            solver,
             Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
             body,
@@ -4654,14 +4647,16 @@ mod tests {
 
     #[test]
     fn test_infer_nested_comprehension() {
+        let solver = &mut Solver::new();
         // [y for y in [x for x in [10, 20]]]
         // Both outer and inner comp lambdas start unannotated.
         let inner_comp = list_comp_unannotated(
+            solver,
             Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
             Expr::var("x"),
         );
-        let mut outer_comp = list_comp_unannotated(inner_comp, "y", Expr::var("y"));
+        let mut outer_comp = list_comp_unannotated(solver, inner_comp, "y", Expr::var("y"));
         let mut ctx = TypeInferenceContext::new();
         infer(&mut outer_comp, &mut ctx).unwrap();
 
@@ -4679,13 +4674,13 @@ mod tests {
 
     /// Builds `λ x → BinOp(Apply(f, Var(x)), op, Apply(g, Var(x)))` where `f`
     /// and `g` are annotated lambdas with the given param types.
-    fn double_apply_lambda(f_param_ty: Type, g_param_ty: Type) -> Expr {
+    fn double_apply_lambda(solver: &mut Solver, f_param_ty: Type, g_param_ty: Type) -> Expr {
         let f = Expr::lambda("a", Occurrence::mint(), f_param_ty, Expr::var("a"));
         let g = Expr::lambda("b", Occurrence::mint(), g_param_ty, Expr::var("b"));
         Expr::lambda(
             "x",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::binop(
                 Expr::apply(Expr::var("x"), f),
                 BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -4696,9 +4691,11 @@ mod tests {
 
     #[test]
     fn test_collect_multi_same_type() {
+        let solver = &mut Solver::new();
         // λ x → Apply(λ a:Int → a, Var(x)) + Apply(λ b:Int → b, Var(x))
         // Both constraints are Int → infers x : Int.
-        let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::Int));
+        let mut expr =
+            double_apply_lambda(solver, Type::Base(BaseType::Int), Type::Base(BaseType::Int));
         let mut ctx = TypeInferenceContext::new();
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
@@ -4722,6 +4719,7 @@ mod tests {
 
     #[test]
     fn test_collect_multi_same_type_with_caret_operators() {
+        let solver = &mut Solver::new();
         // λ x → Apply(λ a:Int → a, Var(x)) ^+ Apply(λ b:Int → b, Var(x))
         let f = Expr::lambda(
             "a",
@@ -4738,7 +4736,7 @@ mod tests {
         let mut expr = Expr::lambda(
             "x",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::binop(
                 Expr::apply(Expr::var("x"), f),
                 BinOpKind::Arithmetic(ArithmeticKind::AddRefined),
@@ -4762,13 +4760,14 @@ mod tests {
     /// result. Sum's result is `int`.
     #[test]
     fn test_infer_list_param_consumed_by_aggregate() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::list_of(Type::Base(BaseType::Int)),
                     Occurrence::mint(),
@@ -4796,13 +4795,14 @@ mod tests {
     /// that edge must be wired.
     #[test]
     fn test_infer_list_to_list_ascription() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::list_of(Type::Base(BaseType::Int)),
                     Occurrence::mint(),
@@ -4827,7 +4827,7 @@ mod tests {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::list_of(Type::Base(BaseType::Int)),
                     Occurrence::mint(),
@@ -4858,13 +4858,14 @@ mod tests {
     /// round-trip with its `UIntRanges` domain inert, re-forming the identical Σ.
     #[test]
     fn test_infer_list_param_annotation_round_trips() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::list_of(Type::Base(BaseType::Int)),
                     Occurrence::mint(),
@@ -4898,6 +4899,7 @@ mod tests {
     /// (including the key type) and codomain preserved.
     #[test]
     fn test_infer_map_param_round_trips() {
+        let solver = &mut Solver::new();
         for ann in [
             Type::map_of(Type::Base(BaseType::Int), Type::Base(BaseType::String)),
             Type::set_of(Type::Base(BaseType::Int)),
@@ -4908,7 +4910,7 @@ mod tests {
                     parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: "m".into(),
-                    ty: Type::infer(),
+                    ty: Type::infer(solver),
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                     site: None,
@@ -4964,13 +4966,14 @@ mod tests {
     /// so `sum` over a `Collection(int)` is `Int`.
     #[test]
     fn test_infer_collection_param_and_consume() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         let mut ident = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::collection_of(Type::Base(BaseType::Int)),
                     Occurrence::mint(),
@@ -4996,7 +4999,7 @@ mod tests {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "xs".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::collection_of(Type::Base(BaseType::Int)),
                     Occurrence::mint(),
@@ -5054,6 +5057,7 @@ mod tests {
 
     #[test]
     fn test_infer_let_mismatch() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         // let x : String = 42 in x  =>  AnnotationMismatch
         let mut expr = TypedExpr::new(TypedExprNode::Let {
@@ -5061,7 +5065,7 @@ mod tests {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::Base(BaseType::String),
                     Occurrence::mint(),
@@ -5165,6 +5169,7 @@ mod tests {
 
     #[test]
     fn test_let_shadowing_no_constraint() {
+        let solver = &mut Solver::new();
         // λ x → let x = 42 in Apply(λ b:String → b, Var(x))
         //
         // `let x = 42` shadows the outer lambda param `x`. The scope stack
@@ -5182,7 +5187,7 @@ mod tests {
         let mut expr = Expr::lambda(
             "x",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::let_bind(
                 "x",
                 Occurrence::mint(),
@@ -5210,6 +5215,7 @@ mod tests {
 
     #[test]
     fn test_collect_multi_conflict() {
+        let solver = &mut Solver::new();
         // λ x → Apply(λ a:Int → a, Var(x)) + Apply(λ b:String → b, Var(x))
         // `x` is the argument to both an Int-domain and a String-domain function,
         // whose results are then added.
@@ -5223,7 +5229,11 @@ mod tests {
         // The one-way `arg <: domain` rule that puts them there is what the
         // `IncompatibleBounds` tests in `tests/it/type_check.rs` cover, joining two types
         // without an operator in the way.
-        let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
+        let mut expr = double_apply_lambda(
+            solver,
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+        );
         let mut ctx = TypeInferenceContext::new();
         let errs = infer_bare(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
         assert!(
@@ -5539,9 +5549,11 @@ mod tests {
     /// `0..2 ⤇ Int`, which `Sum` accepts, returning `Int`.
     #[test]
     fn test_infer_aggregate_sum_over_list_comp() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         // The list-comp CCL: λ __list_comp_var → __list_comp_var ▷ [1, 2] ▷ (λ x → x)
         let comp = list_comp_unannotated(
+            solver,
             Expr::list(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
             "x",
             Expr::var("x"),
@@ -5568,12 +5580,13 @@ mod tests {
     /// constrains `xs = Fun(UIntRange(3), Int)`.
     #[test]
     fn test_infer_aggregate_input_type_inferred_from_call_site() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         // let total = λ xs → sum(xs) in total([1, 2, 3])
         let total_fn = Expr::lambda(
             "xs",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::aggregate(Expr::var("xs"), AggregateKind::Sum),
         );
         let call = Expr::apply(
@@ -5599,6 +5612,7 @@ mod tests {
     /// with a type error from the `BoolLogic(And)` operator (Int vs Bool).
     #[test]
     fn test_tuple_field_gap_infers_from_projections() {
+        let solver = &mut Solver::new();
         let f = Expr::lambda(
             "a",
             Occurrence::mint(),
@@ -5614,7 +5628,7 @@ mod tests {
         let mut expr = Expr::lambda(
             "p",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::binop(
                 Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), f),
                 BinOpKind::BoolLogic(LogicKind::And),
@@ -5636,6 +5650,7 @@ mod tests {
     /// TypeMismatch.
     #[test]
     fn test_tuple_field_conflict_returns_mismatch() {
+        let solver = &mut Solver::new();
         let f = Expr::lambda(
             "a",
             Occurrence::mint(),
@@ -5651,7 +5666,7 @@ mod tests {
         let mut expr = Expr::lambda(
             "p",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::binop(
                 Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), f),
                 BinOpKind::BoolLogic(LogicKind::And),
@@ -5677,8 +5692,9 @@ mod tests {
     /// `f : {Int, Int, Int} ⇒ {Int, Int}`, and the whole expression `{Int, Int}`.
     #[test]
     fn test_lambda_type_inferred_from_call_site() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
-        let g_lambda = Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x"));
+        let g_lambda = Expr::lambda("x", Occurrence::mint(), Type::infer(solver), Expr::var("x"));
         let t0g = Expr::apply(
             Expr::apply(Expr::var("t"), Expr::proj_index(0)),
             Expr::var("g"),
@@ -5690,7 +5706,7 @@ mod tests {
         let f_lambda = Expr::lambda(
             "t",
             Occurrence::mint(),
-            Type::infer(),
+            Type::infer(solver),
             Expr::tuple(vec![t0g, t2g]),
         );
         let tuple_012 = Expr::tuple(vec![
@@ -5731,7 +5747,8 @@ mod tests {
     /// use, because there is no variable for the two demands to meet on.
     #[test]
     fn test_infer_param_annotation_conflict() {
-        let param_annotation = |ann: Type| {
+        let solver = &mut Solver::new();
+        let mut param_annotation = |ann: Type| {
             let mut ctx = TypeInferenceContext::new();
             let inner = Expr::lambda(
                 "s",
@@ -5744,7 +5761,7 @@ mod tests {
                     parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: "x".into(),
-                    ty: Type::infer(),
+                    ty: Type::infer(solver),
                     user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                     site: None,
@@ -5784,6 +5801,7 @@ mod tests {
     /// `Int ≤ String` and surfaces as `TypeMismatch{Apply, Int, String}`.
     #[test]
     fn test_infer_apply_annotation_mismatch() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
@@ -5791,7 +5809,7 @@ mod tests {
                     parameter_mode: Default::default(),
                     occurrence: Occurrence::mint(),
                     name: "x".into(),
-                    ty: Type::infer(),
+                    ty: Type::infer(solver),
                     user_annotation: Some(Annotation::new(
                         Type::Base(BaseType::String),
                         Occurrence::mint(),
@@ -5822,13 +5840,14 @@ mod tests {
     /// as the param type.
     #[test]
     fn test_infer_annotation_used_when_no_body_constraint() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
-                ty: Type::infer(),
+                ty: Type::infer(solver),
                 user_annotation: Some(Annotation::new(
                     Type::Base(BaseType::Int),
                     Occurrence::mint(),
@@ -6415,37 +6434,34 @@ mod tests {
         );
     }
 
-    /// A `Type::Infer` on the root node fails with `UnresolvedInfer`.
+    /// A [`Type::Undetermined`] on the root node fails with `UnresolvedInfer`.
     ///
     /// The context string is the symbolic representation of the offending expression
-    /// (`"1"`), and the var ID matches the one used to build the type.
+    /// (`"1"`), and the id is the one the type carries.
     #[test]
     fn test_check_fully_typed_infer_on_root() {
-        let var = crate::ccl::InferVar::fresh(0);
-        let id = var.uid;
-        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Infer(var));
+        let id = crate::ccl::infer_var::next_infer_var_id();
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Undetermined(id));
         assert_eq!(
             check_fully_typed(&expr),
             Err(vec![InferError::UnresolvedInfer { id, at: "1".into() }])
         );
     }
 
-    /// A `Type::Infer` inside a lambda parameter binding is caught.
+    /// A [`Type::Undetermined`] inside a lambda parameter binding is caught.
     ///
     /// The context string is the parameter name (`"x"`), not the whole lambda,
     /// because `check_fully_typed` passes `|| param.name.clone()` for param checks.
     #[test]
     fn test_check_fully_typed_infer_in_lambda_param() {
-        let var = crate::ccl::InferVar::fresh(0);
-        let id = var.uid;
-        // The lambda's own type is concrete, but the param still holds an Infer var.
-        // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
+        let id = crate::ccl::infer_var::next_infer_var_id();
+        // The lambda's own type is concrete, but the param's is undetermined.
         let expr = Expr::new(TypedExprNode::Lambda {
             params: vec![TypedBinding {
                 parameter_mode: Default::default(),
                 occurrence: Occurrence::mint(),
                 name: "x".into(),
-                ty: Type::Infer(var), // unsolved
+                ty: Type::Undetermined(id),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
                 site: None,
@@ -6799,6 +6815,7 @@ mod tests {
     /// tuple-typed domain, after `set()` merging and `TupleField` constraint accumulation.
     #[test]
     fn test_infer_lambda_two_proj_on_same_param() {
+        let solver = &mut Solver::new();
         let mut ctx = TypeInferenceContext::new();
         // λ p → ((p ► .0) + 0, p ► .1)
         // p ► .0 feeds into Int addition → p.0 : Int
@@ -6813,7 +6830,7 @@ mod tests {
             }),
             Expr::apply(Expr::var("p"), Expr::proj_index(1)),
         ]));
-        let mut expr = Expr::lambda("p", Occurrence::mint(), Type::infer(), body);
+        let mut expr = Expr::lambda("p", Occurrence::mint(), Type::infer(solver), body);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         if let Type::Fun { domain, .. } = ty {
             match *domain {

@@ -16,6 +16,7 @@
 //! the written type as [`OUTER_ARGUMENT`], and
 //! anything else as [`NOT_PRINTABLE`].
 
+use crate::ccl::infer::solver::Solver;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt;
@@ -332,7 +333,8 @@ impl Printer {
                             .map(|(k, d)| format!("{k}: {d}"))
                             .collect();
                         let at: Vec<Name> = names.iter().map(|n| Name::raw(n.as_str())).collect();
-                        let bound = crate::ccl::subst::family_at_names(bound, &at);
+                        let bound =
+                            crate::ccl::subst::family_at_names(&mut Solver::none(), bound, &at);
                         family_bounds.push(format!(
                             "forall ({}) {}({}) <: {}",
                             binders.join(", "),
@@ -384,7 +386,7 @@ impl Printer {
         format!(
             "forall ({}) {body}{}",
             params.join(", "),
-            crate::ccl::capabilities::clauses(requires, &capabilities)
+            crate::ccl::capabilities::clauses(&mut Solver::none(), requires, &capabilities)
         )
     }
 
@@ -409,7 +411,9 @@ impl Printer {
             Type::DataSource(name) => format!("Source({name})"),
             Type::Txn => "Txn".to_string(),
             Type::Hole => "_".to_string(),
-            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) => self.variable(ty),
+            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) | Type::Undetermined(_) => {
+                self.variable(ty)
+            }
             Type::Param(p) => match self.joins.iter().find(|(id, _)| *id == p.id) {
                 Some((_, text)) => text.clone(),
                 None => p.spelling.to_string(),
@@ -712,7 +716,12 @@ impl Printer {
             let alternatives: Vec<String> = candidates
                 .iter()
                 .map(|candidate| {
-                    let values = crate::ccl::ty::instantiate_witness(codomain, w.id(), candidate);
+                    let values = crate::ccl::ty::instantiate_witness(
+                        &mut Solver::none(),
+                        codomain,
+                        w.id(),
+                        candidate,
+                    );
                     let alternative = Type::Fun {
                         binder: name.cloned().into(),
                         fun_kind: FunKind::Data(None),
@@ -1161,7 +1170,7 @@ impl Printer {
         };
         let target = self.expr(f, Prec::Postfix, env);
         let (_, arg) = argument.written();
-        let text = if fun_kind.resolved().is_data() {
+        let text = if fun_kind.resolved_in(&Solver::none()).is_data() {
             format!("{target}[{arg}]!")
         } else {
             format!("{target}({arg})")
@@ -1421,6 +1430,7 @@ fn product_components(domain: &Type, width: usize) -> Vec<(Option<Name>, Type)> 
 
 #[cfg(test)]
 mod tests {
+
     use std::rc::Rc;
 
     use super::{NOT_PRINTABLE, OUTER_ARGUMENT, chl_type};

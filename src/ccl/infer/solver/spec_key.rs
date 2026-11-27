@@ -10,6 +10,7 @@
 //! Graph changes and redundant-clone limits are described in
 //! `src/ccl/design/type-inference.md`, "Key timing and precision limits".
 
+use crate::ccl::infer::solver::Solver;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
@@ -488,7 +489,7 @@ struct KeyCtx {
 /// the use's pin will see — i.e. *before* the pin, matching every other use's
 /// key, so that both sides of a memo comparison are computed by one procedure at
 /// one point in the pin's lifecycle.
-pub fn spec_key(ty: &Type) -> SpecKey {
+pub fn spec_key(solver: &mut Solver, ty: &Type) -> SpecKey {
     let mut ctx = KeyCtx {
         visiting: HashSet::new(),
         #[cfg(debug_assertions)]
@@ -504,13 +505,14 @@ pub fn spec_key(ty: &Type) -> SpecKey {
     // One walk-wide `ctx` for both reads: its memo is keyed by polarity, so the
     // two reads share it without contaminating each other.
     SpecKey {
-        positive: key_go(ty, true, &Subst::id(), &mut ctx),
-        negative: key_go(ty, false, &Subst::id(), &mut ctx),
+        positive: key_go(solver, ty, true, &Subst::id(), &mut ctx),
+        negative: key_go(solver, ty, false, &Subst::id(), &mut ctx),
     }
 }
 
 /// A binder's kind into `acc`: its children as types, at the kind's polarity, and its shape.
 fn key_type_kind(
+    solver: &mut Solver,
     type_kind: &crate::ccl::ty::TypeKind,
     pol: bool,
     subst_acc: &Subst,
@@ -518,7 +520,7 @@ fn key_type_kind(
     acc: &mut KeyView,
 ) {
     for child in type_kind.children() {
-        acc.union(key_go(child, pol, subst_acc, ctx));
+        acc.union(key_go(solver, child, pol, subst_acc, ctx));
     }
     let shape = type_kind.map_children(|_| Type::Hole);
     if !acc.type_kinds.contains(&shape) {
@@ -530,7 +532,12 @@ fn key_type_kind(
 /// relations `compact`'s `var_binder_kind` reads — **change the two together**: the source
 /// that owns the position, else every kind below, else the demands above, read and not
 /// continued through. Whether anything answered.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's solver, the question, and the key's accumulators"
+)]
 fn key_var_binder(
+    solver: &mut Solver,
     k: &Rc<crate::ccl::ty::FunKindVar>,
     position: usize,
     pol: bool,
@@ -544,10 +551,11 @@ fn key_var_binder(
     }
     seen.push(k.uid);
     let mut offset = 0;
-    for src in k.built_over() {
-        let n = src.arity().unwrap_or(0);
+    for src in k.built_over(solver) {
+        let n = src.arity(solver).unwrap_or(0);
         if position < offset + n {
             return key_kind_at(
+                solver,
                 &src,
                 position - offset,
                 pol,
@@ -561,14 +569,14 @@ fn key_var_binder(
         offset += n;
     }
     let mut answered = false;
-    for (f, edge) in k.lower_edges() {
-        let inner = Subst::then(&edge, subst_acc);
-        answered |= key_kind_at(&f, position, pol, true, &inner, ctx, seen, acc);
+    for (f, edge) in k.lower_edges(solver) {
+        let composed = Subst::then(solver, &edge, subst_acc);
+        answered |= key_kind_at(solver, &f, position, pol, true, &composed, ctx, seen, acc);
     }
     if !answered {
-        for (f, edge) in k.upper_edges() {
-            let inner = Subst::then(&edge, subst_acc);
-            answered |= key_kind_at(&f, position, pol, false, &inner, ctx, seen, acc);
+        for (f, edge) in k.upper_edges(solver) {
+            let composed = Subst::then(solver, &edge, subst_acc);
+            answered |= key_kind_at(solver, &f, position, pol, false, &composed, ctx, seen, acc);
         }
     }
     answered
@@ -580,6 +588,7 @@ fn key_var_binder(
     reason = "the mirror of `kind_at`, plus the key's sink"
 )]
 fn key_kind_at(
+    solver: &mut Solver,
     f: &crate::ccl::ty::FunKind,
     position: usize,
     pol: bool,
@@ -591,12 +600,12 @@ fn key_kind_at(
 ) -> bool {
     match f {
         crate::ccl::ty::FunKind::Var(v) if through => {
-            key_var_binder(v, position, pol, subst_acc, ctx, seen, acc)
+            key_var_binder(solver, v, position, pol, subst_acc, ctx, seen, acc)
         }
         crate::ccl::ty::FunKind::Var(_) => false,
         other => match other.witnesses().get(position) {
             Some(w) => {
-                key_type_kind(&w.type_kind(), pol, subst_acc, ctx, acc);
+                key_type_kind(solver, &w.type_kind(), pol, subst_acc, ctx, acc);
                 true
             }
             None => false,
@@ -604,7 +613,13 @@ fn key_kind_at(
     }
 }
 
-fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView {
+fn key_go(
+    solver: &mut Solver,
+    ty: &Type,
+    pol: bool,
+    subst_acc: &Subst,
+    ctx: &mut KeyCtx,
+) -> KeyView {
     match ty {
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
@@ -623,6 +638,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
+        | Type::Undetermined(_)
         | Type::ChanDom(..)
         | Type::Param(_)
         | Type::Txn => KeyView::from_atom(
@@ -651,11 +667,14 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 ctx.truncations += 1;
                 return KeyView::default();
             }
-            let lowers = barrier.lowers.borrow().clone();
+            let lowers = barrier.lowers(solver).to_vec();
             let mut acc = KeyView::default();
             for b in &lowers {
-                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                acc.union(key_go(&b.ty, true, &inner_acc, ctx));
+                let inner_acc = {
+                    let rendered = b.render_subst(solver);
+                    Subst::then(solver, &rendered, subst_acc)
+                };
+                acc.union(key_go(solver, &b.ty, true, &inner_acc, ctx));
             }
             ctx.visiting_barriers.remove(&barrier.uid);
             acc.drop_covariant_refinements(Variance::Covariant);
@@ -674,7 +693,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // An opened family parameter's application is rigid inside the definition it is
         // opened for, as the parameter is, and keys as the atom compaction makes of it.
         Type::FamilyApp(_) => KeyView::from_atom(
-            AtomKey::from_type(&subst_acc.apply_type(ty))
+            AtomKey::from_type(&subst_acc.apply_type_in(solver, ty))
                 .expect("a family application classifies as an AtomKey"),
         ),
         // A refinement rides the position it refines. The accumulated substitution
@@ -683,13 +702,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // clone will actually carry — that is use-specific information, and two
         // uses discharging different arguments *should* key apart.
         Type::Refinement(inner, refinements) => {
-            let mut k = key_go(inner, pol, subst_acc, ctx);
+            let mut k = key_go(solver, inner, pol, subst_acc, ctx);
             for r in refinements {
-                let r = subst_acc.force_refinement(r);
+                let r = subst_acc.force_refinement(solver, r);
                 // Closed against the walk's enclosing binders, as in `compact_go`:
                 // the key stores the index-spelled refinement, so α-variant
                 // instantiations key together.
-                let r = ctx.scope.close(&r);
+                let r = ctx.scope.close(solver, &r);
                 if !k.refinements.contains(&r) {
                     k.refinements.push(r);
                 }
@@ -705,7 +724,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         } => {
             // The domain is contravariant — the flip that makes the dual read
             // follow an argument's *lower* bounds.
-            let dom = key_go(domain, !pol, subst_acc, ctx);
+            let dom = key_go(solver, domain, !pol, subst_acc, ctx);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain, as in `compact_go`. The binder *name* itself is not part
             // of the key — see `SpecKey::fun`.
@@ -714,7 +733,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 .fold(subst_acc.clone(), |acc, b| acc.shadow(b));
             // Entering the codomain crosses this function, as in `compact_go`.
             ctx.scope.enter(binder.clone());
-            let cod = key_go(codomain, pol, &cod_acc, ctx);
+            let cod = key_go(solver, codomain, pol, &cod_acc, ctx);
             ctx.scope.exit();
             // Resolved through `KindPin::of`, not off the `FunKind` itself: an
             // inferred kind is a variable whose identity is fresh per instantiation,
@@ -726,12 +745,12 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // two would only ever differ before that. Keeping them apart would split
             // a generic use from a concrete compute one over a distinction that does
             // not reach the materialized type.
-            let key_kind = match fun_kind.resolved() {
+            let key_kind = match fun_kind.resolved_in(solver) {
                 KindPin::Unpinned => KindPin::Compute,
                 resolved => resolved,
             };
             // What the function does, resolved, as compaction resolves it.
-            let does = capabilities.set();
+            let does = capabilities.set_in(solver);
             let mut acc = KeyView {
                 fun: BTreeMap::from([(
                     (key_kind, binder.parameter_count()),
@@ -763,13 +782,22 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             // reading a variable as ranging over nothing shares one clone between them.
             match fun_kind {
                 crate::ccl::ty::FunKind::Var(v) => {
-                    for position in 0..v.arity().unwrap_or(0) {
-                        key_var_binder(v, position, pol, subst_acc, ctx, &mut Vec::new(), &mut acc);
+                    for position in 0..v.arity(solver).unwrap_or(0) {
+                        key_var_binder(
+                            solver,
+                            v,
+                            position,
+                            pol,
+                            subst_acc,
+                            ctx,
+                            &mut Vec::new(),
+                            &mut acc,
+                        );
                     }
                 }
                 stated => {
                     for w in stated.witnesses() {
-                        key_type_kind(&w.type_kind(), pol, subst_acc, ctx, &mut acc);
+                        key_type_kind(solver, &w.type_kind(), pol, subst_acc, ctx, &mut acc);
                     }
                 }
             }
@@ -781,7 +809,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let mut acc = subst_acc.clone();
             let mut components = Vec::with_capacity(cs.len());
             for (name, t) in cs {
-                components.push(key_go(t, pol, &acc, ctx));
+                components.push(key_go(solver, t, pol, &acc, ctx));
                 ctx.scope.enter(name.clone().into());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
@@ -798,7 +826,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Family { binders, body } => {
             let domains = binders
                 .iter()
-                .map(|(_, t)| key_go(t, pol, subst_acc, ctx))
+                .map(|(_, t)| key_go(solver, t, pol, subst_acc, ctx))
                 .collect();
             let mut acc = subst_acc.clone();
             for (name, _) in binders {
@@ -807,7 +835,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                     acc = acc.shadow(b);
                 }
             }
-            let body = key_go(body, pol, &acc, ctx);
+            let body = key_go(solver, body, pol, &acc, ctx);
             binders.iter().for_each(|_| ctx.scope.exit());
             KeyView {
                 family: Some((domains, Box::new(body))),
@@ -818,7 +846,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             rec: ts
                 .iter()
                 .enumerate()
-                .map(|(i, t)| (FieldKey::Index(i), key_go(t, pol, subst_acc, ctx)))
+                .map(|(i, t)| (FieldKey::Index(i), key_go(solver, t, pol, subst_acc, ctx)))
                 .collect(),
             tuple_widths: BTreeSet::from([if matches!(ty, Type::OpenTuple(_)) {
                 TupleWidthKey::AtLeast(ts.len())
@@ -830,7 +858,12 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Record(fs) => KeyView {
             rec: fs
                 .iter()
-                .map(|(n, t)| (FieldKey::Name(n.clone()), key_go(t, pol, subst_acc, ctx)))
+                .map(|(n, t)| {
+                    (
+                        FieldKey::Name(n.clone()),
+                        key_go(solver, t, pol, subst_acc, ctx),
+                    )
+                })
                 .collect(),
             ..Default::default()
         },
@@ -839,7 +872,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Variant(tags, _) => KeyView {
             var: tags
                 .iter()
-                .map(|(k, t)| (k.clone(), key_go(t, pol, subst_acc, ctx)))
+                .map(|(k, t)| (k.clone(), key_go(solver, t, pol, subst_acc, ctx)))
                 .collect(),
             ..Default::default()
         },
@@ -850,8 +883,8 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         history @ Type::History { .. } => {
             let (domain, value, history_kind) = history.history_parts().expect("matched a history");
             let history_kind = &history_kind;
-            let value = key_go(value, pol, subst_acc, ctx);
-            let domain = key_go(domain, pol, subst_acc, ctx);
+            let value = key_go(solver, value, pol, subst_acc, ctx);
+            let domain = key_go(solver, domain, pol, subst_acc, ctx);
             KeyView {
                 history: BTreeMap::from([(*history_kind, (Box::new(value), Box::new(domain)))]),
                 ..Default::default()
@@ -865,10 +898,10 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             for (t, v) in args.iter().zip(&decl.body().variances) {
                 if *v == Variance::Bipolar {
                     let (input, output) = crate::ccl::nominal::sides(t);
-                    sides.push(key_go(input, !pol, subst_acc, ctx));
-                    sides.push(key_go(output, pol, subst_acc, ctx));
+                    sides.push(key_go(solver, input, !pol, subst_acc, ctx));
+                    sides.push(key_go(solver, output, pol, subst_acc, ctx));
                 } else {
-                    sides.push(key_go(t, v.polarity(pol), subst_acc, ctx));
+                    sides.push(key_go(solver, t, v.polarity(pol), subst_acc, ctx));
                 }
             }
             let args = sides;
@@ -892,7 +925,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 Some(Subst::id())
             } else {
                 ctx.consulted
-                    .below(state, pol)
+                    .below(solver, state, pol)
                     .filter(|reads| !subst_acc.has_witnesses() || !reads.witnesses)
                     .map(|reads| subst_acc.restricted_to(&reads.names))
             };
@@ -929,7 +962,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 ctx.visits += 1;
             }
             let bounds = {
-                let b = state.bounds.borrow();
+                let b = state.bounds(solver);
                 Rc::clone(if pol { b.lower() } else { b.upper() })
             };
             let truncations_before = ctx.truncations;
@@ -938,8 +971,11 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 // Compose the edge's morphism before descending, as `compact_go`
                 // does: a bound reached transitively arrives with every edge's
                 // substitution composed.
-                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                acc.union(key_go(&b.ty, pol, &inner_acc, ctx));
+                let inner_acc = {
+                    let rendered = b.render_subst(solver);
+                    Subst::then(solver, &rendered, subst_acc)
+                };
+                acc.union(key_go(solver, &b.ty, pol, &inner_acc, ctx));
             }
             ctx.visiting.remove(&visit_key);
             #[cfg(debug_assertions)]
@@ -993,51 +1029,80 @@ mod tests {
             crate::ccl::FunKind::Compute,
         );
         let tuple = Type::fun(Type::tuple(vec![int(), int()]), int());
-        assert_ne!(spec_key(&parameters), spec_key(&tuple));
+        let solver = &mut Solver::new();
+        assert_ne!(spec_key(solver, &parameters), spec_key(solver, &tuple));
     }
 
     #[test]
     fn atoms_and_shapes_are_structural() {
-        assert_eq!(spec_key(&int()), spec_key(&int()));
-        assert_ne!(spec_key(&int()), spec_key(&Type::Base(BaseType::String)));
+        let solver = &mut Solver::new();
+        assert_eq!(spec_key(solver, &int()), spec_key(solver, &int()));
+        assert_ne!(
+            spec_key(solver, &int()),
+            spec_key(solver, &Type::Base(BaseType::String))
+        );
         assert_eq!(
-            spec_key(&Type::Tuple(vec![int(), int()])),
-            spec_key(&Type::Tuple(vec![int(), int()]))
+            spec_key(solver, &Type::Tuple(vec![int(), int()])),
+            spec_key(solver, &Type::Tuple(vec![int(), int()]))
         );
         // Width matters: a key must not equate a 1-tuple with a 2-tuple, or a
         // narrowed domain would share a clone with an unnarrowed one.
         assert_ne!(
-            spec_key(&Type::Tuple(vec![int()])),
-            spec_key(&Type::Tuple(vec![int(), int()]))
+            spec_key(solver, &Type::Tuple(vec![int()])),
+            spec_key(solver, &Type::Tuple(vec![int(), int()]))
         );
         // Nor a closed tuple with an open one listing the same positions: one fixes
         // the width the other leaves open.
         assert_ne!(
-            spec_key(&Type::Tuple(vec![int(), int()])),
-            spec_key(&Type::OpenTuple(vec![int(), int()]))
+            spec_key(solver, &Type::Tuple(vec![int(), int()])),
+            spec_key(solver, &Type::OpenTuple(vec![int(), int()]))
         );
     }
 
     #[test]
     fn refinements_participate_and_distinguish() {
-        assert_ne!(spec_key(&int()), spec_key(&singleton(1)));
-        assert_ne!(spec_key(&singleton(1)), spec_key(&singleton(2)));
-        assert_eq!(spec_key(&singleton(1)), spec_key(&singleton(1)));
+        let solver = &mut Solver::new();
+        assert_ne!(spec_key(solver, &int()), spec_key(solver, &singleton(1)));
+        assert_ne!(
+            spec_key(solver, &singleton(1)),
+            spec_key(solver, &singleton(2))
+        );
+        assert_eq!(
+            spec_key(solver, &singleton(1)),
+            spec_key(solver, &singleton(1))
+        );
     }
 
     #[test]
     fn refinement_sets_compare_order_insensitively() {
+        let solver = &mut Solver::new();
         let a = Type::refined_one(Type::refined_one(int(), refined(1)), refined(2));
         let b = Type::refined_one(Type::refined_one(int(), refined(2)), refined(1));
-        assert_eq!(spec_key(&a), spec_key(&b));
+        assert_eq!(spec_key(solver, &a), spec_key(solver, &b));
     }
 
     /// An under-determined position is one canonical value, not a fresh
     /// placeholder — two such uses must be able to share.
     #[test]
     fn under_determined_positions_are_canonical() {
-        assert_eq!(spec_key(&fresh_var(0)), spec_key(&fresh_var(0)));
-        assert_eq!(spec_key(&fresh_var(0)), SpecKey::default());
+        let solver = &mut Solver::new();
+        assert_eq!(
+            {
+                let fresh = fresh_var(solver, 0);
+                spec_key(solver, &fresh)
+            },
+            {
+                let fresh = fresh_var(solver, 0);
+                spec_key(solver, &fresh)
+            }
+        );
+        assert_eq!(
+            {
+                let fresh = fresh_var(solver, 0);
+                spec_key(solver, &fresh)
+            },
+            SpecKey::default()
+        );
     }
 
     /// An argument's refinement reaches a domain variable as a **lower** bound, and
@@ -1048,16 +1113,19 @@ mod tests {
     /// domain's lower bounds.
     #[test]
     fn lower_bound_refinement_is_visible_where_a_materialization_narrows() {
+        let solver = &mut Solver::new();
         let mut keys = Vec::new();
         for n in [2, 5] {
-            let dom = fresh_var(0);
+            let dom = fresh_var(solver, 0);
             let mut cache = ConstrainCache::new();
             // The emit-time `arg <: domain` edge, for an argument carrying its
             // literal's singleton.
-            constrain_subtype(&singleton(n), &dom, &mut cache).expect("arg flows into domain");
+            constrain_subtype(solver, &singleton(n), &dom, &mut cache)
+                .expect("arg flows into domain");
             // And the definition's demand, which settles the domain's shape.
-            constrain_subtype(&dom, &int(), &mut cache).expect("domain meets the body's demand");
-            keys.push(spec_key(&Type::fun(dom, int())));
+            constrain_subtype(solver, &dom, &int(), &mut cache)
+                .expect("domain meets the body's demand");
+            keys.push(spec_key(solver, &Type::fun(dom, int())));
         }
         assert_ne!(
             keys[0], keys[1],
@@ -1071,18 +1139,23 @@ mod tests {
     /// ?b` with `?b <: ?a` is the ordinary spurious cycle, not a recursive type.)
     #[test]
     fn mutually_constrained_vars_terminate() {
-        let a = fresh_var(0);
-        let b = fresh_var(0);
+        let solver = &mut Solver::new();
+        let a = fresh_var(solver, 0);
+        let b = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&a, &b, &mut cache).expect("a <: b");
-        constrain_subtype(&b, &a, &mut cache).expect("b <: a");
-        constrain_subtype(&singleton(7), &a, &mut cache).expect("7 <: a");
-        let k = spec_key(&a);
+        constrain_subtype(solver, &a, &b, &mut cache).expect("a <: b");
+        constrain_subtype(solver, &b, &a, &mut cache).expect("b <: a");
+        constrain_subtype(solver, &singleton(7), &a, &mut cache).expect("7 <: a");
+        let k = spec_key(solver, &a);
         assert_ne!(k, SpecKey::default(), "the lower bound must be collected");
-        assert_eq!(k, spec_key(&a), "and the walk must be deterministic");
+        assert_eq!(
+            k,
+            spec_key(solver, &a),
+            "and the walk must be deterministic"
+        );
         // The refinement is on `a`'s lower bounds, so it is the *positive* read that
         // carries it — the same asymmetry a domain position exploits in reverse.
-        assert_eq!(k.positive, spec_key(&singleton(7)).positive);
+        assert_eq!(k.positive, spec_key(solver, &singleton(7)).positive);
     }
 
     /// A key computed while a cycle back-edge was dropped is **incomplete**, so it
@@ -1107,22 +1180,23 @@ mod tests {
     /// the same contribution.
     #[test]
     fn a_truncated_expansion_is_not_memoized() {
-        fn push_lower(var: &Type, ty: Type) {
+        let solver = &mut Solver::new();
+        fn push_lower(solver: &mut Solver, var: &Type, ty: Type) {
             let Type::Infer(v) = var else {
                 unreachable!("fresh_var yields Type::Infer");
             };
-            v.bounds.borrow_mut().lower_mut().push(Bound::conc(ty));
+            v.bounds_mut(solver).lower_mut().push(Bound::conc(ty));
         }
-        let a = fresh_var(0);
-        let b = fresh_var(0);
-        push_lower(&a, singleton(1));
-        push_lower(&a, b.clone());
-        push_lower(&b, singleton(2));
-        push_lower(&b, a.clone());
+        let a = fresh_var(solver, 0);
+        let b = fresh_var(solver, 0);
+        push_lower(solver, &a, singleton(1));
+        push_lower(solver, &a, b.clone());
+        push_lower(solver, &b, singleton(2));
+        push_lower(solver, &b, a.clone());
 
         // Both variables reach both refinements, so both positions see both — no
         // matter which one the walk expands first.
-        let both = spec_key(&Type::Tuple(vec![a.clone(), b.clone()]));
+        let both = spec_key(solver, &Type::Tuple(vec![a.clone(), b.clone()]));
         let (pos0, pos1) = (
             &both.positive.rec[&FieldKey::Index(0)],
             &both.positive.rec[&FieldKey::Index(1)],
@@ -1139,7 +1213,7 @@ mod tests {
         );
 
         // And the whole key is independent of the order the walk meets them.
-        assert_eq!(both, spec_key(&Type::Tuple(vec![b, a])));
+        assert_eq!(both, spec_key(solver, &Type::Tuple(vec![b, a])));
     }
 
     /// A variable reached along many paths under substitutions that act on nothing below
@@ -1148,18 +1222,18 @@ mod tests {
     /// reaching the next along two bounds is expanded once per path, `2ⁿ` times.
     #[test]
     fn a_variable_reached_under_inert_substitutions_is_expanded_once() {
+        let solver = &mut Solver::new();
         let depth = 16;
-        let mut var = fresh_var(0);
+        let mut var = fresh_var(solver, 0);
         let Type::Infer(bottom) = &var else {
             unreachable!("fresh_var yields Type::Infer");
         };
         bottom
-            .bounds
-            .borrow_mut()
+            .bounds_mut(solver)
             .lower_mut()
             .push(Bound::conc(singleton(1)));
         for level in 0..depth {
-            let above = fresh_var(0);
+            let above = fresh_var(solver, 0);
             let Type::Infer(v) = &above else {
                 unreachable!("fresh_var yields Type::Infer");
             };
@@ -1168,18 +1242,16 @@ mod tests {
                     format!("unread_{level}_{side}"),
                     TypedExpr::lit(Lit::Int(0)).with_ty(int()),
                 );
-                v.bounds
-                    .borrow_mut()
-                    .lower_mut()
-                    .push(Bound::with_subst(var.clone(), inert));
+                let bound = Bound::with_subst(solver, var.clone(), inert);
+                v.bounds_mut(solver).lower_mut().push(bound);
             }
             var = above;
         }
         let mut ctx = fresh_ctx();
-        let view = key_go(&var, true, &Subst::id(), &mut ctx);
+        let view = key_go(solver, &var, true, &Subst::id(), &mut ctx);
         assert_eq!(
             view,
-            key_go(&singleton(1), true, &Subst::id(), &mut fresh_ctx())
+            key_go(solver, &singleton(1), true, &Subst::id(), &mut fresh_ctx())
         );
         assert!(
             ctx.visits <= depth + 1,
@@ -1191,13 +1263,18 @@ mod tests {
 
     #[test]
     fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
-        let kind = crate::ccl::ty::FunKindVar::fresh();
+        let solver = &mut Solver::new();
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
         let collection = Rc::new(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
-        let (root, nodes) = super::super::test_helpers::diamond_bound_graph(16, int(), &edge);
+        let (root, nodes) =
+            super::super::test_helpers::diamond_bound_graph(solver, 16, int(), &edge);
         let mut ctx = fresh_ctx();
-        let result = key_go(&root, true, &Subst::id(), &mut ctx);
-        assert_eq!(result, key_go(&int(), true, &Subst::id(), &mut fresh_ctx()));
+        let result = key_go(solver, &root, true, &Subst::id(), &mut ctx);
+        assert_eq!(
+            result,
+            key_go(solver, &int(), true, &Subst::id(), &mut fresh_ctx())
+        );
         assert!(
             ctx.visits <= nodes,
             "{} expansions for {nodes} variables",
@@ -1214,15 +1291,16 @@ mod tests {
     /// definition-side demand both say something.
     #[test]
     fn several_bounds_at_one_position_merge_positionwise() {
+        let solver = &mut Solver::new();
         // `?v` bounded below by two function types that differ only in their
         // codomain: the merged view must carry both codomain atoms, not the first.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         for cod in [int(), Type::Base(BaseType::String)] {
             let f = Type::fun(singleton(1), cod);
-            constrain_subtype(&f, &v, &mut cache).expect("bound flows into v");
+            constrain_subtype(solver, &f, &v, &mut cache).expect("bound flows into v");
         }
-        let k = spec_key(&v);
+        let k = spec_key(solver, &v);
         let (dom, cod) = k
             .positive
             .fun
@@ -1252,40 +1330,45 @@ mod tests {
     /// clone instead of splitting on a per-instantiation variable identity.
     #[test]
     fn fun_kind_is_part_of_the_key() {
+        let solver = &mut Solver::new();
         assert_ne!(
-            spec_key(&Type::fun(int(), int())),
-            spec_key(&Type::data_fun(int(), int())),
+            spec_key(solver, &Type::fun(int(), int())),
+            spec_key(solver, &Type::data_fun(int(), int())),
             "a compute function and a collection of the same shape must not share a clone"
         );
         // An *unresolved* kind does not split: both uses read the same unpinned var,
         // which keys as the `Compute` default rather than as its own point.
-        let unresolved = || Type::Fun {
+        let unresolved = |solver: &mut Solver| Type::Fun {
             binder: crate::ccl::FunBinder::None,
-            fun_kind: crate::ccl::ty::FunKind::fresh_var(),
+            fun_kind: crate::ccl::ty::FunKind::fresh_var(solver),
             domain: Box::new(int()),
             codomain: Box::new(int()),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
+        let (first, second) = (unresolved(solver), unresolved(solver));
         assert_eq!(
-            spec_key(&unresolved()),
-            spec_key(&unresolved()),
+            spec_key(solver, &first),
+            spec_key(solver, &second),
             "two fresh kind vars are the same unresolved answer, not two identities"
         );
+        let third = unresolved(solver);
         assert_eq!(
-            spec_key(&unresolved()),
-            spec_key(&Type::fun(int(), int())),
+            spec_key(solver, &third),
+            spec_key(solver, &Type::fun(int(), int())),
             "an unpinned kind is the compute-function default, so it shares a clone with \
              a concrete compute function rather than splitting off its own"
         );
         // And the merge keeps two concrete kinds apart rather than one shadowing the
         // other — what keying `fun` by `KindPin` buys, and why it needs `Ord`.
         let mut merged = key_go(
+            solver,
             &Type::fun(int(), int()),
             true,
             &Subst::id(),
             &mut fresh_ctx(),
         );
         merged.union(key_go(
+            solver,
             &Type::data_fun(int(), int()),
             true,
             &Subst::id(),
@@ -1303,10 +1386,11 @@ mod tests {
     /// key alike, or a clone pinned to one would serve a use of the other.
     #[test]
     fn history_kind_is_part_of_the_key() {
+        let solver = &mut Solver::new();
         let history = |history_kind| Type::history(Type::Txn, int(), history_kind);
         assert_ne!(
-            spec_key(&history(HistoryKind::Overwrite)),
-            spec_key(&history(HistoryKind::Append))
+            spec_key(solver, &history(HistoryKind::Overwrite)),
+            spec_key(solver, &history(HistoryKind::Append))
         );
         // And the merge keeps them apart rather than one shadowing the other —
         // which is what the `history` map being keyed by kind buys, and why
@@ -1314,12 +1398,14 @@ mod tests {
         // reads an `Overwrite` place type *through* to its value type, so the two kinds
         // never reach one variable's bound list by way of a subtyping edge.
         let mut merged = key_go(
+            solver,
             &history(HistoryKind::Overwrite),
             true,
             &Subst::id(),
             &mut fresh_ctx(),
         );
         merged.union(key_go(
+            solver,
             &history(HistoryKind::Append),
             true,
             &Subst::id(),
@@ -1356,30 +1442,28 @@ mod tests {
     fn a_memoized_variable_s_names_include_its_barrier_s_lowers() {
         use crate::ccl::Refinement;
         use crate::ccl::infer::solver::test_helpers::dep_pred;
-        let barrier = crate::ccl::BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let solver = &mut Solver::new();
+        let barrier = crate::ccl::BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
         let b = Type::BarrierVar(Rc::clone(&barrier));
         let lower = Type::fun(
             Type::refined_one(int(), Refinement::born(dep_pred("x"))),
             int(),
         );
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&lower, &b, &mut cache).expect("the lower flows in");
-        let v = fresh_var(0);
-        constrain_subtype(&b, &v, &mut cache).expect("the barrier flows into ?v");
-        let above = |xs: &[i64]| {
-            let top = fresh_var(0);
+        constrain_subtype(solver, &lower, &b, &mut cache).expect("the lower flows in");
+        let v = fresh_var(solver, 0);
+        constrain_subtype(solver, &b, &v, &mut cache).expect("the barrier flows into ?v");
+        let mut above = |xs: &[i64]| {
+            let top = fresh_var(solver, 0);
             let Type::Infer(state) = &top else {
                 unreachable!()
             };
             for &x in xs {
                 let at = Subst::discharge("x", TypedExpr::lit(Lit::Int(x)).with_ty(int()));
-                state
-                    .bounds
-                    .borrow_mut()
-                    .lower_mut()
-                    .push(Bound::with_subst(v.clone(), at));
+                let bound = Bound::with_subst(solver, v.clone(), at);
+                state.bounds_mut(solver).lower_mut().push(bound);
             }
-            spec_key(&top)
+            spec_key(solver, &top)
         };
         assert_ne!(above(&[1, 2]), above(&[1]));
         assert_eq!(above(&[1, 2]), above(&[2, 1]));
@@ -1389,11 +1473,13 @@ mod tests {
     /// recursing forever, as `compact_go` compacts it: the back-edge is cut.
     #[test]
     fn a_barrier_reaching_itself_through_its_lower_keys() {
-        let barrier = crate::ccl::BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let solver = &mut Solver::new();
+        let barrier = crate::ccl::BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
         let b = Type::BarrierVar(Rc::clone(&barrier));
         let lower = Type::fun(int(), b.clone());
-        constrain_subtype(&lower, &b, &mut ConstrainCache::new()).expect("the lower flows in");
-        let _ = spec_key(&b);
+        constrain_subtype(solver, &lower, &b, &mut ConstrainCache::new())
+            .expect("the lower flows in");
+        let _ = spec_key(solver, &b);
     }
 }
 
@@ -1424,17 +1510,18 @@ mod refinement_closing_tests {
     /// name-spelled key split them into per-spelling clones.
     #[test]
     fn spec_key_shares_alpha_variant_dependent_types() {
+        let solver = &mut Solver::new();
         let fx = dep_fun("x");
         let fy = dep_fun("y");
         // The relation reconciles the α-variants both ways…
         let mut c = ConstrainCache::new();
-        assert!(constrain_subtype(&fx, &fy, &mut c).is_ok());
+        assert!(constrain_subtype(solver, &fx, &fy, &mut c).is_ok());
         let mut c = ConstrainCache::new();
-        assert!(constrain_subtype(&fy, &fx, &mut c).is_ok());
+        assert!(constrain_subtype(solver, &fy, &fx, &mut c).is_ok());
         // …and the specialization key agrees.
         assert_eq!(
-            spec_key(&fx),
-            spec_key(&fy),
+            spec_key(solver, &fx),
+            spec_key(solver, &fy),
             "α-variant dependent instantiation types must share a specialization"
         );
     }
@@ -1446,6 +1533,7 @@ mod refinement_closing_tests {
     /// whose interior was resolved against the other's argument.
     #[test]
     fn spec_key_keeps_distinct_binders_distinct() {
+        let solver = &mut Solver::new();
         let nested = |referenced: &str| Type::Fun {
             binder: crate::ccl::FunBinder::Whole(Name::raw("x")),
             fun_kind: FunKind::Data(None),
@@ -1463,8 +1551,8 @@ mod refinement_closing_tests {
             capabilities: crate::ccl::capabilities::Capabilities::none(),
         };
         assert_ne!(
-            spec_key(&nested("y")),
-            spec_key(&nested("x")),
+            spec_key(solver, &nested("y")),
+            spec_key(solver, &nested("x")),
             "the key must not conflate the inner and outer Pi binders"
         );
         // A free name that binds to no enclosing function stays a name and stays
@@ -1480,6 +1568,6 @@ mod refinement_closing_tests {
             };
             *codomain
         };
-        assert_ne!(spec_key(&free), spec_key(&bound));
+        assert_ne!(spec_key(solver, &free), spec_key(solver, &bound));
     }
 }

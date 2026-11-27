@@ -20,7 +20,7 @@ use cambra::ccl::infer::solver::compact::{
 };
 use cambra::ccl::infer::solver::constrain::admits_resolved;
 use cambra::ccl::infer::solver::smt::NoScope;
-use cambra::ccl::infer::solver::{CoalesceError, ConstrainCache, constrain_subtype};
+use cambra::ccl::infer::solver::{CoalesceError, ConstrainCache, Solver, constrain_subtype};
 use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, Lit, Name, Openness, ProjKey, Refinement,
     Type, TypeKind, TypedExpr, TypedExprNode, ccl_utils,
@@ -332,7 +332,7 @@ fn key_json(k: &FieldKey) -> String {
 /// name-based dependent shapes (the solver's mid-solve form) because that is
 /// the natural way to write them; this normalizes each case into the form
 /// both the solver's construction sites and the model's grammar mean.
-fn close_all(ty: &Type) -> Type {
+fn close_all(solver: &mut Solver, ty: &Type) -> Type {
     use cambra::ccl::subst::close_pi_binder;
     match ty {
         Type::Fun {
@@ -342,10 +342,10 @@ fn close_all(ty: &Type) -> Type {
             codomain,
             capabilities,
         } => {
-            let domain = close_all(domain);
-            let codomain = close_all(codomain);
+            let domain = close_all(solver, domain);
+            let codomain = close_all(solver, codomain);
             let codomain = match binder.whole() {
-                Some(b) => close_pi_binder(b, &codomain, cambra::ccl::Ids::Fresh),
+                Some(b) => close_pi_binder(solver, b, &codomain, cambra::ccl::Ids::Fresh),
                 None => codomain,
             };
             Type::Fun {
@@ -356,15 +356,17 @@ fn close_all(ty: &Type) -> Type {
                 capabilities: capabilities.clone(),
             }
         }
-        Type::Refinement(base, r) => Type::Refinement(Box::new(close_all(base)), r.clone()),
-        Type::Tuple(ts) => Type::Tuple(ts.iter().map(close_all).collect()),
-        Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(close_all).collect()),
-        Type::Record(fs) => {
-            Type::Record(fs.iter().map(|(n, t)| (n.clone(), close_all(t))).collect())
-        }
+        Type::Refinement(base, r) => Type::Refinement(Box::new(close_all(solver, base)), r.clone()),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| close_all(solver, t)).collect()),
+        Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(|t| close_all(solver, t)).collect()),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), close_all(solver, t)))
+                .collect(),
+        ),
         Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
-                .map(|(k, t)| (k.clone(), close_all(t)))
+                .map(|(k, t)| (k.clone(), close_all(solver, t)))
                 .collect(),
             *openness,
         ),
@@ -635,13 +637,13 @@ fn width_json(w: &TupleWidth) -> String {
 /// contribution a `Hole` compacts to (the merge identity). A generated function
 /// sometimes carries a kind *variable*, which is the only way to reach
 /// `KindMerge::Unknown`.
-fn gen_bound(rng: &mut Rng) -> CompactType {
+fn gen_bound(solver: &mut Solver, rng: &mut Rng) -> CompactType {
     if rng.chance(1, 10) {
-        return compact_type(&Type::Hole).term;
+        return compact_type(solver, &Type::Hole).term;
     }
     let ty = gen_ty(rng, 3, Fragment::Modelled);
     let ty = open_some_tuples(rng, ty);
-    compact_type(&maybe_kind_var(rng, ty)).term
+    compact_type(solver, &maybe_kind_var(rng, ty)).term
 }
 
 /// Reopen some of a generated type's non-empty tuples, so the bounds carry open widths too. A
@@ -779,20 +781,23 @@ fn differential_coalesce_vs_lean_model() {
     let seed: u64 = env_or("CAMBRA_DIFF_SEED", 0xC0A1);
     let n: usize = env_or("CAMBRA_DIFF_N", 4000);
 
+    let solver = &mut Solver::new();
     let mut rng = Rng::new(seed);
     let mut cases: Vec<String> = Vec::new();
     while cases.len() < n {
         let pol = rng.chance(1, 2);
-        let bounds: Vec<CompactType> = (0..1 + rng.below(3)).map(|_| gen_bound(&mut rng)).collect();
+        let bounds: Vec<CompactType> = (0..1 + rng.below(3))
+            .map(|_| gen_bound(solver, &mut rng))
+            .collect();
         let mut acc = bounds[0].clone();
         for b in &bounds[1..] {
-            acc = CompactType::merge_bounds(pol, acc, b.clone());
+            acc = CompactType::merge_bounds(solver, pol, acc, b.clone());
         }
         // Materialized at the merge's polarity: a join and a meet settle a chain of `UInt` and
         // ranges at opposite ends.
         let (Some(ct), Some(got)) = (
             cty_json(&acc),
-            coalesce_outcome(&coalesce_position(&acc, pol)),
+            coalesce_outcome(&coalesce_position(solver, &acc, pol)),
         ) else {
             panic!("generator produced a bound outside the wire schema: {acc:?}");
         };
@@ -860,6 +865,7 @@ fn gen_type_kind(rng: &mut Rng) -> TypeKind {
 }
 
 fn admits_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
+    let solver = &mut Solver::new();
     let mut rng = Rng::new(seed);
     let mut cases = Vec::with_capacity(n);
     let mut admitted = 0usize;
@@ -875,7 +881,8 @@ fn admits_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
         };
         // Enter the model's concrete fragment, which is closed, as the subtyping differential
         // does.
-        let (kind, ty) = (kind.map_children(close_all), close_all(&ty));
+        let kind = kind.map_children(|t| close_all(solver, t));
+        let ty = close_all(solver, &ty);
         let (Some(k), Some(t)) = (tk_json(&kind), ty_json(&ty)) else {
             panic!(
                 "generator produced a membership case outside the wire schema \
@@ -883,7 +890,7 @@ fn admits_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
                 cases.len()
             );
         };
-        let got = admits_resolved(&ty, &kind, &[], &NoScope);
+        let got = admits_resolved(solver, &ty, &kind, &[], &NoScope);
         admitted += usize::from(got);
         cases.push(format!(
             r#"{{"op":"admits","kind":{k},"ty":{t},"got":{got}}}"#
@@ -962,25 +969,29 @@ fn ctk_json(k: &CompactTypeKind) -> Option<String> {
 /// property carry nothing. Weighted toward the member-naming pair, which is where the rows that
 /// can disagree live — and a candidate list of length zero is generated, since the empty kind is
 /// what both degenerate parameters answer.
-fn gen_kind(rng: &mut Rng) -> CompactTypeKind {
+fn gen_kind(solver: &mut Solver, rng: &mut Rng) -> CompactTypeKind {
     match rng.below(10) {
         0 => CompactTypeKind::Type,
         1 => CompactTypeKind::UIntRanges,
-        2..=5 => CompactTypeKind::SubtypesOf(Box::new(gen_bound(rng))),
-        _ => CompactTypeKind::Enumerated((0..rng.below(3)).map(|_| gen_bound(rng)).collect()),
+        2..=5 => CompactTypeKind::SubtypesOf(Box::new(gen_bound(solver, rng))),
+        _ => {
+            CompactTypeKind::Enumerated((0..rng.below(3)).map(|_| gen_bound(solver, rng)).collect())
+        }
     }
 }
 
 fn type_kind_merge_cases(seed: u64, n: usize) -> Vec<String> {
+    let solver = &mut Solver::new();
     let mut rng = Rng::new(seed);
     let mut cases = Vec::new();
     while cases.len() < n {
         let pol = rng.chance(1, 2);
-        let kinds: Vec<CompactTypeKind> =
-            (0..2 + rng.below(3)).map(|_| gen_kind(&mut rng)).collect();
+        let kinds: Vec<CompactTypeKind> = (0..2 + rng.below(3))
+            .map(|_| gen_kind(solver, &mut rng))
+            .collect();
         let mut acc = kinds[0].clone();
         for k in &kinds[1..] {
-            let merged = CompactTypeKind::merge_kinds(pol, acc.clone(), k.clone());
+            let merged = CompactTypeKind::merge_kinds(solver, pol, acc.clone(), k.clone());
             let (Some(l), Some(r), Some(g)) = (ctk_json(&acc), ctk_json(k), ctk_json(&merged))
             else {
                 panic!(
@@ -1055,14 +1066,17 @@ fn differential_polar_merge_vs_lean_model() {
     let seed: u64 = env_or("CAMBRA_DIFF_SEED", 0x5EED);
     let n: usize = env_or("CAMBRA_DIFF_N", 4000);
 
+    let solver = &mut Solver::new();
     let mut rng = Rng::new(seed);
     let mut cases: Vec<String> = Vec::new();
     while cases.len() < n {
         let pol = rng.chance(1, 2);
-        let bounds: Vec<CompactType> = (0..2 + rng.below(3)).map(|_| gen_bound(&mut rng)).collect();
+        let bounds: Vec<CompactType> = (0..2 + rng.below(3))
+            .map(|_| gen_bound(solver, &mut rng))
+            .collect();
         let mut acc = bounds[0].clone();
         for b in &bounds[1..] {
-            let merged = CompactType::merge_bounds(pol, acc.clone(), b.clone());
+            let merged = CompactType::merge_bounds(solver, pol, acc.clone(), b.clone());
             let (Some(l), Some(r), Some(g)) = (cty_json(&acc), cty_json(b), cty_json(&merged))
             else {
                 panic!("generator produced a bound outside the wire schema: {acc:?} / {b:?}");
@@ -1109,6 +1123,7 @@ fn differential_concrete_subtype_vs_lean_model() {
     let seed: u64 = env_or("CAMBRA_DIFF_SEED", 0xC0FFEE);
     let n: usize = env_or("CAMBRA_DIFF_N", 4000);
 
+    let solver = &mut Solver::new();
     let mut rng = Rng::new(seed);
     let mut cases = Vec::with_capacity(n);
     while cases.len() < n {
@@ -1127,7 +1142,7 @@ fn differential_concrete_subtype_vs_lean_model() {
         };
         // Enter the model's concrete fragment, which is closed — what
         // construction produces, and what the model's grammar means.
-        let (lhs, rhs) = (close_all(&lhs), close_all(&rhs));
+        let (lhs, rhs) = (close_all(solver, &lhs), close_all(solver, &rhs));
         let (Some(lj), Some(rj)) = (ty_json(&lhs), ty_json(&rhs)) else {
             panic!("generator produced a type outside the concrete wire schema: {lhs:?} / {rhs:?}");
         };
@@ -1138,7 +1153,7 @@ fn differential_concrete_subtype_vs_lean_model() {
             );
         }
         let mut cache = ConstrainCache::new();
-        let rust = constrain_subtype(&lhs, &rhs, &mut cache).is_ok();
+        let rust = constrain_subtype(solver, &lhs, &rhs, &mut cache).is_ok();
         cases.push((format!(r#"{{"op":"sub","lhs":{lj},"rhs":{rj}}}"#), rust));
     }
 
@@ -1256,10 +1271,10 @@ fn harness_dump_write_failure_is_loud() {
 
 #[test]
 fn bug_plain_and_data_pins_have_the_same_wire_encoding() {
-    let mut plain = compact_type(&Type::data_fun(
-        Type::UIntRange(1),
-        Type::Base(BaseType::Int),
-    ))
+    let mut plain = compact_type(
+        &mut Solver::new(),
+        &Type::data_fun(Type::UIntRange(1), Type::Base(BaseType::Int)),
+    )
     .term;
     plain.fun.as_mut().unwrap().kind = KindPin::Plain;
     let mut data = plain.clone();

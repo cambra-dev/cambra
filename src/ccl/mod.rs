@@ -78,11 +78,8 @@ pub use ty::*;
 // `pub(crate)` items are NOT carried by the globs above (a glob re-exports only
 // `pub` items), so they are re-exported explicitly here to preserve their
 // `crate::ccl::X` paths:
-//   - `arena_enter` / `arena_exit` are used by `infer.rs`;
 //   - `fresh_infer_var_id` is used by `solver`.
-pub(crate) use infer_var::{
-    arena_barrier_vars, arena_enter, arena_exit, barrier_arena_exit, fresh_infer_var_id,
-};
+pub(crate) use infer_var::fresh_infer_var_id;
 
 /// Reset all IDs allocated by ccl module counters. Test-only convenience for
 /// differential harnesses that re-run lowering + inference and need stable

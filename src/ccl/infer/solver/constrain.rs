@@ -15,12 +15,13 @@
 #![allow(clippy::mutable_key_type)]
 
 use crate::ccl::capabilities::{Capabilities, Filter, LocatedCapability, Repr};
+use crate::ccl::infer::solver::Solver;
 use crate::ccl::nominal::{Variance, sides};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ccl::Duplicate;
-use crate::ccl::ccl_utils::normal_refinement;
+use crate::ccl::ccl_utils::normal_refinement_in;
 use crate::ccl::infer_var::{GuardedBound, Origin};
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunBinder, FunKind, KindPin, TypeKind};
@@ -416,15 +417,20 @@ impl ConstrainCache {
     /// variable's upper bound is checked after emission
     /// (`solver::barrier::solve_barrier_vars`), so a failure there reports what the edge's
     /// caller would have. `report` runs only when a bound was recorded.
-    pub fn report_recorded(&mut self, report: impl FnOnce() -> EdgeReport) {
+    /// Whether an edge recorded a barrier bound that no report has been stamped on yet.
+    pub fn holds_unreported(&self) -> bool {
+        !self.unreported.is_empty()
+    }
+
+    pub fn report_recorded(&mut self, solver: &mut Solver, report: impl FnOnce() -> EdgeReport) {
         if !self.unreported.is_empty() {
-            self.stamp_recorded(&Rc::new(report()));
+            self.stamp_recorded(solver, &Rc::new(report()));
         }
     }
 
-    fn stamp_recorded(&mut self, report: &Rc<EdgeReport>) {
+    fn stamp_recorded(&mut self, solver: &mut Solver, report: &Rc<EdgeReport>) {
         for (barrier, index) in self.unreported.drain(..) {
-            barrier.uppers.borrow_mut()[index].report = Some(Rc::clone(report));
+            barrier.uppers_mut(solver)[index].report = Some(Rc::clone(report));
         }
     }
 
@@ -560,7 +566,7 @@ impl ExtrudeCache {
 pub struct SkipSmtScope;
 
 impl ScopeEnv for SkipSmtScope {
-    fn binder_type(&self, _name: &Name) -> Option<Type> {
+    fn binder_type(&self, _solver: &mut Solver, _name: &Name) -> Option<Type> {
         None
     }
     fn is_skip_smt(&self) -> bool {
@@ -579,7 +585,7 @@ struct ComponentScope<'a> {
 impl ComponentScope<'_> {
     /// A mismatch leaving this component scope reads its temporary binders at their
     /// literal values. Captured names from the outer scope keep their written spelling.
-    fn mismatch_at_values(&self, error: ConstrainError) -> ConstrainError {
+    fn mismatch_at_values(&self, solver: &mut Solver, error: ConstrainError) -> ConstrainError {
         let ConstrainError::Mismatch { lhs, rhs } = error else {
             return error;
         };
@@ -596,20 +602,20 @@ impl ComponentScope<'_> {
             Subst::discharging(&values, crate::ccl::Ids::Fresh)
         };
         ConstrainError::Mismatch {
-            lhs: Box::new(substitution.apply_type(&lhs)),
-            rhs: Box::new(substitution.apply_type(&rhs)),
+            lhs: Box::new(substitution.apply_type_in(solver, &lhs)),
+            rhs: Box::new(substitution.apply_type_in(solver, &rhs)),
         }
     }
 }
 
 impl ScopeEnv for ComponentScope<'_> {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
         self.components
             .iter()
             .rev()
             .find(|(n, _)| n == name)
             .map(|(_, t)| t.clone())
-            .or_else(|| self.outer.binder_type(name))
+            .or_else(|| self.outer.binder_type(solver, name))
     }
     fn is_skip_smt(&self) -> bool {
         self.outer.is_skip_smt()
@@ -628,11 +634,12 @@ impl ScopeEnv for ComponentScope<'_> {
 /// are parts of a type it has taken apart; a caller holding none that still wants
 /// the fallback passes [`NoScope`](super::smt::NoScope) to either.
 pub fn constrain_subtype(
+    solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    constrain_subtype_in(lhs, rhs, cache, &SkipSmtScope)
+    constrain_subtype_in(solver, lhs, rhs, cache, &SkipSmtScope)
 }
 
 /// [`constrain_subtype`] with the lexical scope the edge is drawn in.
@@ -644,18 +651,20 @@ pub fn constrain_subtype(
 /// types built outside any program — passes [`NoScope`](super::smt::NoScope), which
 /// only weakens what the fallback can prove.
 pub fn constrain_subtype_in(
+    solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     cache.extruded.clear();
-    constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
+    constrain_go(solver, lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
 }
 
 /// [`constrain_subtype_in`] with `rhs` read under `rhs_subst`: an argument against its
 /// parameter, whose type reads the parameters before it, discharged at their arguments.
 pub fn constrain_subtype_discharged_in(
+    solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
     rhs_subst: &Subst,
@@ -663,14 +672,19 @@ pub fn constrain_subtype_discharged_in(
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     cache.extruded.clear();
-    constrain_go(lhs, rhs, &Subst::id(), rhs_subst, cache, scope)
+    constrain_go(solver, lhs, rhs, &Subst::id(), rhs_subst, cache, scope)
 }
 
 /// `domain`, the domain of a function binding the parameter list `from`, with its parameters
 /// named as `to` names them: each component's name and each reference to it, so it meets a
 /// domain under `to`'s names component by component. `None` unless both are parameter lists of
 /// one length over a dependent tuple.
-fn onto_parameter_names(domain: &Type, from: &FunBinder, to: &FunBinder) -> Option<Type> {
+fn onto_parameter_names(
+    solver: &mut Solver,
+    domain: &Type,
+    from: &FunBinder,
+    to: &FunBinder,
+) -> Option<Type> {
     let (FunBinder::Parameters(from), FunBinder::Parameters(to)) = (from, to) else {
         return None;
     };
@@ -693,7 +707,12 @@ fn onto_parameter_names(domain: &Type, from: &FunBinder, to: &FunBinder) -> Opti
         components
             .iter()
             .zip(to)
-            .map(|((name, ty), to)| (to.clone().or_else(|| name.clone()), renames.apply_type(ty)))
+            .map(|((name, ty), to)| {
+                (
+                    to.clone().or_else(|| name.clone()),
+                    renames.apply_type_in(solver, ty),
+                )
+            })
             .collect(),
     ))
 }
@@ -705,6 +724,7 @@ fn onto_parameter_names(domain: &Type, from: &FunBinder, to: &FunBinder) -> Opti
 /// An upper bound the check records on another barrier variable reports what `upper` does:
 /// it is the same edge, carried further.
 pub(super) fn constrain_opaque_upper(
+    solver: &mut Solver,
     resolved: &Type,
     value: Option<Origin>,
     upper: &BarrierUpper,
@@ -713,6 +733,7 @@ pub(super) fn constrain_opaque_upper(
     let bound = &upper.bound;
     cache.at(value, bound.origin);
     let result = constrain_go(
+        solver,
         resolved,
         &bound.ty,
         &bound.self_subst,
@@ -721,7 +742,7 @@ pub(super) fn constrain_opaque_upper(
         &SkipSmtScope,
     );
     if let Some(report) = &upper.report {
-        cache.stamp_recorded(report);
+        cache.stamp_recorded(solver, report);
     }
     result
 }
@@ -737,6 +758,7 @@ pub(super) fn constrain_opaque_upper(
 /// as in [`constrain_subtype_in`]; [`NoScope`](super::smt::NoScope) leaves the query
 /// running with nothing assumed about the names its predicates mention.
 pub fn constrain_subtype_under_in(
+    solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
     lhs_binders: &[crate::ccl::ty::Witness],
@@ -752,7 +774,7 @@ pub fn constrain_subtype_under_in(
     let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
     cache.extruded.clear();
     cache.under(lhs_binders, rhs_binders, |cache| {
-        constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache, scope)
+        constrain_go(solver, lhs, rhs, &Subst::id(), &instantiation, cache, scope)
     })
 }
 
@@ -801,11 +823,11 @@ fn witness_instantiation(
 /// `own` across an edge to `far` read under `far_subst`: what the type bound recorded at that
 /// end renders, `Bound::edge(own, far, far_subst)`, so a sum's candidates read across the edge
 /// are read as the bound's content is ([`FunKindVar::record_under`]).
-fn kind_edge_subst(own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
+fn kind_edge_subst(solver: &mut Solver, own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
     if own.is_id() && far_subst.is_id() {
         return Subst::id();
     }
-    Bound::edge(own.clone(), far.clone(), far_subst.clone()).render_subst()
+    Bound::edge(solver, own.clone(), far.clone(), far_subst.clone()).render_subst(solver)
 }
 
 /// Capabilities are covariant: a function that does less stands where one that may do more is
@@ -860,6 +882,7 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &Constrai
 /// anything later: two kinds that denote different points of the lattice have no common
 /// function, whichever side is which.
 fn constrain_fun_kind(
+    solver: &mut Solver,
     k0: &FunKind,
     k1: &FunKind,
     lhs: &Type,
@@ -879,19 +902,23 @@ fn constrain_fun_kind(
         // kind"). Recording one side leaves the other reading nothing, so a pin that
         // reaches either end after the edge is drawn never crosses it.
         (FunKind::Var(v0), FunKind::Var(v1)) => {
-            v0.record_under(k1.clone(), false, kind_edge_subst(sl, rhs, sr));
-            v1.record_under(k0.clone(), true, kind_edge_subst(sr, lhs, sl));
+            let edge_subst = kind_edge_subst(solver, sl, rhs, sr);
+            v0.record_under(solver, k1.clone(), false, edge_subst);
+            let edge_subst = kind_edge_subst(solver, sr, lhs, sl);
+            v1.record_under(solver, k0.clone(), true, edge_subst);
         }
         (FunKind::Var(v), other) if matches!(k0, FunKind::Var(_)) => {
-            v.record_under(other.clone(), false, kind_edge_subst(sl, rhs, sr));
+            let edge_subst = kind_edge_subst(solver, sl, rhs, sr);
+            v.record_under(solver, other.clone(), false, edge_subst);
         }
         (other, FunKind::Var(v)) => {
-            v.record_under(other.clone(), true, kind_edge_subst(sr, lhs, sl));
+            let edge_subst = kind_edge_subst(solver, sr, lhs, sl);
+            v.record_under(solver, other.clone(), true, edge_subst);
         }
         // Both concrete: a compute function is not a collection, a plain collection is not a sum —
         // entering one is a term — and two sums of different width are two types. Nothing
         // arriving later can change any of that.
-        _ if k0.resolved() == k1.resolved() => return Ok(()),
+        _ if k0.resolved_in(solver) == k1.resolved_in(solver) => return Ok(()),
         _ => return Err(mismatch()),
     }
     // **A kind required to be two points is rejected at the edge that completed it.** A
@@ -910,7 +937,7 @@ fn constrain_fun_kind(
     // Reading it here is sound because `Conflict` **absorbs** in [`KindPin::join`] and
     // contributions are only ever appended, so a component that has reached it can never
     // leave, and the first edge to observe it is the one that completed it.
-    if k0.resolved() == KindPin::Conflict || k1.resolved() == KindPin::Conflict {
+    if k0.resolved_in(solver) == KindPin::Conflict || k1.resolved_in(solver) == KindPin::Conflict {
         return Err(mismatch());
     }
     Ok(())
@@ -918,8 +945,8 @@ fn constrain_fun_kind(
 
 /// Whether `d` is a variable that names one data domain ([`InferVar::names_domain`]), whose
 /// edges are invariant before any kind reaches it.
-fn named_domain(d: &Type) -> bool {
-    matches!(d, Type::Infer(v) if v.names_domain())
+fn named_domain(solver: &mut Solver, d: &Type) -> bool {
+    matches!(d, Type::Infer(v) if v.names_domain(solver))
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -952,7 +979,12 @@ fn named_domain(d: &Type) -> bool {
 /// - two *distinct non-invertible* morphisms meeting at one variable are two instances of
 ///   it: `L <: V[𝑎]` and `V[𝑏] <: U` say nothing about `L` and `U`, so there is no bridge
 ///   (`None`) and the closure draws no edge.
-fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Option<(Subst, Subst)> {
+fn bridge_holder_gap(
+    solver: &mut Solver,
+    lo: &Subst,
+    hi: &Subst,
+    holder: Option<&InferVar>,
+) -> Option<(Subst, Subst)> {
     if lo == hi {
         return Some((Subst::id(), Subst::id()));
     }
@@ -960,7 +992,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
     // binder the holder cannot name leaves the holder unchanged, so where the views differ only
     // there, `𝐿 <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and `𝐿 <: 𝑈` needs no transport.
     if let Some(v) = holder
-        && lo.acting_on(v) == hi.acting_on(v)
+        && lo.acting_on(solver, v) == hi.acting_on(solver, v)
     {
         return Some((Subst::id(), Subst::id()));
     }
@@ -973,7 +1005,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
     if lo.discharges_a_value()
         && let Some(hi_inv) = hi.invert()
     {
-        return Some((Subst::id(), Subst::then(&hi_inv, lo)));
+        return Some((Subst::id(), Subst::then(solver, &hi_inv, lo)));
     }
     // Reconcile on the LICENSED CORRESPONDENCE VIEWS: Var-target discharges
     // read as correspondences into the outer scope, under the monomorphic
@@ -984,10 +1016,10 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
     let lo = &lo.licensed_correspondence_view();
     let hi = &hi.licensed_correspondence_view();
     if let Some(lo_inv) = lo.invert() {
-        return Some((Subst::then(&lo_inv, hi), Subst::id()));
+        return Some((Subst::then(solver, &lo_inv, hi), Subst::id()));
     }
     if let Some(hi_inv) = hi.invert() {
-        return Some((Subst::id(), Subst::then(&hi_inv, lo)));
+        return Some((Subst::id(), Subst::then(solver, &hi_inv, lo)));
     }
     if lo.commutes_with(hi) {
         return Some((hi.clone(), lo.clone()));
@@ -1017,10 +1049,10 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst, holder: Option<&InferVar>) -> Optio
     // same-fiber meeting into the tripwire below.
     if lo_term.eq_modulo_ty_slots(&hi_term) {
         if let Some(lo_ren_inv) = lo_ren.invert() {
-            return Some((Subst::then(&lo_ren_inv, &hi_ren), Subst::id()));
+            return Some((Subst::then(solver, &lo_ren_inv, &hi_ren), Subst::id()));
         }
         if let Some(hi_ren_inv) = hi_ren.invert() {
-            return Some((Subst::id(), Subst::then(&hi_ren_inv, &lo_ren)));
+            return Some((Subst::id(), Subst::then(solver, &hi_ren_inv, &lo_ren)));
         }
     }
     // Last resort before declaring the morphisms genuinely different: equal
@@ -1096,7 +1128,7 @@ fn debug_assert_unique_keys<'a, K: Eq + std::fmt::Debug + 'a>(
 /// rather than left to the pointwise fallback because that fallback relates each
 /// collection to the consumer separately, which is the silent narrowing a lossless data
 /// join rules out, and which does not terminate.
-fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
+fn distinct_data_domains(solver: &mut Solver, lows: &[Bound]) -> Option<(Type, Type)> {
     let mut seen: Vec<Type> = Vec::new();
     for low in lows {
         let Type::Fun {
@@ -1120,8 +1152,11 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
         // binder's refinement stays on the domain, as on any data domain, so two rows over keys
         // that differ by the binder conflict here. A dependent tuple whose components read no
         // earlier one is the plain tuple (`Type::dep_tuple`), so the two compare as one domain.
-        let d = match low.render_subst().apply_domain(fun_kind, domain) {
-            Type::DepTuple(components) => Type::dep_tuple(components),
+        let d = match low
+            .render_subst(solver)
+            .apply_domain(solver, fun_kind, domain)
+        {
+            Type::DepTuple(components) => Type::dep_tuple_in(solver, components),
             d => d,
         };
         if matches!(d.peel_refinements(), Type::WitnessRef(_))
@@ -1130,11 +1165,10 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
             continue;
         }
         // Compaction's rule, so the solver and the merge never answer this differently.
-        let disagree = |p: &Type| {
-            super::compact::data_domains_disagree(
-                &super::compact::compact_type(p).term,
-                &super::compact::compact_type(&d).term,
-            )
+        let mut disagree = |p: &Type| {
+            let p = super::compact::compact_type(solver, p).term;
+            let d = super::compact::compact_type(solver, &d).term;
+            super::compact::data_domains_disagree(&p, &d)
         };
         if let Some(prev) = seen.iter().find(|p| disagree(p)) {
             return Some((prev.clone(), d));
@@ -1166,11 +1200,11 @@ fn joined_keys(domain: &Type, subst: &Subst) -> Option<ConstrainError> {
 
 /// The substitution taking the lower side of the edge `lhs‹sl› <: rhs‹sr›` into the frame `rhs`
 /// stands in: `sl`, then `sr` undone where it can be.
-fn edge_into_holder(sl: &Subst, sr: &Subst) -> Subst {
+fn edge_into_holder(solver: &mut Solver, sl: &Subst, sr: &Subst) -> Subst {
     if sr.is_id() {
         return sl.clone();
     }
-    Subst::then(sl, &sr.invert().unwrap_or_else(Subst::id))
+    Subst::then(solver, sl, &sr.invert().unwrap_or_else(Subst::id))
 }
 
 /// A bound that would put the binder of a function whose codomain edge the descent is inside
@@ -1179,6 +1213,7 @@ fn edge_into_holder(sl: &Subst, sr: &Subst) -> Subst {
 /// not compute (`docs/chl-spec.md`, "Family parameters"). Any other gap stays
 /// [`enforce_bound_scope`](crate::ccl::infer_var::enforce_bound_scope)'s internal error.
 fn codomain_binder_gap(
+    solver: &mut Solver,
     holder: &InferVar,
     bound: &Bound,
     cache: &ConstrainCache,
@@ -1186,7 +1221,7 @@ fn codomain_binder_gap(
     if cache.codomain_binders.is_empty() {
         return None;
     }
-    let binder = crate::ccl::infer_var::bound_scope_gaps(&holder.telescope, bound)
+    let binder = crate::ccl::infer_var::bound_scope_gaps(solver, &holder.telescope, bound)
         .into_iter()
         .find(|n| cache.codomain_binders.contains(n))?;
     Some(ConstrainError::NotCompiledYet(
@@ -1206,11 +1241,16 @@ fn codomain_binder_gap(
 /// out of `holder`'s scope ([`Bound::reachable_names`]): the type reads one, or a variable it
 /// holds outside a function type is in one's scope. The holder is one type for every value of each, so a lower bound
 /// reaches it as the join over their values ([`Subst::join`]).
-fn crossed_codomain_binders(holder: &InferVar, bound: &Bound, cache: &ConstrainCache) -> Vec<Name> {
+fn crossed_codomain_binders(
+    solver: &mut Solver,
+    holder: &InferVar,
+    bound: &Bound,
+    cache: &ConstrainCache,
+) -> Vec<Name> {
     if cache.codomain_binders.is_empty() {
         return Vec::new();
     }
-    let reachable = bound.reachable_names();
+    let reachable = bound.reachable_names(solver);
     let mut crossed: Vec<Name> = Vec::new();
     for b in &cache.codomain_binders {
         if reachable.contains(b) && !holder.telescope.contains(b) && !crossed.contains(b) {
@@ -1248,6 +1288,7 @@ pub(super) enum Membership {
 /// `src/ccl/design/type-inference.md`, "Type kind containment".
 #[allow(clippy::too_many_arguments)]
 fn constrain_type_kinds(
+    solver: &mut Solver,
     sub: &TypeKind,
     sup: &TypeKind,
     sl: &Subst,
@@ -1258,7 +1299,7 @@ fn constrain_type_kinds(
     scope: &dyn ScopeEnv,
     mode: Membership,
 ) -> Result<(), ConstrainError> {
-    let mismatch = || mismatch(lhs, rhs, sl, sr);
+    let mut mismatch = || mismatch(solver, lhs, rhs, sl, sr);
     match (sub, sup) {
         (TypeKind::Family { .. }, _) | (_, TypeKind::Family { .. }) => {
             unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
@@ -1268,7 +1309,7 @@ fn constrain_type_kinds(
         // Candidates are members, so containment is membership, once per member.
         (TypeKind::Enumerated(subs), _) => {
             for d in subs {
-                admits(d, sup, sl, sr, lhs, rhs, cache, scope, mode)?;
+                admits(solver, d, sup, sl, sr, lhs, rhs, cache, scope, mode)?;
             }
             Ok(())
         }
@@ -1282,7 +1323,7 @@ fn constrain_type_kinds(
             {
                 return Ok(());
             }
-            constrain_go(a, b, sl, sr, cache, scope)
+            constrain_go(solver, a, b, sl, sr, cache, scope)
         }
         (TypeKind::UIntRanges, TypeKind::UIntRanges) => Ok(()),
         // A kind that names no members offers none to place in the kind above it, so nothing
@@ -1312,6 +1353,7 @@ fn constrain_type_kinds(
 /// See `src/ccl/design/type-inference.md`, "Membership is decided at materialization".
 #[allow(clippy::too_many_arguments)]
 fn admits(
+    solver: &mut Solver,
     d: &Type,
     k: &TypeKind,
     sl: &Subst,
@@ -1328,9 +1370,12 @@ fn admits(
     };
     // Each side is read in its own frame, through the edge's substitutions: two candidates
     // spelling a binder each side names differently are one candidate.
-    let listed = |k: &TypeKind| {
-        matches!(k, TypeKind::Enumerated(sups)
-            if { let d = sl.apply_type(d); sups.iter().any(|s| sr.apply_type(s) == d) })
+    let mut listed = |k: &TypeKind| match k {
+        TypeKind::Enumerated(sups) => {
+            let d = sl.apply_type_in(solver, d);
+            sups.iter().any(|s| sr.apply_type_in(solver, s) == d)
+        }
+        _ => false,
     };
     let filtered = !d.refinements().is_empty();
     let range = match d.peel_refinements() {
@@ -1340,17 +1385,17 @@ fn admits(
             }
             // The requirement is on `𝑣` as this edge reads it: through `sl`, the variable
             // that stands for it there.
-            let held = match sl.apply_type(&Type::Infer(Rc::clone(v))) {
+            let held = match sl.apply_type_in(solver, &Type::Infer(Rc::clone(v))) {
                 Type::Infer(h) => h,
                 _ => Rc::clone(v),
             };
             let k = if sr.is_id() {
                 k.clone()
             } else {
-                k.map_children(|t| sr.apply_type(t))
+                k.map_children(|t| sr.apply_type_in(solver, t))
             };
             let recorded = {
-                let mut b = held.bounds.borrow_mut();
+                let b = held.bounds_mut(solver);
                 let fresh = !b.type_kinds.contains(&k);
                 if fresh {
                     b.type_kinds.push(k.clone());
@@ -1361,6 +1406,7 @@ fn admits(
             // recorded on it: the coalesce pass decides it on the suspension itself.
             if recorded && !Rc::ptr_eq(&held, v) {
                 crate::ccl::infer_var::record_suspended_membership(
+                    solver,
                     crate::ccl::infer_var::SuspendedMembership {
                         var: held,
                         kind: k,
@@ -1393,7 +1439,7 @@ fn admits(
         if filtered && matches!(k, TypeKind::UIntRanges) {
             return Err(not_of_kind());
         }
-        return constrain_type_kinds(&range, k, sl, sr, lhs, rhs, cache, scope, mode);
+        return constrain_type_kinds(solver, &range, k, sl, sr, lhs, rhs, cache, scope, mode);
     }
     // A check abstains only where the answer reads a part still open: a dense range is decided
     // by the head alone, while equality and subtyping read the whole type. A check runs on a
@@ -1410,8 +1456,8 @@ fn admits(
             _ => Err(not_of_kind()),
         },
         TypeKind::SubtypesOf(_) | TypeKind::Enumerated(_) if open => Ok(()),
-        TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache, scope),
-        TypeKind::Enumerated(_) => Err(mismatch(lhs, rhs, sl, sr)),
+        TypeKind::SubtypesOf(b) => constrain_go(solver, d, b, sl, sr, cache, scope),
+        TypeKind::Enumerated(_) => Err(mismatch(solver, lhs, rhs, sl, sr)),
     }
 }
 
@@ -1420,6 +1466,7 @@ fn admits(
 /// classify a witness reference there, and `scope` the term binders a refinement reads. `false`
 /// only where `k` certainly does not admit `d`.
 pub fn admits_resolved(
+    solver: &mut Solver,
     d: &Type,
     k: &TypeKind,
     in_scope: &[crate::ccl::ty::Witness],
@@ -1428,11 +1475,24 @@ pub fn admits_resolved(
     let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
     cache.lctx = cache.lctx.extended(in_scope);
     let id = Subst::id();
-    admits(d, k, &id, &id, d, d, &mut cache, scope, Membership::Check).is_ok()
+    admits(
+        solver,
+        d,
+        k,
+        &id,
+        &id,
+        d,
+        d,
+        &mut cache,
+        scope,
+        Membership::Check,
+    )
+    .is_ok()
 }
 
 /// [`admits_resolved`] under a walk's whole witness context rather than a list of binders.
 pub fn admits_in_context(
+    solver: &mut Solver,
     d: &Type,
     k: &TypeKind,
     ctx: &crate::ccl::ty::WitnessContext,
@@ -1441,11 +1501,24 @@ pub fn admits_in_context(
     let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
     cache.seed_context(ctx);
     let id = Subst::id();
-    admits(d, k, &id, &id, d, d, &mut cache, scope, Membership::Check).is_ok()
+    admits(
+        solver,
+        d,
+        k,
+        &id,
+        &id,
+        d,
+        d,
+        &mut cache,
+        scope,
+        Membership::Check,
+    )
+    .is_ok()
 }
 
 /// [`admits_resolved`] for a whole resolved kind: whether `k` contains `sub`, run as a check.
 pub fn contains_resolved(
+    solver: &mut Solver,
     sub: &TypeKind,
     k: &TypeKind,
     in_scope: &[crate::ccl::ty::Witness],
@@ -1456,6 +1529,7 @@ pub fn contains_resolved(
     let id = Subst::id();
     let t = Type::Hole;
     constrain_type_kinds(
+        solver,
         sub,
         k,
         &id,
@@ -1507,9 +1581,9 @@ fn witness_range(t: &Type, gamma: &crate::ccl::ty::WitnessContext) -> Option<Typ
 
 /// `s` as it acts on `t`'s side of an edge: what can act on the variable when `t` is one, and
 /// `s` itself otherwise.
-fn acting_side<'s>(t: &Type, s: &'s Subst) -> std::borrow::Cow<'s, Subst> {
+fn acting_side<'s>(solver: &mut Solver, t: &Type, s: &'s Subst) -> std::borrow::Cow<'s, Subst> {
     match t {
-        Type::Infer(v) => s.acting_on(v),
+        Type::Infer(v) => s.acting_on(solver, v),
         _ => std::borrow::Cow::Borrowed(s),
     }
 }
@@ -1525,6 +1599,7 @@ fn acting_side<'s>(t: &Type, s: &'s Subst) -> std::borrow::Cow<'s, Subst> {
 /// binder is a codomain edge's. Every other gap stays
 /// [`enforce_bound_scope`](crate::ccl::infer_var::enforce_bound_scope)'s internal error.
 fn param_reads_binder(
+    solver: &mut Solver,
     holder: &InferVar,
     bound: &Bound,
     bound_is_value: bool,
@@ -1532,14 +1607,15 @@ fn param_reads_binder(
     if !bound_is_value {
         return None;
     }
-    let chosen = holder.stands_for()?;
-    let binder = crate::ccl::infer_var::bound_scope_gaps(&holder.telescope, bound)
+    let chosen = holder.stands_for(solver)?;
+    let binder = crate::ccl::infer_var::bound_scope_gaps(solver, &holder.telescope, bound)
         .into_iter()
         .next()?;
     Some(ConstrainError::ParamReadsBinder { chosen, binder })
 }
 
 fn constrain_go(
+    solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
     sl: &Subst,
@@ -1560,39 +1636,39 @@ fn constrain_go(
     // paths a different edge per path: each path through a dependent application or a lambda
     // composes its own entries onto the substitution, and the variable then records the same
     // bound once per path.
-    let (sl, sr) = (acting_side(lhs, sl), acting_side(rhs, sr));
+    let (sl, sr) = (acting_side(solver, lhs, sl), acting_side(solver, rhs, sr));
     let (sl, sr) = (&*sl, &*sr);
 
     // **An elimination meeting its function reads it through the term** before the arms
     // compare anything: the function is plain, and its binders are the witnesses the value
     // carries (`crate::ccl::subst::Elim`). A variable keeps the elimination on its edge.
-    if let Some((l2, sl2)) = eliminate_at(lhs, sl) {
-        return constrain_go(&l2, rhs, &sl2, sr, cache, scope);
+    if let Some((l2, sl2)) = eliminate_at(solver, lhs, sl) {
+        return constrain_go(solver, &l2, rhs, &sl2, sr, cache, scope);
     }
-    if let Some((r2, sr2)) = eliminate_at(rhs, sr) {
-        return constrain_go(lhs, &r2, sl, &sr2, cache, scope);
+    if let Some((r2, sr2)) = eliminate_at(solver, rhs, sr) {
+        return constrain_go(solver, lhs, &r2, sl, &sr2, cache, scope);
     }
     // **A reference its substitution discharges is the type it becomes**: the domain an
     // instantiation put where the witness stood, compared as itself, on either side.
-    if let Some(l2) = discharged_witness(lhs, sl) {
-        return constrain_go(&l2, rhs, &Subst::id(), sr, cache, scope);
+    if let Some(l2) = discharged_witness(solver, lhs, sl) {
+        return constrain_go(solver, &l2, rhs, &Subst::id(), sr, cache, scope);
     }
-    if let Some(r2) = discharged_witness(rhs, sr) {
-        return constrain_go(lhs, &r2, sl, &Subst::id(), cache, scope);
+    if let Some(r2) = discharged_witness(solver, rhs, sr) {
+        return constrain_go(solver, lhs, &r2, sl, &Subst::id(), cache, scope);
     }
     // A projection holds a term, and a substitution acting on that term makes it the
     // projection of what the term becomes: compared as that, as a predicate is.
-    if let Some(l2) = substituted_projection(lhs, sl) {
-        return constrain_go(&l2, rhs, &Subst::id(), sr, cache, scope);
+    if let Some(l2) = substituted_projection(solver, lhs, sl) {
+        return constrain_go(solver, &l2, rhs, &Subst::id(), sr, cache, scope);
     }
-    if let Some(r2) = substituted_projection(rhs, sr) {
-        return constrain_go(lhs, &r2, sl, &Subst::id(), cache, scope);
+    if let Some(r2) = substituted_projection(solver, rhs, sr) {
+        return constrain_go(solver, lhs, &r2, sl, &Subst::id(), cache, scope);
     }
 
     // Structural descent over two types at once, one frame per constructor pair;
     // grow on demand as the other deep walks do.
     let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        constrain_go_impl(lhs, rhs, sl, sr, cache, scope)
+        constrain_go_impl(solver, lhs, rhs, sl, sr, cache, scope)
     });
     if out.is_err() {
         cache.note_failure();
@@ -1602,23 +1678,23 @@ fn constrain_go(
 
 /// The projection `ty` becomes under `s`, where `s` is not the identity: the projection's term
 /// substituted. A projection binds no witness, so nothing else in `s` reaches it.
-fn substituted_projection(ty: &Type, s: &Subst) -> Option<Type> {
+fn substituted_projection(solver: &mut Solver, ty: &Type, s: &Subst) -> Option<Type> {
     let Type::WitnessProjection(_) = ty else {
         return None;
     };
     if s.is_id() {
         return None;
     }
-    Some(s.apply_type(ty))
+    Some(s.apply_type_in(solver, ty))
 }
 
 /// The type a witness reference `ty` becomes under `s`, where `s` discharges it rather than
 /// renaming it.
-fn discharged_witness(ty: &Type, s: &Subst) -> Option<Type> {
+fn discharged_witness(solver: &mut Solver, ty: &Type, s: &Subst) -> Option<Type> {
     let Type::WitnessRef(_) = ty else {
         return None;
     };
-    match s.apply_witnesses(ty) {
+    match s.apply_witnesses(solver, ty) {
         Type::WitnessRef(_) => None,
         other => Some(other),
     }
@@ -1627,7 +1703,7 @@ fn discharged_witness(ty: &Type, s: &Subst) -> Option<Type> {
 /// `ty` read under `s`'s elimination, where `s` carries one and `ty` is not a variable: the
 /// eliminated function and the substitution its parts are read under. `None` where there is
 /// nothing to eliminate here.
-fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
+fn eliminate_at(solver: &mut Solver, ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
     use crate::ccl::ty::FunKind;
     let (term, rest) = s.top_elim()?;
     match ty {
@@ -1635,7 +1711,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
         // family application as the bound on its family's values is.
         Type::Infer(_) | Type::Param(_) | Type::FamilyApp(_) => None,
         Type::Refinement(base, refinements) => {
-            let (b2, s2) = eliminate_at(base, s)?;
+            let (b2, s2) = eliminate_at(solver, base, s)?;
             Some((Type::Refinement(Box::new(b2), refinements.clone()), s2))
         }
         Type::Fun {
@@ -1647,7 +1723,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
         } => {
             let parts = match fun_kind {
                 FunKind::Data(Some(ws)) => rest.discharged_through(ws, &term),
-                FunKind::Var(k) => Subst::then(&rest, &Subst::kind_elim(k, &term)),
+                FunKind::Var(k) => Subst::then(solver, &rest, &Subst::kind_elim(k, &term)),
                 // Nothing to eliminate: the sum over no binders, or not a collection.
                 FunKind::Data(None) | FunKind::Compute => return Some((ty.clone(), rest)),
             };
@@ -1667,6 +1743,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
 }
 
 fn constrain_go_impl(
+    solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
     sl: &Subst,
@@ -1706,6 +1783,11 @@ fn constrain_go_impl(
     }
 
     match (lhs, rhs) {
+        // A type a finished run determined nothing about imposes nothing on a run reading it
+        // later, a check of the typed tree or planning, and nothing that run relates it to
+        // is read back into it (`src/ccl/design/type-inference.md`, "A run closes what it
+        // hands back").
+        (Type::Undetermined(_), _) | (_, Type::Undetermined(_)) => Ok(()),
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
         // `0..𝑛` is the `UInt`s below `𝑛`, so a range is below every range that includes it and
@@ -1731,12 +1813,12 @@ fn constrain_go_impl(
         // Two applications of one generalized family are one type where they apply it at the same
         // values, each read under its own side's substitution.
         (Type::FamilyApp(a), Type::FamilyApp(b)) if a.param == b.param => {
-            if sl.apply_type(&Type::FamilyApp(a.clone()))
-                == sr.apply_type(&Type::FamilyApp(b.clone()))
+            if sl.apply_type_in(solver, &Type::FamilyApp(a.clone()))
+                == sr.apply_type_in(solver, &Type::FamilyApp(b.clone()))
             {
                 Ok(())
             } else {
-                Err(mismatch(lhs, rhs, sl, sr))
+                Err(mismatch(solver, lhs, rhs, sl, sr))
             }
         }
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
@@ -1756,14 +1838,14 @@ fn constrain_go_impl(
         (Type::Nominal(d0, a0), Type::Nominal(d1, a1)) if d0 == d1 => {
             for ((x, y), v) in a0.iter().zip(a1).zip(&d0.body().variances) {
                 match v {
-                    Variance::Covariant => constrain_go(x, y, sl, sr, cache, scope)?,
+                    Variance::Covariant => constrain_go(solver, x, y, sl, sr, cache, scope)?,
                     Variance::Contravariant => {
-                        cache.swapped(|cache| constrain_go(y, x, sr, sl, cache, scope))?
+                        cache.swapped(|cache| constrain_go(solver, y, x, sr, sl, cache, scope))?
                     }
                     Variance::Invariant => {
-                        constrain_go(x, y, &Subst::id(), &Subst::id(), cache, scope)?;
+                        constrain_go(solver, x, y, &Subst::id(), &Subst::id(), cache, scope)?;
                         cache.swapped(|cache| {
-                            constrain_go(y, x, &Subst::id(), &Subst::id(), cache, scope)
+                            constrain_go(solver, y, x, &Subst::id(), &Subst::id(), cache, scope)
                         })?;
                     }
                     // The output sides relate as a covariant argument does and the input
@@ -1772,9 +1854,9 @@ fn constrain_go_impl(
                     // with no morphism carried in, as an invariant pair's.
                     Variance::Bipolar => {
                         let ((xi, xo), (yi, yo)) = (sides(x), sides(y));
-                        constrain_go(xo, yo, &Subst::id(), &Subst::id(), cache, scope)?;
+                        constrain_go(solver, xo, yo, &Subst::id(), &Subst::id(), cache, scope)?;
                         cache.swapped(|cache| {
-                            constrain_go(yi, xi, &Subst::id(), &Subst::id(), cache, scope)
+                            constrain_go(solver, yi, xi, &Subst::id(), &Subst::id(), cache, scope)
                         })?;
                     }
                 }
@@ -1809,12 +1891,12 @@ fn constrain_go_impl(
             // The kind edge (see [`constrain_fun_kind`]): recorded, not answered. What the two
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
-            constrain_fun_kind(k0, k1, lhs, rhs, sl, sr)?;
+            constrain_fun_kind(solver, k0, k1, lhs, rhs, sl, sr)?;
             // **A parameter list's length is part of the type**: a function of two parameters
             // is not a function of one pair, nor of three (`docs/chl-spec.md`, "Parameter
             // lists").
             if n0.parameter_count() != n1.parameter_count() {
-                return Err(mismatch(lhs, rhs, sl, sr));
+                return Err(mismatch(solver, lhs, rhs, sl, sr));
             }
             constrain_capabilities(e0, e1, cache);
             // **Binders correspond by position across this edge.** A sum's binders are its
@@ -1843,11 +1925,12 @@ fn constrain_go_impl(
             // settled tree has none. What a check must not do is *decide* a kind, and this
             // does not — it reads what each side states.
             // Each candidate of a kind is a data function's domain.
-            let both_data = k0.resolved().is_data() && k1.resolved().is_data();
+            let both_data = k0.resolved_in(solver).is_data() && k1.resolved_in(solver).is_data();
             if let (Some(w0), Some(w1)) = (k0.sum_binders(), k1.sum_binders()) {
                 cache.within_data_domains(both_data, |cache| {
                     w0.iter().zip(w1.iter()).try_for_each(|(a, b)| {
                         constrain_type_kinds(
+                            solver,
                             &a.type_kind(),
                             &b.type_kind(),
                             sl,
@@ -1871,7 +1954,7 @@ fn constrain_go_impl(
             // to the later, so a chain of such edges carries one rather than a rename per kind
             // it passed.
             let sl = if let (FunKind::Var(_), FunKind::Var(v1)) = (k0, k1) {
-                corresponding = Subst::then(sl, &Subst::onto(v1));
+                corresponding = Subst::then(solver, sl, &Subst::onto(v1));
                 &corresponding
             } else {
                 // **Identities, so a variable-kinded consumer gets a correspondence too.**
@@ -1882,7 +1965,7 @@ fn constrain_go_impl(
                 // no rename is drawn, and the domain premise then compares an arm's witness
                 // against the consumer's raw domain as though the two were one domain rather
                 // than corresponding binders of two sums.
-                let (b0, b1) = (k0.binder_ids(), k1.binder_ids());
+                let (b0, b1) = (k0.binder_ids(solver), k1.binder_ids(solver));
                 // **A position left uncorresponded is silent**, which is why it is asserted
                 // rather than tested: the domain premise still runs, and it compares an arm's
                 // witness against whatever the other side put at that position. Nothing
@@ -1893,10 +1976,10 @@ fn constrain_go_impl(
                 // fewer is a kind answering its width and its binders differently.
                 for (k, ids) in [(k0, &b0), (k1, &b1)] {
                     assert!(
-                        k.arity().is_none_or(|n| ids.len() == n),
+                        k.arity(solver).is_none_or(|n| ids.len() == n),
                         "the Σ rule pairs binders positionally, so a kind states one binder \
                          identity per position: {ids:?} against arity {:?}",
-                        k.arity()
+                        k.arity(solver)
                     );
                 }
                 if b0.is_empty() || b1.is_empty() {
@@ -1919,11 +2002,11 @@ fn constrain_go_impl(
             // the position. A kind nothing has reached yet is not known to be a collection,
             // and the reverse obligation a variable's domain owes is discharged where every
             // contribution to it meets.
-            let invariant_domains = k0.resolved().is_data()
-                || k1.resolved().is_data()
+            let invariant_domains = k0.resolved_in(solver).is_data()
+                || k1.resolved_in(solver).is_data()
                 || [d0, d1]
                     .iter()
-                    .any(|d| matches!(&***d, Type::Infer(v) if v.names_domain()));
+                    .any(|d| matches!(&***d, Type::Infer(v) if v.names_domain(solver)));
             // A parameter list names each parameter, so the side whose codomain is read under
             // the other's names all of them ([`crate::ccl::subst::named_binder`]).
             let n1 = &crate::ccl::subst::named_binder(n1);
@@ -1940,11 +2023,11 @@ fn constrain_go_impl(
             // opening them could capture an unrelated free name matching a display name.
             // Post-pass checks open unconditionally to reconcile stored forms from different
             // passes. Every derivation enforces the same closure invariant on recorded bounds.
-            let open = |n: &FunBinder,
-                        d: &Type,
-                        c: &Type,
-                        other_n: &FunBinder,
-                        other: &Type|
+            let mut open = |n: &FunBinder,
+                            d: &Type,
+                            c: &Type,
+                            other_n: &FunBinder,
+                            other: &Type|
              -> Option<Type> {
                 // An unnamed function whose codomain references it by index has no
                 // binder to open at, so the reference reaches the codomain edge and
@@ -1968,7 +2051,9 @@ fn constrain_go_impl(
                             && other_n
                                 .names()
                                 .any(|name| crate::ccl::ccl_utils::is_free_in_type(name, other)))))
-                .then(|| crate::ccl::subst::open_at_binder(n, d, c, crate::ccl::Ids::Fresh))
+                .then(|| {
+                    crate::ccl::subst::open_at_binder_in(solver, n, d, c, crate::ccl::Ids::Fresh)
+                })
             };
             let c0_opened = open(&crate::ccl::subst::named_binder(n0), d0, c0, n1, c1);
             let c1_opened = open(n1, d1, c1, n0, c0);
@@ -2001,8 +2086,8 @@ fn constrain_go_impl(
                     // way round, and a reference in `d1` is classified by `d1`'s binders.
                     let decided = cache.within_data_domains(both_data, |cache| {
                         cache
-                            .swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))
-                            .and_then(|()| constrain_go(d0, d1, sl, sr, cache, scope))
+                            .swapped(|cache| constrain_go(solver, d1, d0, sr, sl, cache, scope))
+                            .and_then(|()| constrain_go(solver, d0, d1, sl, sr, cache, scope))
                     });
                     // Whichever edge found the two domains unequal, the report is the
                     // inequality and not the sub-comparison that exposed it — except for
@@ -2048,15 +2133,16 @@ fn constrain_go_impl(
                     // Two parameter lists correspond parameter by parameter, as their results do:
                     // the left's domain is read under the right's names, so a later parameter
                     // reads an earlier one in the frame the right's arguments are discharged in.
-                    let d0_aligned = onto_parameter_names(d0, n0, n1);
+                    let d0_aligned = onto_parameter_names(solver, d0, n0, n1);
                     let d0 = d0_aligned.as_ref().unwrap_or(&**d0);
-                    cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))?;
+                    cache.swapped(|cache| constrain_go(solver, d1, d0, sr, sl, cache, scope))?;
                 }
                 let entered = cache.codomain_binders.len();
                 cache
                     .codomain_binders
                     .extend(n0.names().chain(n1.names()).cloned());
                 let codomain = constrain_go(
+                    solver,
                     c0_opened.as_ref().map_or(&**c0, |c| c),
                     c1_opened.as_ref().map_or(&**c1, |c| c),
                     &cod_sl,
@@ -2081,10 +2167,10 @@ fn constrain_go_impl(
         // equal width, position by position (`docs/chl-spec.md`, "Tuple width").
         (Type::Tuple(a), Type::Tuple(b)) => {
             if a.len() != b.len() {
-                return Err(mismatch(lhs, rhs, sl, sr));
+                return Err(mismatch(solver, lhs, rhs, sl, sr));
             }
             for (t0, t1) in a.iter().zip(b) {
-                constrain_go(t0, t1, sl, sr, cache, scope)?;
+                constrain_go(solver, t0, t1, sl, sr, cache, scope)?;
             }
             Ok(())
         }
@@ -2110,22 +2196,24 @@ fn constrain_go_impl(
                 .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__component")))
                 .collect();
             let opened = crate::ccl::subst::open_tuple_components(
+                solver,
                 a,
                 |j, _| crate::ccl::subst::Mapping::Rename(names[j].clone()),
                 crate::ccl::Ids::Fresh,
             );
             for (i, t1) in b.iter().enumerate() {
                 let joined = names[..i].iter().fold(Subst::id(), |s, n| {
-                    Subst::then(&s, &Subst::join_arm(n.clone()))
+                    Subst::then(solver, &s, &Subst::join_arm(n.clone()))
                 });
-                constrain_go(&joined.apply_type(&opened[i]), t1, sl, sr, cache, scope)?;
+                let opened_i = joined.apply_type_in(solver, &opened[i]);
+                constrain_go(solver, &opened_i, t1, sl, sr, cache, scope)?;
             }
             Ok(())
         }
         (Type::Tuple(a) | Type::OpenTuple(a), Type::OpenTuple(b)) => {
             for (i, t1) in b.iter().enumerate() {
                 match a.get(i) {
-                    Some(t0) => constrain_go(t0, t1, sl, sr, cache, scope)?,
+                    Some(t0) => constrain_go(solver, t0, t1, sl, sr, cache, scope)?,
                     None => {
                         // A `Tuple` is **dense**, so the failure here is one of *width*
                         // and the widest position rhs demands is its sharpest witness —
@@ -2160,11 +2248,11 @@ fn constrain_go_impl(
         // flattened to a dependent tuple, meets the tuple of its generators' domains.
         (Type::Tuple(a), Type::DepTuple(b)) if a.len() == b.len() => {
             let unnamed = Type::DepTuple(a.iter().map(|t| (None, t.clone())).collect());
-            constrain_go(&unnamed, rhs, sl, sr, cache, scope)
+            constrain_go(solver, &unnamed, rhs, sl, sr, cache, scope)
         }
         (Type::DepTuple(a), Type::Tuple(b)) if a.len() == b.len() => {
             let unnamed = Type::DepTuple(b.iter().map(|t| (None, t.clone())).collect());
-            constrain_go(lhs, &unnamed, sl, sr, cache, scope)
+            constrain_go(solver, lhs, &unnamed, sl, sr, cache, scope)
         }
         (Type::DepTuple(a), Type::DepTuple(b)) if a.len() == b.len() => {
             // Whether a side's component reads an earlier one by index.
@@ -2177,7 +2265,7 @@ fn constrain_go_impl(
             // A side closed to indices opens at its names where the other side is live, or
             // where the other side does not read the same components by index, so the two
             // cannot be compared index to index: a plain tuple meeting a written dependent one.
-            let opened =
+            let mut opened =
                 |cs: &[(Option<Name>, Type)], closed: bool, other: &Type, other_reads: bool| {
                     if closed
                         && (cache.derivation.opens_unconditionally()
@@ -2185,6 +2273,7 @@ fn constrain_go_impl(
                             || crate::ccl::subst::type_contains_infer(other))
                     {
                         crate::ccl::subst::open_tuple_components(
+                            solver,
                             cs,
                             |j, _| {
                                 let name = cs[j].0.clone().unwrap_or_else(|| {
@@ -2210,11 +2299,12 @@ fn constrain_go_impl(
                 components: Vec::new(),
             };
             for (k, (t0, t1)) in a_opened.iter().zip(&b_opened).enumerate() {
-                constrain_go(t0, t1, &aligned, sr, cache, &bound)
-                    .map_err(|error| bound.mismatch_at_values(error))?;
+                constrain_go(solver, t0, t1, &aligned, sr, cache, &bound)
+                    .map_err(|error| bound.mismatch_at_values(solver, error))?;
                 aligned = aligned.aligned(&a[k].0, &b[k].0);
                 if let Some(name) = b[k].0.clone().or_else(|| a[k].0.clone()) {
-                    bound.components.push((name, aligned.apply_type(t0)));
+                    let at_value = aligned.apply_type_in(solver, t0);
+                    bound.components.push((name, at_value));
                 }
             }
             Ok(())
@@ -2222,7 +2312,7 @@ fn constrain_go_impl(
 
         // An open tuple fixes no width, so it is below no closed tuple: a type parameter
         // bounded by `{𝐴, ..}` cannot be taken apart as a tuple of any one width.
-        (Type::OpenTuple(_), Type::Tuple(_)) => Err(mismatch(lhs, rhs, sl, sr)),
+        (Type::OpenTuple(_), Type::Tuple(_)) => Err(mismatch(solver, lhs, rhs, sl, sr)),
 
         // Family: pointwise, a family below another where at each value of the binders its
         // body is below the other's (`src/ccl/design/nominal-types.md`, "Family parameters").
@@ -2243,28 +2333,34 @@ fn constrain_go_impl(
                 body: b_body,
             },
         ) if a.len() == b.len() => {
-            let opened = |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
-                let live = cache.derivation.opens_unconditionally()
-                    || crate::ccl::subst::type_contains_infer(other);
-                live.then(|| {
-                    crate::ccl::subst::opened_family_body(binders, body, crate::ccl::Ids::Fresh)
-                })
-                .flatten()
-                .unwrap_or_else(|| body.clone())
-            };
+            let mut opened =
+                |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
+                    let live = cache.derivation.opens_unconditionally()
+                        || crate::ccl::subst::type_contains_infer(other);
+                    live.then(|| {
+                        crate::ccl::subst::opened_family_body(
+                            solver,
+                            binders,
+                            body,
+                            crate::ccl::Ids::Fresh,
+                        )
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| body.clone())
+                };
             let (a_opened, b_opened) = (opened(a, a_body, rhs), opened(b, b_body, lhs));
             let aligned = a
                 .iter()
                 .zip(b)
                 .fold(sl.clone(), |s, ((n0, _), (n1, _))| s.aligned(n0, n1));
-            constrain_go(&a_opened, &b_opened, &aligned, sr, cache, scope)
+            constrain_go(solver, &a_opened, &b_opened, &aligned, sr, cache, scope)
         }
 
         // Record: named width-subtyping. rhs's fields must all appear in lhs.
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
                 match a.iter().find(|(n, _)| n == name) {
-                    Some((_, t0)) => constrain_go(t0, t1, sl, sr, cache, scope)?,
+                    Some((_, t0)) => constrain_go(solver, t0, t1, sl, sr, cache, scope)?,
                     None => {
                         return Err(ConstrainError::MissingField {
                             key: FieldKey::Name(name.clone()),
@@ -2296,14 +2392,14 @@ fn constrain_go_impl(
         // identity either side of inference.
         (Type::WitnessRef(a), Type::WitnessRef(b)) => {
             let (a, b) = (
-                sl.apply_witnesses(&Type::WitnessRef(*a)),
-                sr.apply_witnesses(&Type::WitnessRef(*b)),
+                sl.apply_witnesses(solver, &Type::WitnessRef(*a)),
+                sr.apply_witnesses(solver, &Type::WitnessRef(*b)),
             );
             // A discharge maps a reference to the domain it instantiates (a projection, or a
             // candidate), and the edge then relates those types.
             let (Type::WitnessRef(a), Type::WitnessRef(b)) = (&a, &b) else {
                 let id = Subst::id();
-                return constrain_go(&a, &b, &id, &id, cache, scope);
+                return constrain_go(solver, &a, &b, &id, &id, cache, scope);
             };
             // Compare IDs after applying the caller's binder correspondence. Equal kinds
             // do not identify independent witnesses. This arm does not inspect either scope,
@@ -2312,7 +2408,7 @@ fn constrain_go_impl(
             if a == b {
                 Ok(())
             } else {
-                Err(mismatch(lhs, rhs, sl, sr))
+                Err(mismatch(solver, lhs, rhs, sl, sr))
             }
         }
 
@@ -2330,9 +2426,10 @@ fn constrain_go_impl(
         // bounds like any other leaf. Two witnesses compare by identity (the arm above).
         (Type::WitnessRef(_) | Type::WitnessProjection(_), other) if !is_witness_or_var(other) => {
             let Some(range) = witness_range(lhs, &cache.lctx) else {
-                return Err(mismatch(lhs, rhs, sl, sr));
+                return Err(mismatch(solver, lhs, rhs, sl, sr));
             };
             constrain_type_kinds(
+                solver,
                 &range,
                 &TypeKind::SubtypesOf(Box::new(other.clone())),
                 sl,
@@ -2346,10 +2443,10 @@ fn constrain_go_impl(
         }
         (other, Type::WitnessRef(_) | Type::WitnessProjection(_)) if !is_witness_or_var(other) => {
             let Some(TypeKind::Enumerated(candidates)) = witness_range(rhs, &cache.rctx) else {
-                return Err(mismatch(lhs, rhs, sl, sr));
+                return Err(mismatch(solver, lhs, rhs, sl, sr));
             };
             for c in &candidates {
-                constrain_go(other, c, sl, sr, cache, scope)?;
+                constrain_go(solver, other, c, sl, sr, cache, scope)?;
             }
             Ok(())
         }
@@ -2380,7 +2477,7 @@ fn constrain_go_impl(
             );
             for (k, t0) in a {
                 match b.iter().find(|(bk, _)| bk == k) {
-                    Some((_, t1)) => constrain_go(t0, t1, sl, sr, cache, scope)?,
+                    Some((_, t1)) => constrain_go(solver, t0, t1, sl, sr, cache, scope)?,
                     None if openness.permits_extra_tags() => continue,
                     None => {
                         return Err(ConstrainError::ExtraTag {
@@ -2423,17 +2520,19 @@ fn constrain_go_impl(
                 history_kind: k1,
             },
         ) if k0 == k1 => {
-            constrain_go(w0, w1, &Subst::id(), &Subst::id(), cache, scope)?;
-            cache.swapped(|cache| constrain_go(w1, w0, &Subst::id(), &Subst::id(), cache, scope))
+            constrain_go(solver, w0, w1, &Subst::id(), &Subst::id(), cache, scope)?;
+            cache.swapped(|cache| {
+                constrain_go(solver, w1, w0, &Subst::id(), &Subst::id(), cache, scope)
+            })
         }
         // Record the upper edge in native form (`H‹sl› <: rhs‹sr›`), as the
         // `(Type::Infer(_), _)` arm below does. It is not closed against the lowers:
         // `solver::barrier::solve_barrier_vars` checks each upper against the variable's
         // resolution once the lowers have arrived.
         (Type::BarrierVar(barrier), rhs) if !matches!(rhs, Type::Infer(_)) => {
-            let bound =
-                Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
-            let mut uppers = barrier.uppers.borrow_mut();
+            let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
+                .with_origin(cache.origins.1);
+            let uppers = barrier.uppers_mut(solver);
             cache.unreported.push((Rc::clone(barrier), uppers.len()));
             uppers.push(BarrierUpper::unreported(bound));
             Ok(())
@@ -2443,10 +2542,10 @@ fn constrain_go_impl(
         // uppers. The contribution is delivered to the obligations watching a variable
         // this one flows into (see `link_barrier_watches`).
         (lhs, Type::BarrierVar(barrier)) if !matches!(lhs, Type::Infer(_)) => {
-            let bound =
-                Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
-            barrier.lowers.borrow_mut().push(bound);
-            notify_barrier_lower(barrier, lhs, cache)
+            let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
+                .with_origin(cache.origins.0);
+            barrier.lowers_mut(solver).push(bound);
+            notify_barrier_lower(solver, barrier, lhs, cache)
         }
         // There is deliberately **no deref arm here.** A mutable variable mention that denotes
         // its value is dereffed by the rule that emits it (`emit::emit_value_read`), so a
@@ -2466,24 +2565,23 @@ fn constrain_go_impl(
         // existing lower (`low.ty‹low.ty_subst› <: V‹low.self_subst›`) against
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
-        (Type::Infer(lv), _) if type_level(rhs) <= lv.level() => {
-            crate::ccl::capabilities::lower_capability_levels(rhs, lv.level());
+        (Type::Infer(lv), _) if type_level(solver, rhs) <= lv.level(solver) => {
+            crate::ccl::capabilities::lower_capability_levels(rhs, lv.level(solver));
             let lows = {
-                let bound =
-                    Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
-                if let Some(e) = param_reads_binder(lv, &bound, cache.value_on_right) {
+                let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
+                    .with_origin(cache.origins.1);
+                if let Some(e) = param_reads_binder(solver, lv, &bound, cache.value_on_right) {
                     return Err(e);
                 }
-                if let Some(e) = codomain_binder_gap(lv, &bound, cache) {
+                if let Some(e) = codomain_binder_gap(solver, lv, &bound, cache) {
                     return Err(e);
                 }
-                crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
-                let mut s = lv.bounds.borrow_mut();
+                crate::ccl::infer_var::enforce_bound_scope(solver, lv, "upper", &bound);
+                let s = lv.bounds_mut(solver);
                 s.upper_mut().push(bound);
                 #[cfg(test)]
                 bounds_probe::record();
                 let lows = Rc::clone(s.lower());
-                drop(s);
                 // **A function-shaped bound carries a kind, so it lands on this variable's.**
                 // Unconditional: a variable no function reaches keeps an unpinned kind
                 // nobody consults, so nothing here dispatches on what the variable will turn
@@ -2501,7 +2599,7 @@ fn constrain_go_impl(
                     let mine = if sl.top_elim().is_some() {
                         FunKind::Data(None)
                     } else {
-                        FunKind::Var(Rc::clone(&lv.fun_kind))
+                        FunKind::Var(Rc::clone(lv.fun_kind()))
                     };
                     let k = if sr.top_elim().is_some() {
                         FunKind::Data(None)
@@ -2509,17 +2607,19 @@ fn constrain_go_impl(
                         k
                     };
                     if let FunKind::Var(other) = &k {
-                        other.record_under(mine.clone(), true, kind_edge_subst(sr, lhs, sl));
+                        let edge_subst = kind_edge_subst(solver, sr, lhs, sl);
+                        other.record_under(solver, mine.clone(), true, edge_subst);
                     }
                     if let FunKind::Var(v) = &mine {
-                        v.record_under(k, false, kind_edge_subst(sl, rhs, sr));
+                        let edge_subst = kind_edge_subst(solver, sl, rhs, sr);
+                        v.record_under(solver, k, false, edge_subst);
                     }
                 }
                 lows
             };
             // A collection above a watched operand answers a trait that reads collections,
             // and a nominal type above a receiver answers a method call.
-            notify_upper(lv, rhs, cache)?;
+            notify_upper(solver, lv, rhs, cache)?;
             // **No join here.** A variable's lower bounds are joined where every other
             // join is: at compaction, off these same bounds. Assembling one here as well
             // would compute it twice, by two rules, and — because this arm runs again on
@@ -2531,7 +2631,7 @@ fn constrain_go_impl(
             // consumer's domain would have to lie below both — and the transitive closure
             // does not terminate on it. Now that only sums join, this is the case `box`
             // is there to resolve: box each arm, and the arms join as sums.
-            if let Some(domains) = distinct_data_domains(&lows) {
+            if let Some(domains) = distinct_data_domains(solver, &lows) {
                 return Err(ConstrainError::DomainJoinConflict {
                     domains: vec![domains.0, domains.1],
                 });
@@ -2540,21 +2640,18 @@ fn constrain_go_impl(
             // closure below only re-offers `lv`'s lowers to `rhs` when the levels let
             // this arm run, which is precisely what a `let` RHS breaks.
             if let Type::Infer(rv) = rhs {
-                link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?;
+                let into = edge_into_holder(solver, sl, sr);
+                link_watches(solver, lv, rv, &into, cache)?;
             }
             for low in lows.iter() {
-                let Some((tau_l, tau_u)) = bridge_holder_gap(&low.self_subst, sl, Some(lv)) else {
+                let Some((tau_l, tau_u)) = bridge_holder_gap(solver, &low.self_subst, sl, Some(lv))
+                else {
                     continue;
                 };
                 cache.with_origins((low.origin, None), |cache| {
-                    constrain_go(
-                        &low.ty,
-                        rhs,
-                        &Subst::then(&low.ty_subst, &tau_l),
-                        &Subst::then(sr, &tau_u),
-                        cache,
-                        scope,
-                    )
+                    let left = Subst::then(solver, &low.ty_subst, &tau_l);
+                    let right = Subst::then(solver, sr, &tau_u);
+                    constrain_go(solver, &low.ty, rhs, &left, &right, cache, scope)
                 })?;
             }
             Ok(())
@@ -2568,12 +2665,12 @@ fn constrain_go_impl(
         // edge's forward morphism was reconstructed by inverting its stored
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
-        (_, Type::Infer(rv)) if type_level(lhs) <= rv.level() => {
-            crate::ccl::capabilities::lower_capability_levels(lhs, rv.level());
+        (_, Type::Infer(rv)) if type_level(solver, lhs) <= rv.level(solver) => {
+            crate::ccl::capabilities::lower_capability_levels(lhs, rv.level(solver));
             let ups = {
-                let bound =
-                    Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
-                if let Some(e) = param_reads_binder(rv, &bound, !cache.value_on_right) {
+                let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
+                    .with_origin(cache.origins.0);
+                if let Some(e) = param_reads_binder(solver, rv, &bound, !cache.value_on_right) {
                     return Err(e);
                 }
                 // **A lower bound leaving a codomain binder's scope is joined over it.** The
@@ -2581,31 +2678,33 @@ fn constrain_go_impl(
                 // value of the binder by the polarity of each position: a refinement reading it
                 // is dropped at a covariant position, and reported at a contravariant one and
                 // in a data domain (`src/ccl/design/type-inference.md`, "The invariant").
-                let crossed = crossed_codomain_binders(rv, &bound, cache);
+                let crossed = crossed_codomain_binders(solver, rv, &bound, cache);
                 if !crossed.is_empty() {
-                    let join = crossed
-                        .into_iter()
-                        .fold(Subst::id(), |acc, b| Subst::then(&acc, &Subst::join(b)));
-                    return constrain_go(lhs, rhs, &Subst::then(sl, &join), sr, cache, scope);
+                    let join = crossed.into_iter().fold(Subst::id(), |acc, b| {
+                        Subst::then(solver, &acc, &Subst::join(b))
+                    });
+                    return {
+                        let composed = Subst::then(solver, sl, &join);
+                        constrain_go(solver, lhs, rhs, &composed, sr, cache, scope)
+                    };
                 }
                 debug_assert!(
-                    codomain_binder_gap(rv, &bound, cache).is_none(),
+                    codomain_binder_gap(solver, rv, &bound, cache).is_none(),
                     "a lower bound reading a codomain binder outside its holder's scope is joined \
                      over the binder before it is recorded"
                 );
-                crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
-                let mut s = rv.bounds.borrow_mut();
+                crate::ccl::infer_var::enforce_bound_scope(solver, rv, "lower", &bound);
+                let s = rv.bounds_mut(solver);
                 s.lower_mut().push(bound);
                 #[cfg(test)]
                 bounds_probe::record();
                 let ups = Rc::clone(s.upper());
-                drop(s);
                 if let Some(k) = lhs.fun_kind_of() {
                     // Both ends, as above, an eliminated end relating as plain.
                     let mine = if sr.top_elim().is_some() {
                         FunKind::Data(None)
                     } else {
-                        FunKind::Var(Rc::clone(&rv.fun_kind))
+                        FunKind::Var(Rc::clone(rv.fun_kind()))
                     };
                     let k = if sl.top_elim().is_some() {
                         FunKind::Data(None)
@@ -2613,10 +2712,12 @@ fn constrain_go_impl(
                         k
                     };
                     if let FunKind::Var(other) = &k {
-                        other.record_under(mine.clone(), false, kind_edge_subst(sl, rhs, sr));
+                        let edge_subst = kind_edge_subst(solver, sl, rhs, sr);
+                        other.record_under(solver, mine.clone(), false, edge_subst);
                     }
                     if let FunKind::Var(v) = &mine {
-                        v.record_under(k, true, kind_edge_subst(sr, lhs, sl));
+                        let edge_subst = kind_edge_subst(solver, sr, lhs, sl);
+                        v.record_under(solver, k, true, edge_subst);
                     }
                 }
                 ups
@@ -2640,49 +2741,51 @@ fn constrain_go_impl(
             // A family application's terms are read where the variable stands, so the edge's
             // substitution on its side reaches them before it is delivered.
             if let Type::FamilyApp(_) = lhs.peel_refinements() {
-                let into = edge_into_holder(sl, sr);
-                let at = into.copying(crate::ccl::Ids::Kept).apply_type(lhs);
-                notify_lower(rv, &at, cache)?;
+                let into = edge_into_holder(solver, sl, sr);
+                let at = into
+                    .copying(crate::ccl::Ids::Kept)
+                    .apply_type_in(solver, lhs);
+                notify_lower(solver, rv, &at, cache)?;
             } else {
-                notify_lower(rv, lhs, cache)?;
+                notify_lower(solver, rv, lhs, cache)?;
             }
             match lhs {
-                Type::Infer(lv) => link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?,
+                Type::Infer(lv) => {
+                    let into = edge_into_holder(solver, sl, sr);
+                    link_watches(solver, lv, rv, &into, cache)?
+                }
                 // A refinement offers what its base does, so the watch follows the edge down to
                 // a refined variable as to a bare one: a map loop's positions are its key
                 // variable refined by membership.
                 Type::Refinement(inner, _) => {
                     if let Type::Infer(lv) = &**inner {
-                        link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?;
+                        let into = edge_into_holder(solver, sl, sr);
+                        link_watches(solver, lv, rv, &into, cache)?;
                     }
                 }
                 // A barrier variable's lowers are not closed against `rv`'s uppers, and
                 // `notify_lower` offers nothing for it, so the watch follows the edge
                 // down as it does for a var-var edge.
-                Type::BarrierVar(barrier) => link_barrier_watches(barrier, rv, cache)?,
+                Type::BarrierVar(barrier) => link_barrier_watches(solver, barrier, rv, cache)?,
                 _ => {}
             }
             for up in ups.iter() {
-                let Some((tau_l, tau_u)) = bridge_holder_gap(sr, &up.self_subst, Some(rv)) else {
+                let Some((tau_l, tau_u)) = bridge_holder_gap(solver, sr, &up.self_subst, Some(rv))
+                else {
                     continue;
                 };
                 cache.with_origins((None, up.origin), |cache| {
-                    constrain_go(
-                        lhs,
-                        &up.ty,
-                        &Subst::then(sl, &tau_l),
-                        &Subst::then(&up.ty_subst, &tau_u),
-                        cache,
-                        scope,
-                    )
+                    let left = Subst::then(solver, sl, &tau_l);
+                    let right = Subst::then(solver, &up.ty_subst, &tau_u);
+                    constrain_go(solver, lhs, &up.ty, &left, &right, cache, scope)
                 })?;
             }
-            let guarded = rv.bounds.borrow().guarded_upper.clone();
+            let guarded = rv.bounds(solver).guarded_upper.clone();
             if !guarded.is_empty() && cache.checks_guarded {
-                let low =
-                    Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
+                let low = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
+                    .with_origin(cache.origins.0);
                 for entry in &guarded {
-                    close_guarded(rv, &low, entry, cache, scope)?;
+                    close_guarded(solver, rv, &low, entry, cache, scope)?;
                 }
             }
             Ok(())
@@ -2693,28 +2796,30 @@ fn constrain_go_impl(
         // lifted: below its level no use has substituted for it, so carrying one
         // down is the parameter escaping its definition.
         (Type::Infer(lv), _) => {
-            if let Some(param) = escaping_param(rhs, lv.level()) {
+            if let Some(param) = escaping_param(rhs, lv.level(solver)) {
                 return Err(ConstrainError::TypeParamEscapes { param });
             }
             let new_rhs = extrude(
+                solver,
                 rhs,
                 false,
-                lv.level(),
-                cache.extruded.entry(lv.level()).or_default(),
+                lv.level(solver),
+                cache.extruded.entry(lv.level(solver)).or_default(),
             );
-            constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
+            constrain_go(solver, lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
-            if let Some(param) = escaping_param(lhs, rv.level()) {
+            if let Some(param) = escaping_param(lhs, rv.level(solver)) {
                 return Err(ConstrainError::TypeParamEscapes { param });
             }
             let new_lhs = extrude(
+                solver,
                 lhs,
                 true,
-                rv.level(),
-                cache.extruded.entry(rv.level()).or_default(),
+                rv.level(solver),
+                cache.extruded.entry(rv.level(solver)).or_default(),
             );
-            constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
+            constrain_go(solver, &new_lhs, rhs, sl, sr, cache, scope)
         }
 
         // A type parameter is a subtype of whatever its bound is a subtype of
@@ -2726,8 +2831,8 @@ fn constrain_go_impl(
         // but `𝑃` itself is above `𝑃`.
         (Type::Param(param), _) if !matches!(rhs.peel_refinements(), Type::Param(q) if q == param) => {
             match &param.bound {
-                Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
-                None => Err(mismatch(lhs, rhs, sl, sr)),
+                Some(bound) => constrain_go(solver, bound, rhs, sl, sr, cache, scope),
+                None => Err(mismatch(solver, lhs, rhs, sl, sr)),
             }
         }
         // A family's bound holds at every value it is applied to.
@@ -2737,12 +2842,12 @@ fn constrain_go_impl(
                 // A bound on a family's values is a family itself, read at the application's
                 // terms (`docs/chl-spec.md`, "Family parameters").
                 Some(Type::Family { .. }) => {
-                    let at = crate::ccl::subst::family_bound_at(app)
+                    let at = crate::ccl::subst::family_bound_at(solver, app)
                         .expect("a family parameter's bound is a family");
-                    constrain_go(&at, rhs, sl, sr, cache, scope)
+                    constrain_go(solver, &at, rhs, sl, sr, cache, scope)
                 }
-                Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
-                None => Err(mismatch(lhs, rhs, sl, sr)),
+                Some(bound) => constrain_go(solver, bound, rhs, sl, sr, cache, scope),
+                None => Err(mismatch(solver, lhs, rhs, sl, sr)),
             }
         }
 
@@ -2860,21 +2965,35 @@ fn constrain_go_impl(
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
             let lbase = lhs.peel_refinements();
             if cache.refinement_blind() {
-                return constrain_go(lbase, rhs.peel_refinements(), sl, sr, cache, scope);
+                return constrain_go(solver, lbase, rhs.peel_refinements(), sl, sr, cache, scope);
             }
             // Each side's refinements are forced through its own morphism into the ambient
             // frame before comparing (`sl(S₁)` vs `sr(S₂)`), each in its normal form
-            // ([`normal_refinement`]), which is what refinement equality compares and what
+            // ([`normal_refinement_in`]), which is what refinement equality compares and what
             // the SMT encoder can read: it has no `let` or eliminated combinator.
             let lrefs_in_ambient: Vec<Refinement> = lhs
                 .refinements()
                 .iter()
-                .map(|l| normal_refinement(&sl.force_refinement(l)))
+                .map(|l| {
+                    let forced = sl.force_refinement(solver, l);
+                    normal_refinement_in(solver, &forced)
+                })
                 .collect();
-            constrain_refined(lhs, lbase, lrefs_in_ambient, &[], rhs, sl, sr, cache, scope)
+            constrain_refined(
+                solver,
+                lhs,
+                lbase,
+                lrefs_in_ambient,
+                &[],
+                rhs,
+                sl,
+                sr,
+                cache,
+                scope,
+            )
         }
 
-        _ => Err(mismatch(lhs, rhs, sl, sr)),
+        _ => Err(mismatch(solver, lhs, rhs, sl, sr)),
     }
 }
 
@@ -2892,6 +3011,7 @@ fn constrain_go_impl(
     reason = "the two sides of an edge, each with its morphism, the producer's transported predicates, and the walk's state"
 )]
 fn constrain_refined(
+    solver: &mut Solver,
     lhs: &Type,
     lbase: &Type,
     lrefs_in_ambient: Vec<Refinement>,
@@ -2910,7 +3030,10 @@ fn constrain_refined(
     // discharge edge on `sl` replaces with the bound term.
     let rrefs_in_ambient: Vec<Refinement> = rrefs
         .iter()
-        .map(|r| normal_refinement(&sr.force_refinement(r)))
+        .map(|r| {
+            let forced = sr.force_refinement(solver, r);
+            normal_refinement_in(solver, &forced)
+        })
         .collect();
     // The refinements rhs requires that no transported lhs layer matches (by
     // `Refinement`'s structural `PartialEq`). The deficit keeps the *untransported* rhs
@@ -2947,7 +3070,7 @@ fn constrain_refined(
     }
     if deficit.is_empty() && !range_demand {
         // lhs's explicit layers already supply every refinement rhs requires.
-        constrain_go(lbase, rbase, sl, sr, cache, scope)
+        constrain_go(solver, lbase, rbase, sl, sr, cache, scope)
     } else if let Type::Infer(lv) = lbase {
         // Variable base: the edge constrains only the values of `lbase` that `lhs`'s
         // own refinements keep, so it is recorded as written, a guarded upper bound
@@ -2957,7 +3080,7 @@ fn constrain_refined(
         // coalescing decides once the bases resolve (`data_domains_disagree`)
         // (`src/ccl/design/type-inference.md`, "A variable base takes a guarded
         // bound").
-        constrain_go(lbase, rbase, sl, sr, cache, scope)?;
+        constrain_go(solver, lbase, rbase, sl, sr, cache, scope)?;
         if cache.in_data_domains {
             return Ok(());
         }
@@ -2965,25 +3088,38 @@ fn constrain_refined(
             .into_iter()
             .chain(guard.iter().cloned())
             .collect();
-        record_guarded_upper(lv, &guard, rhs, sl, sr, cache, scope)
+        record_guarded_upper(solver, lv, &guard, rhs, sl, sr, cache, scope)
     } else if scope.is_skip_smt() {
-        Err(mismatch(lhs, rhs, sl, sr))
+        Err(mismatch(solver, lhs, rhs, sl, sr))
     } else if range_demand {
         // Both bases are leaves, so the entailment is the whole edge.
-        let proven =
-            super::smt::smt_sub_at(lbase, rbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
-                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?;
+        let proven = super::smt::smt_sub_at(
+            solver,
+            lbase,
+            rbase,
+            &lrefs_in_ambient,
+            &rrefs_in_ambient,
+            scope,
+        )
+        .or_else(|error| smt_undecided_is_mismatch(solver, error, lhs, rhs, sl, sr))?;
         if proven {
             Ok(())
         } else {
-            Err(mismatch(lhs, rhs, sl, sr))
+            Err(mismatch(solver, lhs, rhs, sl, sr))
         }
-    } else if super::smt::smt_sub_guarded(lbase, &lrefs_in_ambient, guard, &rrefs_in_ambient, scope)
-        .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs, sl, sr))?
+    } else if super::smt::smt_sub_guarded(
+        solver,
+        lbase,
+        &lrefs_in_ambient,
+        guard,
+        &rrefs_in_ambient,
+        scope,
+    )
+    .or_else(|error| smt_undecided_is_mismatch(solver, error, lhs, rhs, sl, sr))?
     {
-        constrain_go(lbase, rbase, sl, sr, cache, scope)
+        constrain_go(solver, lbase, rbase, sl, sr, cache, scope)
     } else {
-        Err(mismatch(lhs, rhs, sl, sr))
+        Err(mismatch(solver, lhs, rhs, sl, sr))
     }
 }
 
@@ -2991,7 +3127,13 @@ fn constrain_refined(
 /// `lv` already has under it. A guarded bound already recorded is not recorded or checked
 /// again, which is what ends the walk on a cyclic bound graph: the check of a variable lower
 /// bound records the same guarded bound on it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's solver, the guarded edge's two sides with their morphisms, and the \
+              walk's state"
+)]
 fn record_guarded_upper(
+    solver: &mut Solver,
     lv: &Rc<InferVar>,
     guard: &RefinementSet,
     rhs: &Type,
@@ -3001,25 +3143,26 @@ fn record_guarded_upper(
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     // An upper bound sits at or below its holder's level, as the upper-bound arm keeps it.
-    let rhs = if type_level(rhs) > lv.level() {
-        if let Some(param) = escaping_param(rhs, lv.level()) {
+    let rhs = if type_level(solver, rhs) > lv.level(solver) {
+        if let Some(param) = escaping_param(rhs, lv.level(solver)) {
             return Err(ConstrainError::TypeParamEscapes { param });
         }
         extrude(
+            solver,
             rhs,
             false,
-            lv.level(),
-            cache.extruded.entry(lv.level()).or_default(),
+            lv.level(solver),
+            cache.extruded.entry(lv.level(solver)).or_default(),
         )
     } else {
         rhs.clone()
     };
     let entry = GuardedBound {
         guard: guard.clone(),
-        bound: Bound::edge(sl.clone(), rhs, sr.clone()).with_origin(cache.origins.1),
+        bound: Bound::edge(solver, sl.clone(), rhs, sr.clone()).with_origin(cache.origins.1),
     };
     let lows = {
-        let mut bounds = lv.bounds.borrow_mut();
+        let bounds = lv.bounds_mut(solver);
         let recorded = bounds.guarded_upper.iter().any(|g| {
             g.guard == entry.guard
                 && g.bound.ty == entry.bound.ty
@@ -3035,7 +3178,7 @@ fn record_guarded_upper(
         Rc::clone(bounds.lower())
     };
     for low in lows.iter() {
-        close_guarded(lv, low, &entry, cache, scope)?;
+        close_guarded(solver, lv, low, &entry, cache, scope)?;
     }
     Ok(())
 }
@@ -3049,24 +3192,31 @@ fn record_guarded_upper(
 /// suspend a variable base on it, and the guard would land on the suspension rather than on the
 /// variable the lower bounds reach.
 fn close_guarded(
+    solver: &mut Solver,
     holder: &Rc<InferVar>,
     low: &Bound,
     entry: &GuardedBound,
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
-    let Some((tau_l, tau_u)) =
-        bridge_holder_gap(&low.self_subst, &entry.bound.self_subst, Some(holder))
-    else {
+    let Some((tau_l, tau_u)) = bridge_holder_gap(
+        solver,
+        &low.self_subst,
+        &entry.bound.self_subst,
+        Some(holder),
+    ) else {
         return Ok(());
     };
-    let low_subst = Subst::then(&low.ty_subst, &tau_l);
-    let upper_subst = Subst::then(&entry.bound.ty_subst, &tau_u);
+    let low_subst = Subst::then(solver, &low.ty_subst, &tau_l);
+    let upper_subst = Subst::then(solver, &entry.bound.ty_subst, &tau_u);
     let lrefs_in_ambient: Vec<Refinement> = low
         .ty
         .refinements()
         .iter()
-        .map(|l| normal_refinement(&low_subst.force_refinement(l)))
+        .map(|l| {
+            let forced = low_subst.force_refinement(solver, l);
+            normal_refinement_in(solver, &forced)
+        })
         .collect();
     let guard: Vec<Refinement> = entry
         .guard
@@ -3075,7 +3225,8 @@ fn close_guarded(
             if tau_u.is_id() {
                 g.clone()
             } else {
-                normal_refinement(&tau_u.force_refinement(g))
+                let forced = tau_u.force_refinement(solver, g);
+                normal_refinement_in(solver, &forced)
             }
         })
         .filter(|g| !lrefs_in_ambient.contains(g))
@@ -3083,6 +3234,7 @@ fn close_guarded(
     cache.with_origins((low.origin, entry.bound.origin), |cache| {
         if cache.refinement_blind() {
             return constrain_go(
+                solver,
                 low.ty.peel_refinements(),
                 entry.bound.ty.peel_refinements(),
                 &low_subst,
@@ -3092,6 +3244,7 @@ fn close_guarded(
             );
         }
         constrain_refined(
+            solver,
             &low.ty,
             low.ty.peel_refinements(),
             lrefs_in_ambient,
@@ -3108,10 +3261,10 @@ fn close_guarded(
 /// The failed edge `lhs‹sl› <: rhs‹sr›`, each side under its substitution, so a message
 /// reads a dependent application's result at its argument rather than at the binder the
 /// argument discharges.
-fn mismatch(lhs: &Type, rhs: &Type, sl: &Subst, sr: &Subst) -> ConstrainError {
+fn mismatch(solver: &mut Solver, lhs: &Type, rhs: &Type, sl: &Subst, sr: &Subst) -> ConstrainError {
     ConstrainError::Mismatch {
-        lhs: Box::new(sl.apply_type(lhs)),
-        rhs: Box::new(sr.apply_type(rhs)),
+        lhs: Box::new(sl.apply_type_in(solver, lhs)),
+        rhs: Box::new(sr.apply_type_in(solver, rhs)),
     }
 }
 
@@ -3122,6 +3275,7 @@ fn mismatch(lhs: &Type, rhs: &Type, sl: &Subst, sr: &Subst) -> ConstrainError {
 /// would turn an ill-typed program's diagnostic into a note about the encoder. Every other
 /// error is the solver failing, which is reported.
 fn smt_undecided_is_mismatch(
+    solver: &mut Solver,
     error: SmtError,
     lhs: &Type,
     rhs: &Type,
@@ -3131,8 +3285,8 @@ fn smt_undecided_is_mismatch(
     match error {
         SmtError::Encoding { .. } => Ok(false),
         error => Err(ConstrainError::SmtError {
-            lhs: Box::new(sl.apply_type(lhs)),
-            rhs: Box::new(sr.apply_type(rhs)),
+            lhs: Box::new(sl.apply_type_in(solver, lhs)),
+            rhs: Box::new(sr.apply_type_in(solver, rhs)),
             error: Box::new(error),
         }),
     }
@@ -3152,13 +3306,13 @@ fn smt_undecided_is_mismatch(
 /// idempotent set intersection, which makes the duplicate delivery a no-op rather
 /// than something to reason about per polarity. The proxy stands where the original
 /// does, so each obligation reads it in the original's frame.
-fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
-    let watches = from.watches.borrow().clone();
+fn copy_watches(solver: &mut Solver, from: &Rc<InferVar>, to: &Rc<InferVar>) {
+    let watches = from.watches(solver).to_vec();
     for (obligation, pos) in &watches {
         obligation.copy_frame(obligation, *pos, from.uid, to.uid);
     }
     if !watches.is_empty() {
-        to.watches.borrow_mut().extend(watches);
+        to.watches_mut(solver).extend(watches);
     }
 }
 
@@ -3196,9 +3350,15 @@ fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::T
 /// no-op there; it fires for real once let-generalization (`scoped_let`) mints
 /// RHS variables at a deeper level and a cross-level constraint arises (the
 /// constrain_subtype solver's level-mismatch branches).
-pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
-    if type_level(ty) <= target_level {
-        lower_fun_kind_levels(ty, target_level);
+pub fn extrude(
+    solver: &mut Solver,
+    ty: &Type,
+    pol: bool,
+    target_level: Level,
+    cache: &mut ExtrudeCache,
+) -> Type {
+    if type_level(solver, ty) <= target_level {
+        lower_fun_kind_levels(solver, ty, target_level);
         crate::ccl::capabilities::lower_capability_levels(ty, target_level);
         return ty.clone();
     }
@@ -3233,51 +3393,50 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // Registered before the bounds are extruded, as `freshen_above` registers
             // its copy: a bound reaching `B` through structure resolves to `B'` instead
             // of extruding `B` again.
-            let fresh = BarrierVar::fresh(Rc::clone(&barrier.opaque), Vec::new(), Vec::new());
+            let fresh =
+                BarrierVar::fresh(solver, Rc::clone(barrier.opaque()), Vec::new(), Vec::new());
             cache
                 .barrier_vars
                 .insert((barrier.uid, pol), Rc::clone(&fresh));
             // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = barrier.lowers.borrow().clone();
-            let ups = barrier.uppers.borrow().clone();
-            let mut extrude_bound = |b: &Bound| Bound {
+            let lows = barrier.lowers(solver).to_vec();
+            let ups = barrier.uppers(solver).to_vec();
+            let mut extrude_bound = |solver: &mut Solver, b: &Bound| Bound {
                 origin: b.origin,
                 self_subst: b.self_subst.clone(),
-                ty: extrude(&b.ty, pol, target_level, cache),
+                ty: extrude(solver, &b.ty, pol, target_level, cache),
                 ty_subst: b.ty_subst.clone(),
                 rendered: Default::default(),
             };
-            let new_lows: Vec<_> = lows.iter().map(&mut extrude_bound).collect();
+            let new_lows: Vec<_> = lows.iter().map(|b| extrude_bound(solver, b)).collect();
             let new_ups: Vec<_> = ups
                 .iter()
                 .map(|u| BarrierUpper {
-                    bound: extrude_bound(&u.bound),
+                    bound: extrude_bound(solver, &u.bound),
                     report: u.report.clone(),
                 })
                 .collect();
-            *fresh.lowers.borrow_mut() = new_lows;
-            *fresh.uppers.borrow_mut() = new_ups;
+            *fresh.lowers_mut(solver) = new_lows;
+            *fresh.uppers_mut(solver) = new_ups;
             // The bounds above are direct writes, so the copy carries the original's
             // watches, as `copy_watches` gives a proxy its original's.
-            fresh
-                .watches
-                .borrow_mut()
-                .extend(barrier.watches.borrow().iter().cloned());
-            let link = Type::Infer(InferVar::fresh(target_level));
+            let watches = barrier.watches(solver).to_vec();
+            fresh.watches_mut(solver).extend(watches);
+            let link = Type::Infer(InferVar::fresh(solver, target_level));
             let (from, to) = if pol {
                 (barrier, &fresh)
             } else {
                 (&fresh, barrier)
             };
-            from.uppers
-                .borrow_mut()
+            from.uppers_mut(solver)
                 .push(BarrierUpper::unreported(Bound::conc(link.clone())));
-            to.lowers.borrow_mut().push(Bound::conc(link));
+            to.lowers_mut(solver).push(Bound::conc(link));
             Type::BarrierVar(fresh)
         }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
+        | Type::Undetermined(_)
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
@@ -3287,15 +3446,20 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         Type::Family { binders, body } => Type::Family {
             binders: binders
                 .iter()
-                .map(|(name, t)| (name.clone(), extrude_invariant(t, target_level, cache)))
+                .map(|(name, t)| {
+                    (
+                        name.clone(),
+                        extrude_invariant(solver, t, target_level, cache),
+                    )
+                })
                 .collect(),
-            body: Box::new(extrude(body, pol, target_level, cache)),
+            body: Box::new(extrude(solver, body, pol, target_level, cache)),
         },
         // Componentwise, as a tuple is: a component's names stay its binders.
         Type::DepTuple(components) => Type::DepTuple(
             components
                 .iter()
-                .map(|(name, t)| (name.clone(), extrude(t, pol, target_level, cache)))
+                .map(|(name, t)| (name.clone(), extrude(solver, t, pol, target_level, cache)))
                 .collect(),
         ),
         // `constrain_go` refuses an edge carrying a parameter below its level before
@@ -3332,12 +3496,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // and silently drops the other, which for a candidate is usually fatal.
             fun_kind: match fun_kind {
                 FunKind::Var(kind) => {
-                    kind.place_at(target_level);
+                    kind.place_at(solver, target_level);
                     fun_kind.clone()
                 }
                 FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
                     ws.iter()
-                        .map(|w| w.map_types(|t| extrude_invariant(t, target_level, cache)))
+                        .map(|w| w.map_types(|t| extrude_invariant(solver, t, target_level, cache)))
                         .collect(),
                 ))),
                 other => other.clone(),
@@ -3347,21 +3511,23 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // do: a one-way proxy would carry only the contravariant half of the equation the
             // domain owes, and a domain variable copied up a level would never learn the
             // domain the collection reaching the copy brings.
-            domain: Box::new(if fun_kind.resolved().is_data() || named_domain(d) {
-                extrude_invariant(d, target_level, cache)
-            } else {
-                extrude(d, !pol, target_level, cache)
-            }),
-            codomain: Box::new(extrude(c, pol, target_level, cache)),
+            domain: Box::new(
+                if fun_kind.resolved_in(solver).is_data() || named_domain(solver, d) {
+                    extrude_invariant(solver, d, target_level, cache)
+                } else {
+                    extrude(solver, d, !pol, target_level, cache)
+                },
+            ),
+            codomain: Box::new(extrude(solver, c, pol, target_level, cache)),
         },
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
-                .map(|t| extrude(t, pol, target_level, cache))
+                .map(|t| extrude(solver, t, pol, target_level, cache))
                 .collect(),
         ),
         Type::OpenTuple(ts) => Type::OpenTuple(
             ts.iter()
-                .map(|t| extrude(t, pol, target_level, cache))
+                .map(|t| extrude(solver, t, pol, target_level, cache))
                 .collect(),
         ),
         // Each argument extrudes at the polarity its variance gives it, and an invariant
@@ -3371,34 +3537,36 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             args.iter()
                 .zip(&decl.body().variances)
                 .map(|(t, v)| match (v, t) {
-                    (Variance::Covariant, _) => extrude(t, pol, target_level, cache),
-                    (Variance::Contravariant, _) => extrude(t, !pol, target_level, cache),
-                    (Variance::Bipolar, Type::Split { .. }) => extrude(t, pol, target_level, cache),
+                    (Variance::Covariant, _) => extrude(solver, t, pol, target_level, cache),
+                    (Variance::Contravariant, _) => extrude(solver, t, !pol, target_level, cache),
+                    (Variance::Bipolar, Type::Split { .. }) => {
+                        extrude(solver, t, pol, target_level, cache)
+                    }
                     (Variance::Invariant | Variance::Bipolar, _) => {
-                        extrude_invariant(t, target_level, cache)
+                        extrude_invariant(solver, t, target_level, cache)
                     }
                 })
                 .collect(),
         ),
         // A bipolar argument's input side is read where its output side's polarity flips.
         Type::Split { input, output } => Type::Split {
-            input: Box::new(extrude(input, !pol, target_level, cache)),
-            output: Box::new(extrude(output, pol, target_level, cache)),
+            input: Box::new(extrude(solver, input, !pol, target_level, cache)),
+            output: Box::new(extrude(solver, output, pol, target_level, cache)),
         },
         Type::Record(fs) => Type::Record(
             fs.iter()
-                .map(|(n, t)| (n.clone(), extrude(t, pol, target_level, cache)))
+                .map(|(n, t)| (n.clone(), extrude(solver, t, pol, target_level, cache)))
                 .collect(),
         ),
         Type::Variant(tags, openness) => Type::Variant(
             tags.iter()
                 // Variant payloads are covariant — same polarity, no flip.
-                .map(|(k, t)| (k.clone(), extrude(t, pol, target_level, cache)))
+                .map(|(k, t)| (k.clone(), extrude(solver, t, pol, target_level, cache)))
                 .collect(),
             *openness,
         ),
         Type::Refinement(inner, r) => {
-            Type::refined(extrude(inner, pol, target_level, cache), r.clone())
+            Type::refined(extrude(solver, inner, pol, target_level, cache), r.clone())
         }
         Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.clone(),
         // Invariant payload: polarity is meaningless under invariance, so
@@ -3422,8 +3590,8 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 Type::Fun {
                     binder: binder.clone(),
                     fun_kind: fun_kind.clone(),
-                    domain: Box::new(extrude_invariant(domain, target_level, cache)),
-                    codomain: Box::new(extrude_invariant(codomain, target_level, cache)),
+                    domain: Box::new(extrude_invariant(solver, domain, target_level, cache)),
+                    codomain: Box::new(extrude_invariant(solver, codomain, target_level, cache)),
                     capabilities: capabilities.clone(),
                 },
                 *history_kind,
@@ -3443,6 +3611,8 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 uid: (),
                 // The target level.
                 level: (),
+                // Minted by this solver.
+                home: (),
                 // The original's: the bounds copied below close against the same scope.
                 telescope: (),
                 // Linked to the original, and the side the polarity reads copied, below.
@@ -3462,16 +3632,16 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 stands_for: (),
                 // `inherit_witness_placement`.
                 witness_scopes: (),
-            } = tv.fields();
-            let nvs = InferVar::fresh_in(target_level, &tv.telescope);
-            nvs.inherit_witness_placement(tv);
-            nvs.inherit_stands_for(tv);
-            if tv.names_domain() {
-                nvs.mark_named_domain();
+            } = tv.fields(solver);
+            let nvs = InferVar::fresh_in(solver, target_level, &tv.telescope);
+            nvs.inherit_witness_placement(solver, tv);
+            nvs.inherit_stands_for(solver, tv);
+            if tv.names_domain(solver) {
+                nvs.mark_named_domain(solver);
             }
-            relate_proxy_funkinds(tv, &nvs, &[pol]);
+            relate_proxy_funkinds(solver, tv, &nvs, &[pol]);
             cache.vars.insert((tv.uid, pol), Rc::clone(&nvs));
-            copy_watches(tv, &nvs);
+            copy_watches(solver, tv, &nvs);
             // Kinding constraints ride along at **both** polarities, unlike the bounds
             // below. The proxy stands in for the original wherever the outer scope reads
             // it, and "must inhabit 𝐾" is a property of what that resolves to, not of a
@@ -3479,14 +3649,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             // the constraint away. The kind's own type children extrude with it: a
             // parameterized kind carries types like any other position.
             {
-                let carried: Vec<_> = tv
-                    .bounds
-                    .borrow()
-                    .type_kinds
+                let kinds = tv.bounds(solver).type_kinds.clone();
+                let carried: Vec<_> = kinds
                     .iter()
-                    .map(|k| k.map_children(|t| extrude(t, pol, target_level, cache)))
+                    .map(|k| k.map_children(|t| extrude(solver, t, pol, target_level, cache)))
                     .collect();
-                nvs.bounds.borrow_mut().type_kinds = carried;
+                nvs.bounds_mut(solver).type_kinds = carried;
             }
 
             // Each branch snapshots only the list it does *not* push to — the
@@ -3499,9 +3667,8 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 // Positive: original flows into new var. Original gains
                 // `nvs` as an upper bound; new var inherits original's
                 // lower bounds (extruded at the same polarity).
-                let lows = Rc::clone(tv.bounds.borrow().lower());
-                tv.bounds
-                    .borrow_mut()
+                let lows = Rc::clone(tv.bounds(solver).lower());
+                tv.bounds_mut(solver)
                     .upper_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
@@ -3509,19 +3676,18 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     .map(|b| Bound {
                         origin: b.origin,
                         self_subst: b.self_subst.clone(),
-                        ty: extrude(&b.ty, pol, target_level, cache),
+                        ty: extrude(solver, &b.ty, pol, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().set_lower(new_lows);
+                nvs.bounds_mut(solver).set_lower(new_lows);
             } else {
                 // Negative: new var flows into original. Original gains
                 // `nvs` as a lower bound; new var inherits original's
                 // upper bounds.
-                let ups = Rc::clone(tv.bounds.borrow().upper());
-                tv.bounds
-                    .borrow_mut()
+                let ups = Rc::clone(tv.bounds(solver).upper());
+                tv.bounds_mut(solver)
                     .lower_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
@@ -3529,16 +3695,16 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                     .map(|b| Bound {
                         origin: b.origin,
                         self_subst: b.self_subst.clone(),
-                        ty: extrude(&b.ty, pol, target_level, cache),
+                        ty: extrude(solver, &b.ty, pol, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().set_upper(new_ups);
+                nvs.bounds_mut(solver).set_upper(new_ups);
                 // A guarded bound restricts what reaches `tv`, so the proxy flowing into it
                 // carries it as it carries the upper bounds.
-                let guarded = extrude_guarded(tv, pol, target_level, cache);
-                nvs.bounds.borrow_mut().guarded_upper.extend(guarded);
+                let guarded = extrude_guarded(solver, tv, pol, target_level, cache);
+                nvs.bounds_mut(solver).guarded_upper.extend(guarded);
             }
             Type::Infer(nvs)
         }
@@ -3549,7 +3715,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
 /// draws, as relating two variables records their funkinds' (`constrain_go`): `original <: proxy`
 /// for a positive direction, `proxy <: original` for a negative one. The link is written directly,
 /// so without this the proxy's funkind variable relates to nothing the original's does.
-fn relate_proxy_funkinds(original: &InferVar, proxy: &InferVar, directions: &[bool]) {
+fn relate_proxy_funkinds(
+    solver: &mut Solver,
+    original: &InferVar,
+    proxy: &InferVar,
+    directions: &[bool],
+) {
     for &positive in directions {
         let (lower, upper) = if positive {
             (original, proxy)
@@ -3557,11 +3728,11 @@ fn relate_proxy_funkinds(original: &InferVar, proxy: &InferVar, directions: &[bo
             (proxy, original)
         };
         upper
-            .fun_kind
-            .record(FunKind::Var(Rc::clone(&lower.fun_kind)), true);
+            .fun_kind()
+            .record(solver, FunKind::Var(Rc::clone(lower.fun_kind())), true);
         lower
-            .fun_kind
-            .record(FunKind::Var(Rc::clone(&upper.fun_kind)), false);
+            .fun_kind()
+            .record(solver, FunKind::Var(Rc::clone(upper.fun_kind())), false);
     }
 }
 
@@ -3577,8 +3748,8 @@ fn relate_proxy_funkinds(original: &InferVar, proxy: &InferVar, directions: &[bo
 /// level"). The transitive walk keeps the level invariant, that a variable's bounds
 /// sit at or below it. A channel's level does not take part in its identity
 /// ([`crate::ccl::ChanLevel`]), so the lowered name is the same channel.
-pub fn lower_levels(ty: &Type, level: Level) -> Type {
-    lower_var_levels(ty, level);
+pub fn lower_levels(solver: &mut Solver, ty: &Type, level: Level) -> Type {
+    lower_var_levels(solver, ty, level);
     let mut ty = ty.clone();
     lower_chan_levels(&mut ty, level);
     ty
@@ -3591,15 +3762,15 @@ fn lower_chan_levels(ty: &mut Type, level: Level) {
     ty.walk_children_mut(|child| lower_chan_levels(child, level));
 }
 
-fn lower_var_levels(ty: &Type, level: Level) {
-    if type_level(ty) <= level {
-        lower_fun_kind_levels(ty, level);
+fn lower_var_levels(solver: &mut Solver, ty: &Type, level: Level) {
+    if type_level(solver, ty) <= level {
+        lower_fun_kind_levels(solver, ty, level);
         return;
     }
     if let Type::Infer(v) = ty {
         // Lowered before its bounds are walked, which is what ends a cycle.
-        v.lower_level(level);
-        let bounds = v.bounds.borrow();
+        v.lower_level(solver, level);
+        let bounds = v.bounds(solver);
         let reached: Vec<Type> = bounds
             .lower()
             .iter()
@@ -3613,9 +3784,8 @@ fn lower_var_levels(ty: &Type, level: Level) {
                     .flat_map(|k| k.children().iter().cloned()),
             )
             .collect();
-        drop(bounds);
         for t in &reached {
-            lower_var_levels(t, level);
+            lower_var_levels(solver, t, level);
         }
         return;
     }
@@ -3624,22 +3794,22 @@ fn lower_var_levels(ty: &Type, level: Level) {
         ..
     } = ty
     {
-        kind.place_at(level);
+        kind.place_at(solver, level);
     }
-    ty.walk_children(|child| lower_var_levels(child, level));
+    ty.walk_children(|child| lower_var_levels(solver, child, level));
 }
 
 /// Function kinds cross a scope boundary even when their domains and codomains have no type
 /// variable above it. `type_level` omits the kind variable's own level.
-fn lower_fun_kind_levels(ty: &Type, level: Level) {
+fn lower_fun_kind_levels(solver: &mut Solver, ty: &Type, level: Level) {
     if let Type::Fun {
         fun_kind: FunKind::Var(kind),
         ..
     } = ty
     {
-        kind.place_at(level);
+        kind.place_at(solver, level);
     }
-    ty.walk_children(|child| lower_fun_kind_levels(child, level));
+    ty.walk_children(|child| lower_fun_kind_levels(solver, child, level));
 }
 
 /// Extrusion for an *invariant* position — a [`Type::History`] payload.
@@ -3657,12 +3827,13 @@ fn lower_fun_kind_levels(ty: &Type, level: Level) {
 /// `tv`'s guarded upper bounds, their bounding types extruded at `pol` to `target_level` as an
 /// upper bound's is. The guard is a predicate, which extrusion does not walk.
 fn extrude_guarded(
+    solver: &mut Solver,
     tv: &InferVar,
     pol: bool,
     target_level: Level,
     cache: &mut ExtrudeCache,
 ) -> Vec<GuardedBound> {
-    let guarded = tv.bounds.borrow().guarded_upper.clone();
+    let guarded = tv.bounds(solver).guarded_upper.clone();
     guarded
         .into_iter()
         .map(|g| GuardedBound {
@@ -3670,7 +3841,7 @@ fn extrude_guarded(
             bound: Bound {
                 origin: g.bound.origin,
                 self_subst: g.bound.self_subst,
-                ty: extrude(&g.bound.ty, pol, target_level, cache),
+                ty: extrude(solver, &g.bound.ty, pol, target_level, cache),
                 ty_subst: g.bound.ty_subst,
                 rendered: Default::default(),
             },
@@ -3678,9 +3849,14 @@ fn extrude_guarded(
         .collect()
 }
 
-fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -> Type {
-    if type_level(ty) <= target_level {
-        lower_fun_kind_levels(ty, target_level);
+fn extrude_invariant(
+    solver: &mut Solver,
+    ty: &Type,
+    target_level: Level,
+    cache: &mut ExtrudeCache,
+) -> Type {
+    if type_level(solver, ty) <= target_level {
+        lower_fun_kind_levels(solver, ty, target_level);
         return ty.clone();
     }
     match ty {
@@ -3711,13 +3887,15 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             let nvs = cached_pos
                 .clone()
                 .or_else(|| cached_neg.clone())
-                .unwrap_or_else(|| InferVar::fresh_in(target_level, &tv.telescope));
+                .unwrap_or_else(|| InferVar::fresh_in(solver, target_level, &tv.telescope));
             // Each field of the original, and what the proxy makes of it.
             let crate::ccl::infer_var::InferVarFields {
                 // The proxy's own.
                 uid: (),
                 // The target level.
                 level: (),
+                // Minted by this solver.
+                home: (),
                 // The original's: the bounds copied below close against the same scope.
                 telescope: (),
                 // Linked both ways, and both sides copied, below.
@@ -3737,13 +3915,13 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                 stands_for: (),
                 // `inherit_witness_placement`.
                 witness_scopes: (),
-            } = tv.fields();
-            nvs.inherit_witness_placement(tv);
-            nvs.inherit_stands_for(tv);
-            if tv.names_domain() {
-                nvs.mark_named_domain();
+            } = tv.fields(solver);
+            nvs.inherit_witness_placement(solver, tv);
+            nvs.inherit_stands_for(solver, tv);
+            if tv.names_domain(solver) {
+                nvs.mark_named_domain(solver);
             }
-            relate_proxy_funkinds(tv, &nvs, &[true, false]);
+            relate_proxy_funkinds(solver, tv, &nvs, &[true, false]);
             // Which bound links does the reused proxy already carry? A polar
             // proxy under the `true` key has the positive link (`tv <: proxy`);
             // under the `false` key, the negative link (`proxy <: tv`). A fresh
@@ -3752,14 +3930,14 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             let has_neg_link = cached_neg.as_ref().is_some_and(|n| Rc::ptr_eq(n, &nvs));
             cache.vars.insert((tv.uid, true), Rc::clone(&nvs));
             cache.vars.insert((tv.uid, false), Rc::clone(&nvs));
-            copy_watches(tv, &nvs);
+            copy_watches(solver, tv, &nvs);
 
             // Snapshot the original's bounds, excluding any edge that already
             // points at this proxy (a polar extrusion pushed one such link into
             // `tv`); re-seeding from it would create a spurious `proxy <: proxy`
             // self-edge.
             let (lows, ups) = {
-                let s = tv.bounds.borrow();
+                let s = tv.bounds(solver);
                 let not_proxy = |b: &Bound| !matches!(&b.ty, Type::Infer(v) if v.uid == nvs.uid);
                 (
                     s.lower()
@@ -3776,8 +3954,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
             };
             // Positive link: `tv <: proxy`; proxy inherits `tv`'s lower bounds.
             if !has_pos_link {
-                tv.bounds
-                    .borrow_mut()
+                tv.bounds_mut(solver)
                     .upper_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
@@ -3785,17 +3962,16 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                     .map(|b| Bound {
                         origin: b.origin,
                         self_subst: b.self_subst.clone(),
-                        ty: extrude(&b.ty, true, target_level, cache),
+                        ty: extrude(solver, &b.ty, true, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().lower_mut().extend(new_lows);
+                nvs.bounds_mut(solver).lower_mut().extend(new_lows);
             }
             // Negative link: `proxy <: tv`; proxy inherits `tv`'s upper bounds.
             if !has_neg_link {
-                tv.bounds
-                    .borrow_mut()
+                tv.bounds_mut(solver)
                     .lower_mut()
                     .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
@@ -3803,14 +3979,14 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                     .map(|b| Bound {
                         origin: b.origin,
                         self_subst: b.self_subst.clone(),
-                        ty: extrude(&b.ty, false, target_level, cache),
+                        ty: extrude(solver, &b.ty, false, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
                         rendered: Default::default(),
                     })
                     .collect();
-                nvs.bounds.borrow_mut().upper_mut().extend(new_ups);
-                let guarded = extrude_guarded(tv, false, target_level, cache);
-                nvs.bounds.borrow_mut().guarded_upper.extend(guarded);
+                nvs.bounds_mut(solver).upper_mut().extend(new_ups);
+                let guarded = extrude_guarded(solver, tv, false, target_level, cache);
+                nvs.bounds_mut(solver).guarded_upper.extend(guarded);
             }
             Type::Infer(nvs)
         }
@@ -3823,10 +3999,10 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                 ..
             } = ty
             {
-                kind.place_at(target_level);
+                kind.place_at(solver, target_level);
             }
             let mut out = ty.clone();
-            out.walk_children_mut(|t| *t = extrude_invariant(t, target_level, cache));
+            out.walk_children_mut(|t| *t = extrude_invariant(solver, t, target_level, cache));
             out
         }
     }
@@ -3874,6 +4050,7 @@ mod tests {
     /// are two types and one data domain, so collections over them are not distinct.
     #[test]
     fn collections_over_redundant_plain_and_dependent_tuples_share_a_data_domain() {
+        let solver = &mut Solver::new();
         let components = || vec![Type::UIntRange(2), Type::UIntRange(3)];
         let plain = Type::Tuple(components());
         let dependent = Type::DepTuple(components().into_iter().map(|t| (None, t)).collect());
@@ -3882,13 +4059,14 @@ mod tests {
             Bound::conc(Type::data_fun(plain, Type::Base(BaseType::Int))),
             Bound::conc(Type::data_fun(dependent, Type::Base(BaseType::Int))),
         ];
-        assert!(distinct_data_domains(&lows).is_none());
+        assert!(distinct_data_domains(solver, &lows).is_none());
     }
 
     #[test]
     fn monomorphic_functions_keep_their_kind_at_the_bindings_level() {
-        let kind = FunKindVar::fresh();
-        kind.place_at(2);
+        let solver = &mut Solver::new();
+        let kind = FunKindVar::fresh(solver);
+        kind.place_at(solver, 2);
         let function = Type::Fun {
             binder: FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&kind)),
@@ -3897,35 +4075,36 @@ mod tests {
             capabilities: Capabilities::none(),
         };
         let nested = Type::Tuple(vec![function]);
-        assert_eq!(type_level(&nested), 0);
-        lower_levels(&nested, 0);
-        assert_eq!(kind.level(), Some(0));
+        assert_eq!(type_level(solver, &nested), 0);
+        lower_levels(solver, &nested, 0);
+        assert_eq!(kind.level(solver), Some(0));
     }
 
     #[test]
     fn extrusion_moves_a_functions_kind_with_its_type() {
+        let solver = &mut Solver::new();
         for has_variable in [false, true] {
             for invariant in [false, true] {
-                let kind = FunKindVar::fresh();
-                kind.place_at(2);
+                let kind = FunKindVar::fresh(solver);
+                kind.place_at(solver, 2);
                 let function = Type::Fun {
                     binder: FunBinder::None,
                     fun_kind: FunKind::Var(Rc::clone(&kind)),
                     domain: Box::new(prim(BaseType::Int)),
                     codomain: Box::new(if has_variable {
-                        fresh_var(2)
+                        fresh_var(solver, 2)
                     } else {
                         prim(BaseType::Int)
                     }),
                     capabilities: Capabilities::none(),
                 };
                 let extruded = if invariant {
-                    extrude_invariant(&function, 0, &mut ExtrudeCache::new())
+                    extrude_invariant(solver, &function, 0, &mut ExtrudeCache::new())
                 } else {
-                    extrude(&function, true, 0, &mut ExtrudeCache::new())
+                    extrude(solver, &function, true, 0, &mut ExtrudeCache::new())
                 };
-                assert_eq!(type_level(&extruded), 0);
-                assert_eq!(kind.level(), Some(0));
+                assert_eq!(type_level(solver, &extruded), 0);
+                assert_eq!(kind.level(solver), Some(0));
             }
         }
     }
@@ -3935,24 +4114,27 @@ mod tests {
     /// directly, with no constraint between the two variables.
     #[test]
     fn an_extruded_proxy_follows_its_originals_funkind_and_named_domain() {
+        let solver = &mut Solver::new();
         for invariant in [false, true] {
-            let original = InferVar::fresh(2);
-            original.mark_named_domain();
+            let original = InferVar::fresh(solver, 2);
+            original.mark_named_domain(solver);
             let ty = Type::Infer(Rc::clone(&original));
             let extruded = if invariant {
-                extrude_invariant(&ty, 0, &mut ExtrudeCache::new())
+                extrude_invariant(solver, &ty, 0, &mut ExtrudeCache::new())
             } else {
-                extrude(&ty, true, 0, &mut ExtrudeCache::new())
+                extrude(solver, &ty, true, 0, &mut ExtrudeCache::new())
             };
             let Type::Infer(proxy) = extruded else {
                 panic!("expected the original's proxy");
             };
             assert_ne!(proxy.uid, original.uid, "the original is proxied");
-            assert!(proxy.names_domain(), "the proxy names a domain");
-            assert_eq!(proxy.fun_kind.resolved(), KindPin::Unpinned);
-            original.fun_kind.record(FunKind::fresh_data(), true);
+            assert!(proxy.names_domain(solver), "the proxy names a domain");
+            assert_eq!(proxy.fun_kind().resolved_in(solver), KindPin::Unpinned);
+            original
+                .fun_kind()
+                .record(solver, FunKind::fresh_data(), true);
             assert_eq!(
-                proxy.fun_kind.resolved(),
+                proxy.fun_kind().resolved_in(solver),
                 KindPin::Data,
                 "the proxy's funkind reads the original's"
             );
@@ -3962,6 +4144,7 @@ mod tests {
     #[test]
     fn family_mismatches_report_the_substituted_sides() {
         use crate::ccl::ty::{FamilyApp, TypeParam};
+        let solver = &mut Solver::new();
         let family = Type::FamilyApp(FamilyApp::new(
             TypeParam::declared_family("V", 1),
             vec![Rc::new(TypedExpr::var("n"))],
@@ -3970,6 +4153,7 @@ mod tests {
         let sr = Subst::discharge("n", TypedExpr::lit(Lit::Int(2)));
         for demand in [&family, &Type::Base(BaseType::Int)] {
             let error = constrain_go(
+                solver,
                 &family,
                 demand,
                 &sl,
@@ -3981,8 +4165,8 @@ mod tests {
             let ConstrainError::Mismatch { lhs, rhs } = error else {
                 panic!("expected a mismatch, got {error:?}");
             };
-            assert_eq!(*lhs, sl.apply_type(&family));
-            assert_eq!(*rhs, sr.apply_type(demand));
+            assert_eq!(*lhs, sl.apply_type_in(solver, &family));
+            assert_eq!(*rhs, sr.apply_type_in(solver, demand));
             assert_ne!(*lhs, family);
         }
     }
@@ -3990,19 +4174,21 @@ mod tests {
     #[test]
     fn solver_failures_report_the_substituted_sides() {
         use crate::ccl::ty::{FamilyApp, TypeParam};
+        let solver = &mut Solver::new();
         let ty = Type::FamilyApp(FamilyApp::new(
             TypeParam::declared_family("V", 1),
             vec![Rc::new(TypedExpr::var("n"))],
         ));
         let sl = Subst::discharge("n", TypedExpr::lit(Lit::Int(1)));
         let sr = Subst::discharge("n", TypedExpr::lit(Lit::Int(2)));
-        let error = smt_undecided_is_mismatch(SmtError::SolverReportedUnknown, &ty, &ty, &sl, &sr)
-            .expect_err("an unanswered query reports a solver failure");
+        let error =
+            smt_undecided_is_mismatch(solver, SmtError::SolverReportedUnknown, &ty, &ty, &sl, &sr)
+                .expect_err("an unanswered query reports a solver failure");
         let ConstrainError::SmtError { lhs, rhs, .. } = error else {
             panic!("expected a solver failure, got {error:?}");
         };
-        assert_eq!(*lhs, sl.apply_type(&ty));
-        assert_eq!(*rhs, sr.apply_type(&ty));
+        assert_eq!(*lhs, sl.apply_type_in(solver, &ty));
+        assert_eq!(*rhs, sr.apply_type_in(solver, &ty));
         assert_ne!(*lhs, *rhs);
     }
 
@@ -4030,6 +4216,7 @@ mod tests {
     /// is the same binder.
     #[test]
     fn the_derivation_decides_whether_a_concrete_pair_opens() {
+        let solver = &mut Solver::new();
         let x = Name::raw("x");
         let refinement = |referenced: &Name| {
             Type::Refinement(
@@ -4043,7 +4230,7 @@ mod tests {
             )
         };
         // Construction closes the reference into `#0`.
-        let closed = Type::pi(x.clone(), Type::Base(BaseType::Int), refinement(&x));
+        let closed = Type::pi_in(solver, x.clone(), Type::Base(BaseType::Int), refinement(&x));
         // The same spelling, free: no function in this type binds it.
         let free = Type::fun(Type::Base(BaseType::Int), refinement(&x));
         assert!(
@@ -4051,12 +4238,13 @@ mod tests {
             "the right side's reference must be free for this to be the capture case"
         );
         assert!(
-            constrain_subtype(&closed, &free, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &closed, &free, &mut ConstrainCache::new()).is_err(),
             "a closed refinement about the function's own binder does not satisfy one \
              about a free name that shares its spelling"
         );
         assert!(
             constrain_subtype(
+                solver,
                 &closed,
                 &free,
                 &mut ConstrainCache::for_derivation(Derivation::PostPass),
@@ -4075,10 +4263,11 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "open bound recorded")]
     fn a_whole_tree_re_derivation_enforces_the_closure_invariant() {
+        let solver = &mut Solver::new();
         let escaped = escaped_refinement();
         let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
-        let v = fresh_var(0);
-        let _ = constrain_subtype(&escaped, &v, &mut cache);
+        let v = fresh_var(solver, 0);
+        let _ = constrain_subtype(solver, &escaped, &v, &mut cache);
     }
 
     /// The tripwire is armed for the one place the record/variant arms and the
@@ -4094,12 +4283,13 @@ mod tests {
     #[cfg(debug_assertions)]
     #[should_panic(expected = "duplicate record key")]
     fn dup_key_record_trips_the_uniquely_keyed_invariant() {
+        let solver = &mut Solver::new();
         let dup = Type::Record(vec![
             ("a".into(), Type::Base(BaseType::Int)),
             ("a".into(), Type::Base(BaseType::Bool)),
         ]);
         let mut cache = ConstrainCache::new();
-        let _ = constrain_subtype(&dup, &dup.clone(), &mut cache);
+        let _ = constrain_subtype(solver, &dup, &dup.clone(), &mut cache);
     }
 
     /// A kinding constraint must cross a scope boundary with its variable. `extrude`
@@ -4113,21 +4303,21 @@ mod tests {
     /// boundary.
     #[test]
     fn extrusion_carries_a_kinding_constraint_at_both_polarities() {
+        let solver = &mut Solver::new();
         for pol in [true, false] {
-            let inner = InferVar::fresh(2);
-            inner
-                .bounds
-                .borrow_mut()
+            let fresh = InferVar::fresh(solver, 2);
+            fresh
+                .bounds_mut(solver)
                 .type_kinds
                 .push(TypeKind::UIntRanges);
             let mut cache = ExtrudeCache::new();
-            let out = extrude(&Type::Infer(Rc::clone(&inner)), pol, 0, &mut cache);
+            let out = extrude(solver, &Type::Infer(Rc::clone(&fresh)), pol, 0, &mut cache);
             let Type::Infer(proxy) = out else {
                 panic!("extruding a variable yields a variable, got {out:?}");
             };
-            assert_eq!(proxy.level(), 0, "proxy sits at the target level");
+            assert_eq!(proxy.level(solver), 0, "proxy sits at the target level");
             assert_eq!(
-                proxy.bounds.borrow().type_kinds,
+                proxy.bounds(solver).type_kinds,
                 vec![TypeKind::UIntRanges],
                 "pol={pol}: the proxy must inhabit the same kind"
             );
@@ -4140,19 +4330,20 @@ mod tests {
     /// both references to `𝐵` become one copy `𝐵'`.
     #[test]
     fn extruding_a_barrier_reaching_itself_through_its_lower_reuses_the_copy() {
+        let solver = &mut Solver::new();
         for pol in [true, false] {
-            let barrier = BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+            let barrier = BarrierVar::fresh(solver, Rc::from([]), Vec::new(), Vec::new());
             let b = Type::BarrierVar(Rc::clone(&barrier));
-            barrier.lowers.borrow_mut().push(Bound::conc(Type::fun(
-                Type::Infer(InferVar::fresh(1)),
-                b.clone(),
-            )));
-            let out = extrude(&b, pol, 0, &mut ExtrudeCache::new());
+            let domain = Type::Infer(InferVar::fresh(solver, 1));
+            barrier
+                .lowers_mut(solver)
+                .push(Bound::conc(Type::fun(domain, b.clone())));
+            let out = extrude(solver, &b, pol, 0, &mut ExtrudeCache::new());
             let Type::BarrierVar(copy) = out else {
                 panic!("extruding a barrier variable yields one, got {out:?}");
             };
             assert_ne!(copy.uid, barrier.uid, "pol={pol}: the extrusion copies");
-            let lowers = copy.lowers.borrow();
+            let lowers = copy.lowers(solver);
             let Some(Type::Fun { codomain, .. }) = lowers.first().map(|b| &b.ty) else {
                 panic!("pol={pol}: the copy keeps the function lower, got {lowers:?}");
             };
@@ -4169,6 +4360,7 @@ mod tests {
     /// either (`a_data_domain_relates_only_to_itself`).
     #[test]
     fn sigma_width_pairs_factored_domains_invariantly() {
+        let solver = &mut Solver::new();
         let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
         let refined_range = refined(Type::UIntRange(3), 7);
 
@@ -4180,19 +4372,19 @@ mod tests {
         ]));
 
         assert!(
-            constrain_subtype(&bare, &wider, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(solver, &bare, &wider, &mut ConstrainCache::new()).is_ok(),
             "a candidate subset widens"
         );
         assert!(
-            constrain_subtype(&wider, &bare, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &wider, &bare, &mut ConstrainCache::new()).is_err(),
             "and not conversely"
         );
         assert!(
-            constrain_subtype(&bare, &filtered, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &bare, &filtered, &mut ConstrainCache::new()).is_err(),
             "a refined candidate is a different candidate"
         );
         assert!(
-            constrain_subtype(&filtered, &bare, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &filtered, &bare, &mut ConstrainCache::new()).is_err(),
             "in either direction"
         );
     }
@@ -4214,33 +4406,36 @@ mod tests {
     /// `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛`, and `0..𝑛 <: UInt`, hold structurally; the converses do not.
     #[test]
     fn a_range_is_below_uint_and_every_range_including_it() {
+        let solver = &mut Solver::new();
         let mut cache = ConstrainCache::new();
         let uint = prim(BaseType::UInt);
         let (narrow, wide) = (Type::UIntRange(3), Type::UIntRange(4));
-        assert!(constrain_subtype(&narrow, &uint, &mut cache).is_ok());
-        assert!(constrain_subtype(&uint, &narrow, &mut cache).is_err());
-        assert!(constrain_subtype(&narrow, &wide, &mut cache).is_ok());
-        assert!(constrain_subtype(&wide, &narrow, &mut cache).is_err());
+        assert!(constrain_subtype(solver, &narrow, &uint, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &uint, &narrow, &mut cache).is_err());
+        assert!(constrain_subtype(solver, &narrow, &wide, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &wide, &narrow, &mut cache).is_err());
     }
 
     /// A refined `UInt` is below `0..𝑛` exactly when the solver proves its refinements entail
     /// the bound, and a caller that skips the solver gets the structural mismatch.
     #[test]
     fn a_refined_uint_is_below_a_range_it_is_proven_inside() {
+        let solver = &mut Solver::new();
         let range = Type::UIntRange(3);
         let mut cache = ConstrainCache::new();
-        let proven = |lhs: &Type, cache: &mut ConstrainCache| {
-            constrain_subtype_in(lhs, &range, cache, &super::super::smt::NoScope)
+        let mut proven = |lhs: &Type, cache: &mut ConstrainCache| {
+            constrain_subtype_in(solver, lhs, &range, cache, &super::super::smt::NoScope)
         };
         assert!(proven(&uint_eq(1), &mut cache).is_ok());
         assert!(proven(&uint_eq(3), &mut cache).is_err());
-        assert!(constrain_subtype(&uint_eq(1), &range, &mut cache).is_err());
+        assert!(constrain_subtype(solver, &uint_eq(1), &range, &mut cache).is_err());
     }
 
     /// A refined range is below a narrower range exactly when the solver proves its
     /// refinements entail the narrower bound.
     #[test]
     fn a_refined_range_is_below_a_narrower_range_it_is_proven_inside() {
+        let solver = &mut Solver::new();
         let range = Type::UIntRange(3);
         let within = |n: i64| {
             let Type::Refinement(_, refinements) = uint_eq(n) else {
@@ -4249,8 +4444,8 @@ mod tests {
             Type::Refinement(Box::new(Type::UIntRange(9)), refinements)
         };
         let mut cache = ConstrainCache::new();
-        let proven = |lhs: &Type, cache: &mut ConstrainCache| {
-            constrain_subtype_in(lhs, &range, cache, &super::super::smt::NoScope)
+        let mut proven = |lhs: &Type, cache: &mut ConstrainCache| {
+            constrain_subtype_in(solver, lhs, &range, cache, &super::super::smt::NoScope)
         };
         assert!(proven(&within(1), &mut cache).is_ok());
         assert!(proven(&within(3), &mut cache).is_err());
@@ -4258,16 +4453,18 @@ mod tests {
 
     #[test]
     fn refined_superset_is_subtype() {
+        let solver = &mut Solver::new();
         // {Int | p, q} <: {Int | p}  — more refinements ⇒ subtype.
         let (p, q) = (1, 2);
         let lhs = refined(refined(prim(BaseType::Int), p), q);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &lhs, &rhs, &mut cache).is_ok());
     }
 
     #[test]
     fn refined_missing_refinement_is_not_subtype() {
+        let solver = &mut Solver::new();
         // {Int | q} </: {Int | p}  — a q-refined value cannot stand in for a
         // p-refined one. `refined` gives p and q structurally-distinct
         // predicates, so the refinements don't match.
@@ -4276,13 +4473,14 @@ mod tests {
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&lhs, &rhs, &mut cache),
+            constrain_subtype(solver, &lhs, &rhs, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn structurally_equal_predicate_matches_across_distinct_terms() {
+        let solver = &mut Solver::new();
         // {Int | p} <: {Int | q} when p and q carry *structurally identical*
         // predicates in distinct `Rc`s — exactly what join planning produces
         // by re-minting a refinement at each marker. Equality of the
@@ -4298,11 +4496,12 @@ mod tests {
         let lhs = mk();
         let rhs = mk();
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &lhs, &rhs, &mut cache).is_ok());
     }
 
     #[test]
     fn a_data_domain_relates_only_to_itself() {
+        let solver = &mut Solver::new();
         // A data domain is invariant (`design/type-inference.md`, "Data domains are
         // invariant"), so a data function relates to another only when the domains
         // are the same domain — pinned in all four directions, base and refinement.
@@ -4322,6 +4521,7 @@ mod tests {
         // Bare domain position: the plain lattice, drop-only.
         assert!(
             constrain_subtype(
+                solver,
                 &refined_dom(),
                 &Type::UIntRange(3),
                 &mut ConstrainCache::new()
@@ -4330,6 +4530,7 @@ mod tests {
         );
         assert!(
             constrain_subtype(
+                solver,
                 &Type::UIntRange(3),
                 &refined_dom(),
                 &mut ConstrainCache::new()
@@ -4340,13 +4541,13 @@ mod tests {
         // Behind a data function, neither refinement direction relates.
         assert!(
             matches!(
-                constrain_subtype(&bare, &refined, &mut ConstrainCache::new()),
+                constrain_subtype(solver, &bare, &refined, &mut ConstrainCache::new()),
                 Err(ConstrainError::DataDomainMismatch { .. })
             ),
             "a collection may not acquire a domain filter by subsumption"
         );
         assert!(
-            constrain_subtype(&refined, &bare, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &refined, &bare, &mut ConstrainCache::new()).is_err(),
             "nor drop one"
         );
 
@@ -4354,6 +4555,7 @@ mod tests {
         // invariance is about collections, not about refinements behind any function.
         assert!(
             constrain_subtype(
+                solver,
                 &fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &fun(refined_dom(), prim(BaseType::Int)),
                 &mut ConstrainCache::new()
@@ -4364,22 +4566,22 @@ mod tests {
 
         // Nor either base direction.
         assert!(
-            constrain_subtype(&bare, &wider, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &bare, &wider, &mut ConstrainCache::new()).is_err(),
             "a narrower range domain does not stand in for a wider one"
         );
         assert!(
-            constrain_subtype(&wider, &bare, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &wider, &bare, &mut ConstrainCache::new()).is_err(),
             "nor a wider one for a narrower — no contravariant widening of a data domain"
         );
 
         // The same domain does relate: invariance is equality, not a blanket
         // rejection of `Data`/`Data` edges.
         assert!(
-            constrain_subtype(&bare, &bare, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(solver, &bare, &bare, &mut ConstrainCache::new()).is_ok(),
             "a data function relates to itself"
         );
         assert!(
-            constrain_subtype(&refined, &refined, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(solver, &refined, &refined, &mut ConstrainCache::new()).is_ok(),
             "including through a domain refinement"
         );
     }
@@ -4431,27 +4633,29 @@ mod tests {
 
     #[test]
     fn refined_drops_to_base() {
+        let solver = &mut Solver::new();
         // {Int | p} <: Int  — dropping a refinement is widening.
         let p = 1;
         let lhs = refined(prim(BaseType::Int), p);
         let rhs = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &lhs, &rhs, &mut cache).is_ok());
     }
 
     #[test]
     fn refined_var_base_takes_a_guarded_bound() {
+        let solver = &mut Solver::new();
         // {?a | q} <: {Int | p}: the explicit layer supplies only q. The edge relates the bases,
         // `?a <: Int`, and is kept as written, a guarded bound `{?a | q} <: {Int | p}`. The
         // deficit {p} is not copied onto ?a, which would narrow its values outside q.
         let (p, q) = (1, 2);
-        let a = fresh_var(0);
+        let a = fresh_var(solver, 0);
         let lhs = refined(a.clone(), q);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &lhs, &rhs, &mut cache).is_ok());
         let Type::Infer(v) = &a else { unreachable!() };
-        let bounds = v.bounds.borrow();
+        let bounds = v.bounds(solver);
         let uppers: Vec<Type> = bounds.upper().iter().map(|u| u.ty.clone()).collect();
         assert_eq!(uppers, vec![prim(BaseType::Int)], "?a takes the base alone");
         let guarded: Vec<(Type, Type)> = bounds
@@ -4469,29 +4673,32 @@ mod tests {
 
     #[test]
     fn a_guarded_bound_checks_each_lower_bound_under_its_guard() {
+        let solver = &mut Solver::new();
         // {Int | p} <: ?a <: Int, then {?a | q} <: {Int | p}: the lower bound already carries p.
         // A later lower bound {Int | r} carries neither, so `{Int | r, q} <: {Int | p}` fails.
         let (p, q, r) = (1, 2, 3);
-        let a = fresh_var(0);
+        let a = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&refined(prim(BaseType::Int), p), &a, &mut cache).unwrap();
+        constrain_subtype(solver, &refined(prim(BaseType::Int), p), &a, &mut cache).unwrap();
         let rhs = refined(prim(BaseType::Int), p);
-        constrain_subtype(&refined(a.clone(), q), &rhs, &mut cache).unwrap();
+        constrain_subtype(solver, &refined(a.clone(), q), &rhs, &mut cache).unwrap();
         assert!(matches!(
-            constrain_subtype(&refined(prim(BaseType::Int), r), &a, &mut cache),
+            constrain_subtype(solver, &refined(prim(BaseType::Int), r), &a, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn a_guarded_bound_reaches_a_lower_bound_recorded_before_it() {
+        let solver = &mut Solver::new();
         // {Int | r} <: ?a first: recording {?a | q} <: {Int | p} checks it at once.
         let (p, q, r) = (1, 2, 3);
-        let a = fresh_var(0);
+        let a = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&refined(prim(BaseType::Int), r), &a, &mut cache).unwrap();
+        constrain_subtype(solver, &refined(prim(BaseType::Int), r), &a, &mut cache).unwrap();
         assert!(matches!(
             constrain_subtype(
+                solver,
                 &refined(a.clone(), q),
                 &refined(prim(BaseType::Int), p),
                 &mut cache
@@ -4502,26 +4709,29 @@ mod tests {
 
     #[test]
     fn a_guarded_bound_reaches_a_variable_below() {
+        let solver = &mut Solver::new();
         // ?b <: ?a, then {?a | q} <: {Int | p}: the guarded bound is recorded on ?b too, so a
         // lower bound reaching ?b is checked under the guard.
         let (p, q, r) = (1, 2, 3);
-        let (a, b) = (fresh_var(0), fresh_var(0));
+        let (a, b) = (fresh_var(solver, 0), fresh_var(solver, 0));
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&b, &a, &mut cache).unwrap();
+        constrain_subtype(solver, &b, &a, &mut cache).unwrap();
         constrain_subtype(
+            solver,
             &refined(a.clone(), q),
             &refined(prim(BaseType::Int), p),
             &mut cache,
         )
         .unwrap();
         assert!(matches!(
-            constrain_subtype(&refined(prim(BaseType::Int), r), &b, &mut cache),
+            constrain_subtype(solver, &refined(prim(BaseType::Int), r), &b, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn refined_concrete_base_still_rejects_deficit() {
+        let solver = &mut Solver::new();
         // {Int | q} </: {Int | p}: with a *concrete* base there is nothing to
         // absorb the deficit, so the strict rejection (`{T|q} ⊀ {T|p}`) is
         // preserved — only a variable base can acquire missing refinements.
@@ -4530,13 +4740,14 @@ mod tests {
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&lhs, &rhs, &mut cache),
+            constrain_subtype(solver, &lhs, &rhs, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn unrefined_does_not_flow_into_refined() {
+        let solver = &mut Solver::new();
         // Int </: {Int | p}  — a refinement is *required*, not one the
         // consumer silently applies. An unrefined value cannot stand in
         // where a refined one is demanded; acquiring the refinement is an
@@ -4546,50 +4757,55 @@ mod tests {
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&lhs, &rhs, &mut cache),
+            constrain_subtype(solver, &lhs, &rhs, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn constrain_identical_primitives_succeeds() {
+        let solver = &mut Solver::new();
         let a = prim(BaseType::Int);
         let b = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&a, &b, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &a, &b, &mut cache).is_ok());
     }
 
     #[test]
     fn constrain_distinct_primitives_fails() {
+        let solver = &mut Solver::new();
         let a = prim(BaseType::Int);
         let b = prim(BaseType::String);
         let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&a, &b, &mut cache),
+            constrain_subtype(solver, &a, &b, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn constrain_function_propagates_contravariance() {
+        let solver = &mut Solver::new();
         // (Int -> Int) <: (Int -> Int) — succeeds.
         let f1 = fun(prim(BaseType::Int), prim(BaseType::Int));
         let f2 = fun(prim(BaseType::Int), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&f1, &f2, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &f1, &f2, &mut cache).is_ok());
     }
 
     #[test]
     fn constrain_function_mismatch_on_codomain_fails() {
+        let solver = &mut Solver::new();
         // (Int -> Int) <: (Int -> String) — fails on codomain.
         let f1 = fun(prim(BaseType::Int), prim(BaseType::Int));
         let f2 = fun(prim(BaseType::Int), prim(BaseType::String));
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&f1, &f2, &mut cache).is_err());
+        assert!(constrain_subtype(solver, &f1, &f2, &mut cache).is_err());
     }
 
     #[test]
     fn constrain_record_width_subtyping_succeeds() {
+        let solver = &mut Solver::new();
         // {a: Int, b: Bool} <: {a: Int} — drop field b, OK.
         let lhs = record(&[
             (FieldKey::Name("a".into()), prim(BaseType::Int)),
@@ -4597,11 +4813,12 @@ mod tests {
         ]);
         let rhs = record(&[(FieldKey::Name("a".into()), prim(BaseType::Int))]);
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &lhs, &rhs, &mut cache).is_ok());
     }
 
     #[test]
     fn constrain_record_missing_field_fails() {
+        let solver = &mut Solver::new();
         // {a: Int} <: {a: Int, b: Bool} — lhs lacks field b.
         let lhs = record(&[(FieldKey::Name("a".into()), prim(BaseType::Int))]);
         let rhs = record(&[
@@ -4610,20 +4827,21 @@ mod tests {
         ]);
         let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&lhs, &rhs, &mut cache),
+            constrain_subtype(solver, &lhs, &rhs, &mut cache),
             Err(ConstrainError::MissingField { .. })
         ));
     }
 
     #[test]
     fn constrain_var_against_prim_records_upper_bound() {
+        let solver = &mut Solver::new();
         // α <: Int → α gains Int as an upper bound.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let p = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&v, &p, &mut cache).unwrap();
+        constrain_subtype(solver, &v, &p, &mut cache).unwrap();
         if let Type::Infer(state) = &v {
-            let s = state.bounds.borrow();
+            let s = state.bounds(solver);
             assert_eq!(s.upper().len(), 1);
             assert!(s.lower().is_empty());
         } else {
@@ -4633,13 +4851,14 @@ mod tests {
 
     #[test]
     fn constrain_prim_against_var_records_lower_bound() {
+        let solver = &mut Solver::new();
         // Int <: α → α gains Int as a lower bound.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let p = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&p, &v, &mut cache).unwrap();
+        constrain_subtype(solver, &p, &v, &mut cache).unwrap();
         if let Type::Infer(state) = &v {
-            let s = state.bounds.borrow();
+            let s = state.bounds(solver);
             assert!(s.upper().is_empty());
             assert_eq!(s.lower().len(), 1);
         } else {
@@ -4652,7 +4871,8 @@ mod tests {
     /// is one bound (`Subst::acting_on`).
     #[test]
     fn entries_that_cannot_act_on_a_variable_leave_one_bound() {
-        let v = fresh_var(0);
+        let solver = &mut Solver::new();
+        let v = fresh_var(solver, 0);
         let int = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
         let paths = [
@@ -4660,16 +4880,26 @@ mod tests {
             Subst::rename("x", "y"),
         ];
         for path in &paths {
-            constrain_go(&int, &v, &Subst::id(), path, &mut cache, &SkipSmtScope).unwrap();
+            constrain_go(
+                solver,
+                &int,
+                &v,
+                &Subst::id(),
+                path,
+                &mut cache,
+                &SkipSmtScope,
+            )
+            .unwrap();
         }
         let Type::Infer(state) = &v else {
             unreachable!("a fresh variable")
         };
-        assert_eq!(state.bounds.borrow().lower().len(), 1);
+        assert_eq!(state.bounds(solver).lower().len(), 1);
     }
 
     #[test]
     fn constrain_var_to_var_records_bound_without_immediate_propagation() {
+        let solver = &mut Solver::new();
         // Setup: α has upper Int. Then β <: α.
         //
         // Note: the solver's constrain_subtype rule, when both sides are
@@ -4678,15 +4908,15 @@ mod tests {
         // uppers are NOT eagerly transferred to β — that transitive
         // chain (β <: Int) is recovered at simplification time by
         // walking the bounds graph.
-        let alpha = fresh_var(0);
-        let beta = fresh_var(0);
+        let alpha = fresh_var(solver, 0);
+        let beta = fresh_var(solver, 0);
         let int_ty = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&alpha, &int_ty, &mut cache).unwrap();
-        constrain_subtype(&beta, &alpha, &mut cache).unwrap();
+        constrain_subtype(solver, &alpha, &int_ty, &mut cache).unwrap();
+        constrain_subtype(solver, &beta, &alpha, &mut cache).unwrap();
 
         if let Type::Infer(state) = &beta {
-            let s = state.bounds.borrow();
+            let s = state.bounds(solver);
             assert_eq!(s.upper().len(), 1);
             // The recorded upper bound is α itself, not Int.
             assert!(matches!(&s.upper()[0].ty, Type::Infer(_)));
@@ -4697,43 +4927,47 @@ mod tests {
 
     #[test]
     fn constrain_propagates_when_var_already_has_lower_bound() {
+        let solver = &mut Solver::new();
         // β has Int as a lower bound (e.g. Int has flowed in). Now
         // constrain_subtype β <: String. The propagation rule pushes the new
         // upper through β's existing lowers, raising Int <: String —
         // which fails as expected.
-        let beta = fresh_var(0);
+        let beta = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&prim(BaseType::Int), &beta, &mut cache).unwrap();
-        let result = constrain_subtype(&beta, &prim(BaseType::String), &mut cache);
+        constrain_subtype(solver, &prim(BaseType::Int), &beta, &mut cache).unwrap();
+        let result = constrain_subtype(solver, &beta, &prim(BaseType::String), &mut cache);
         assert!(matches!(result, Err(ConstrainError::Mismatch { .. })));
     }
 
     #[test]
     fn constrain_function_via_var_succeeds() {
+        let solver = &mut Solver::new();
         // λx. x typed as α -> α; constrain_subtype α -> α <: Int -> Int succeeds.
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let identity = fun(v.clone(), v.clone());
         let int_to_int = fun(prim(BaseType::Int), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
-        assert!(constrain_subtype(&identity, &int_to_int, &mut cache).is_ok());
+        assert!(constrain_subtype(solver, &identity, &int_to_int, &mut cache).is_ok());
     }
 
     /// `[A] <: [A, B]` — subtype's tag set is a subset of supertype's. Accept.
     #[test]
     fn variant_width_sub_accept() {
+        let solver = &mut Solver::new();
         let lhs = variant([("A", prim(BaseType::Int))]);
         let rhs = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&lhs, &rhs, &mut cache).expect("[A] <: [A, B] should hold");
+        constrain_subtype(solver, &lhs, &rhs, &mut cache).expect("[A] <: [A, B] should hold");
     }
 
     /// `[A, B] <: [A]` — supertype is missing a tag that lhs has. Reject.
     #[test]
     fn variant_width_sub_reject_missing_tag() {
+        let solver = &mut Solver::new();
         let lhs = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
         let rhs = variant([("A", prim(BaseType::Int))]);
         let mut cache = ConstrainCache::new();
-        let err = constrain_subtype(&lhs, &rhs, &mut cache)
+        let err = constrain_subtype(solver, &lhs, &rhs, &mut cache)
             .expect_err("[A, B] <: [A] should be rejected: B not in rhs");
         match err {
             ConstrainError::ExtraTag { tag, .. } => {
@@ -4747,15 +4981,16 @@ mod tests {
     /// `[A(Int)] <: [A(Str)]` fails on payload mismatch.
     #[test]
     fn variant_payload_covariance() {
+        let solver = &mut Solver::new();
         let lhs = variant([("A", prim(BaseType::Int))]);
         let rhs_ok = variant([("A", prim(BaseType::Int))]);
         let rhs_bad = variant([("A", prim(BaseType::String))]);
 
         let mut c = ConstrainCache::new();
-        constrain_subtype(&lhs, &rhs_ok, &mut c).expect("equal payloads accept");
+        constrain_subtype(solver, &lhs, &rhs_ok, &mut c).expect("equal payloads accept");
 
         let mut c = ConstrainCache::new();
-        constrain_subtype(&lhs, &rhs_bad, &mut c)
+        constrain_subtype(solver, &lhs, &rhs_bad, &mut c)
             .expect_err("Int payload should not flow into String payload");
     }
 
@@ -4763,22 +4998,24 @@ mod tests {
     /// subsequent lower-bound additions on lhs propagate against rhs.
     #[test]
     fn variant_var_lhs_propagation() {
-        let v = fresh_var(0);
+        let solver = &mut Solver::new();
+        let v = fresh_var(solver, 0);
         let upper = variant([("A", prim(BaseType::Int))]);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&v, &upper, &mut cache).unwrap();
+        constrain_subtype(solver, &v, &upper, &mut cache).unwrap();
         // The propagation rule recorded `upper` on v's upper bounds. A
         // subsequent `concrete <: v` adds concrete to lower and propagates
         // it against upper — concrete must satisfy `concrete <: upper`.
         let concrete_ok = variant([("A", prim(BaseType::Int))]);
-        constrain_subtype(&concrete_ok, &v, &mut cache).expect("[A(Int)] <: v <: [A(Int)] ok");
+        constrain_subtype(solver, &concrete_ok, &v, &mut cache)
+            .expect("[A(Int)] <: v <: [A(Int)] ok");
 
-        let v2 = fresh_var(0);
+        let v2 = fresh_var(solver, 0);
         let upper2 = variant([("A", prim(BaseType::Int))]);
         let mut cache2 = ConstrainCache::new();
-        constrain_subtype(&v2, &upper2, &mut cache2).unwrap();
+        constrain_subtype(solver, &v2, &upper2, &mut cache2).unwrap();
         let concrete_bad = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
-        constrain_subtype(&concrete_bad, &v2, &mut cache2)
+        constrain_subtype(solver, &concrete_bad, &v2, &mut cache2)
             .expect_err("[A, B] must not flow into v whose upper is [A]");
     }
 
@@ -4793,36 +5030,40 @@ mod tests {
 
     #[test]
     fn feed_meets_feed_invariantly() {
+        let solver = &mut Solver::new();
         // feed(D, a) <: feed(D, b) equates value and domain: a contribution
         // that later lands on b (the function-parameter side) must reach a (the
         // caller's argument) — and an incompatible read off a must then fail.
-        let a = fresh_var(0);
-        let b = fresh_var(0);
-        let d = fresh_var(0);
+        let a = fresh_var(solver, 0);
+        let b = fresh_var(solver, 0);
+        let d = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &feed_ty(d.clone(), a.clone()),
             &feed_ty(d.clone(), b.clone()),
             &mut cache,
         )
         .unwrap();
         // The callee feeds an Int into its parameter's value.
-        constrain_subtype(&prim(BaseType::Int), &b, &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::Int), &b, &mut cache).unwrap();
         // Reading the caller's value as a String must now fail: the Int
         // contribution flowed backwards through the invariant edge.
         assert!(matches!(
-            constrain_subtype(&a, &prim(BaseType::String), &mut cache),
+            constrain_subtype(solver, &a, &prim(BaseType::String), &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn a_feed_requires_an_explicit_value_read() {
+        let solver = &mut Solver::new();
         let d = Type::UIntRange(3);
         let reference = feed_ty(d.clone(), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
         assert!(
             constrain_subtype(
+                solver,
                 &reference,
                 &data_fun(d.clone(), prim(BaseType::Int)),
                 &mut cache
@@ -4832,18 +5073,20 @@ mod tests {
         let mut cache = ConstrainCache::new();
         assert!(
             constrain_subtype(
+                solver,
                 reference.read_value_type(),
                 &data_fun(d.clone(), prim(BaseType::Int)),
-                &mut cache
+                &mut cache,
             )
             .is_ok()
         );
         let mut cache = ConstrainCache::new();
         assert!(
             constrain_subtype(
+                solver,
                 reference.read_value_type(),
                 &data_fun(d, prim(BaseType::String)),
-                &mut cache
+                &mut cache,
             )
             .is_err()
         );
@@ -4851,6 +5094,7 @@ mod tests {
 
     #[test]
     fn plain_value_is_not_a_feed() {
+        let solver = &mut Solver::new();
         // Int </: feed(D, Int) and (D ⤇ Int) </: feed(D, Int) — a feed reads as its
         // collection, but a feed place cannot be conjured from a value, a
         // collection included.
@@ -4861,6 +5105,7 @@ mod tests {
             let mut cache = ConstrainCache::new();
             assert!(matches!(
                 constrain_subtype(
+                    solver,
                     &value,
                     &feed_ty(Type::UIntRange(3), prim(BaseType::Int)),
                     &mut cache
@@ -4872,39 +5117,54 @@ mod tests {
 
     #[test]
     fn a_reference_in_variable_bounds_does_not_implicitly_read() {
+        let solver = &mut Solver::new();
         let d = Type::UIntRange(3);
-        let x = fresh_var(0);
+        let x = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&feed_ty(d.clone(), prim(BaseType::Int)), &x, &mut cache).unwrap();
-        assert!(constrain_subtype(&x, &data_fun(d, prim(BaseType::Int)), &mut cache).is_err());
+        constrain_subtype(
+            solver,
+            &feed_ty(d.clone(), prim(BaseType::Int)),
+            &x,
+            &mut cache,
+        )
+        .unwrap();
+        assert!(
+            constrain_subtype(solver, &x, &data_fun(d, prim(BaseType::Int)), &mut cache).is_err()
+        );
     }
 
     #[test]
     fn feed_var_coalesces_to_feed() {
+        let solver = &mut Solver::new();
         // A var bounded by feed(D, Int) coalesces carrying the Feed
         // constructor (the `history_slot` survives compact → simplify →
         // coalesce). An `Overwrite` place type reaching a variable survives the same
         // way — the relation holds no rule that would collapse it to its value,
         // because a read derefs at the rule that emits it instead.
         use crate::ccl::infer::solver::simplify_type;
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let h = feed_ty(Type::UIntRange(3), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&h, &v, &mut cache).unwrap();
-        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        constrain_subtype(solver, &h, &v, &mut cache).unwrap();
+        let out = {
+            let c = simplify_type(compact_type(solver, &v));
+            coalesce_compact(solver, &c)
+        }
+        .unwrap();
         assert_eq!(out, h);
     }
 
     #[test]
     fn feed_payload_level_and_freshen() {
+        let solver = &mut Solver::new();
         // `type_level` sees through the value; freshening a quantified value
         // var mints a fresh one (freshening is polarity-free).
         use crate::ccl::infer::solver::{FreshenCache, FreshenLevel, freshen_above};
-        let v1 = fresh_var(1);
+        let v1 = fresh_var(solver, 1);
         let h = feed_ty(Type::UIntRange(3), v1.clone());
-        assert_eq!(type_level(&h), 1);
-        let inst = freshen_above(0, &h, FreshenLevel::At(0), &mut FreshenCache::new());
-        assert_eq!(type_level(&inst), 0);
+        assert_eq!(type_level(solver, &h), 1);
+        let inst = freshen_above(solver, 0, &h, FreshenLevel::At(0), &mut FreshenCache::new());
+        assert_eq!(type_level(solver, &inst), 0);
         let Some((_, value, _)) = inst.history_parts() else {
             panic!("freshen changed the constructor: {inst}");
         };
@@ -4919,6 +5179,7 @@ mod tests {
 
     #[test]
     fn barrier_var_extrudes_through_its_bounds() {
+        let solver = &mut Solver::new();
         // `constrain_go` records a bound on a barrier variable only when the other side
         // is not a bare variable, so the variables sit inside a structured type:
         // `Int ⇒ ?a@1 <: B <: ?b@1 ⇒ Int`. Extruding `B` positively to level 0 extrudes
@@ -4926,12 +5187,13 @@ mod tests {
         // into and `?b` (a domain, so negative) a proxy that flows into it. The copy `B'`
         // is linked to `B` by `B <: ?v@0 <: B'`, recorded on `B`'s uppers and `B'`'s
         // lowers.
-        let a = fresh_var(1);
-        let b = fresh_var(1);
+        let a = fresh_var(solver, 1);
+        let b = fresh_var(solver, 1);
         let (Type::Infer(a_var), Type::Infer(b_var)) = (&a, &b) else {
             unreachable!("fresh_var yields Type::Infer");
         };
         let barrier = BarrierVar::fresh(
+            solver,
             Rc::from(Vec::new()),
             vec![Bound::conc(fun(prim(BaseType::Int), a.clone()))],
             vec![BarrierUpper::unreported(Bound::conc(fun(
@@ -4939,8 +5201,9 @@ mod tests {
                 prim(BaseType::Int),
             )))],
         );
-        assert_eq!(barrier.level(), 1);
+        assert_eq!(barrier.level(solver), 1);
         let out = extrude(
+            solver,
             &Type::BarrierVar(Rc::clone(&barrier)),
             true,
             0,
@@ -4953,10 +5216,10 @@ mod tests {
             extruded.uid, barrier.uid,
             "extrusion mints a fresh barrier variable"
         );
-        assert_eq!(extruded.level(), 0);
-        assert_eq!(extruded.opaque, barrier.opaque);
-        let lows = extruded.lowers.borrow();
-        let ups = extruded.uppers.borrow();
+        assert_eq!(extruded.level(solver), 0);
+        assert_eq!(extruded.opaque(), barrier.opaque());
+        let lows = extruded.lowers(solver);
+        let ups = extruded.uppers(solver);
         assert_eq!((lows.len(), ups.len()), (2, 1));
 
         let Type::Infer(link) = &lows[1].ty else {
@@ -4965,11 +5228,10 @@ mod tests {
                 lows[1].ty
             );
         };
-        assert_eq!(link.level(), 0);
+        assert_eq!(link.level(solver), 0);
         assert!(
             barrier
-                .uppers
-                .borrow()
+                .uppers(solver)
                 .iter()
                 .any(|bd| bd.bound.ty == lows[1].ty),
             "`B` should flow into the link that flows into `B'`"
@@ -4982,12 +5244,11 @@ mod tests {
             panic!("the lower bound's codomain should be a proxy, got {codomain}");
         };
         assert_ne!(a_proxy.uid, a_var.uid);
-        assert_eq!(a_proxy.level(), 0);
+        assert_eq!(a_proxy.level(solver), 0);
         let a_proxy_ty = Type::Infer(Rc::clone(a_proxy));
         assert!(
             a_var
-                .bounds
-                .borrow()
+                .bounds(solver)
                 .upper()
                 .iter()
                 .any(|bd| bd.ty == a_proxy_ty),
@@ -5004,12 +5265,11 @@ mod tests {
             panic!("the upper bound's domain should be a proxy, got {domain}");
         };
         assert_ne!(b_proxy.uid, b_var.uid);
-        assert_eq!(b_proxy.level(), 0);
+        assert_eq!(b_proxy.level(solver), 0);
         let b_proxy_ty = Type::Infer(Rc::clone(b_proxy));
         assert!(
             b_var
-                .bounds
-                .borrow()
+                .bounds(solver)
                 .lower()
                 .iter()
                 .any(|bd| bd.ty == b_proxy_ty),
@@ -5019,18 +5279,20 @@ mod tests {
 
     #[test]
     fn barrier_var_extrudes_negatively_through_its_bounds() {
+        let solver = &mut Solver::new();
         // The negative mirror of `barrier_var_extrudes_through_its_bounds`:
         // `Int ⇒ ?a@1 <: B <: ?b@1 ⇒ Int`, extruded negatively to level 0. Each bound
         // extrudes negatively, so `?a` (a codomain, so negative) gets a proxy that flows
         // into it and `?b` (a domain, so positive) a proxy it flows into. The copy `B'`
         // is linked to `B` by `B' <: ?v@0 <: B`, recorded on `B'`'s uppers and `B`'s
         // lowers.
-        let a = fresh_var(1);
-        let b = fresh_var(1);
+        let a = fresh_var(solver, 1);
+        let b = fresh_var(solver, 1);
         let (Type::Infer(a_var), Type::Infer(b_var)) = (&a, &b) else {
             unreachable!("fresh_var yields Type::Infer");
         };
         let barrier = BarrierVar::fresh(
+            solver,
             Rc::from(Vec::new()),
             vec![Bound::conc(fun(prim(BaseType::Int), a.clone()))],
             vec![BarrierUpper::unreported(Bound::conc(fun(
@@ -5038,8 +5300,9 @@ mod tests {
                 prim(BaseType::Int),
             )))],
         );
-        assert_eq!(barrier.level(), 1);
+        assert_eq!(barrier.level(solver), 1);
         let out = extrude(
+            solver,
             &Type::BarrierVar(Rc::clone(&barrier)),
             false,
             0,
@@ -5052,10 +5315,10 @@ mod tests {
             extruded.uid, barrier.uid,
             "extrusion mints a fresh barrier variable"
         );
-        assert_eq!(extruded.level(), 0);
-        assert_eq!(extruded.opaque, barrier.opaque);
-        let lows = extruded.lowers.borrow();
-        let ups = extruded.uppers.borrow();
+        assert_eq!(extruded.level(solver), 0);
+        assert_eq!(extruded.opaque(), barrier.opaque());
+        let lows = extruded.lowers(solver);
+        let ups = extruded.uppers(solver);
         assert_eq!((lows.len(), ups.len()), (1, 2));
 
         let Type::Infer(link) = &ups[1].bound.ty else {
@@ -5064,19 +5327,17 @@ mod tests {
                 ups[1].bound.ty
             );
         };
-        assert_eq!(link.level(), 0);
+        assert_eq!(link.level(solver), 0);
         assert!(
             barrier
-                .lowers
-                .borrow()
+                .lowers(solver)
                 .iter()
                 .any(|bd| bd.ty == ups[1].bound.ty),
             "`B'` should flow into the link that flows into `B`"
         );
         assert!(
             !barrier
-                .uppers
-                .borrow()
+                .uppers(solver)
                 .iter()
                 .any(|bd| bd.bound.ty == ups[1].bound.ty),
             "a negative extrusion links `B` from below only"
@@ -5089,12 +5350,11 @@ mod tests {
             panic!("the lower bound's codomain should be a proxy, got {codomain}");
         };
         assert_ne!(a_proxy.uid, a_var.uid);
-        assert_eq!(a_proxy.level(), 0);
+        assert_eq!(a_proxy.level(solver), 0);
         let a_proxy_ty = Type::Infer(Rc::clone(a_proxy));
         assert!(
             a_var
-                .bounds
-                .borrow()
+                .bounds(solver)
                 .lower()
                 .iter()
                 .any(|bd| bd.ty == a_proxy_ty),
@@ -5111,12 +5371,11 @@ mod tests {
             panic!("the upper bound's domain should be a proxy, got {domain}");
         };
         assert_ne!(b_proxy.uid, b_var.uid);
-        assert_eq!(b_proxy.level(), 0);
+        assert_eq!(b_proxy.level(solver), 0);
         let b_proxy_ty = Type::Infer(Rc::clone(b_proxy));
         assert!(
             b_var
-                .bounds
-                .borrow()
+                .bounds(solver)
                 .upper()
                 .iter()
                 .any(|bd| bd.ty == b_proxy_ty),
@@ -5126,19 +5385,22 @@ mod tests {
 
     #[test]
     fn barrier_var_extrusion_carries_later_lower_bounds() {
+        let solver = &mut Solver::new();
         // `B` at level 1 extrudes positively to `B'` at level 0, which the outer scope
         // checks against `Int ⇒ Int`. A lower bound `Int ⇒ Bool` that reaches `B` after
         // the extrusion flows out through `B'` as one reaching an extruded `InferVar`
         // flows into its proxy, so the check fails.
         let arena = crate::ccl::infer::InferArena::new();
-        let a = fresh_var(1);
+        let a = fresh_var(solver, 1);
         let barrier = BarrierVar::fresh(
+            solver,
             Rc::from(Vec::new()),
             vec![Bound::conc(fun(prim(BaseType::Int), a))],
             Vec::new(),
         );
-        assert_eq!(barrier.level(), 1);
+        assert_eq!(barrier.level(solver), 1);
         let extruded = extrude(
+            solver,
             &Type::BarrierVar(Rc::clone(&barrier)),
             true,
             0,
@@ -5146,19 +5408,21 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &extruded,
             &fun(prim(BaseType::Int), prim(BaseType::Int)),
             &mut cache,
         )
         .expect("the extruded barrier variable takes the outer upper bound");
         constrain_subtype(
+            solver,
             &fun(prim(BaseType::Int), prim(BaseType::Bool)),
             &Type::BarrierVar(Rc::clone(&barrier)),
             &mut cache,
         )
         .expect("the original barrier variable takes the later lower bound");
 
-        let failures = crate::ccl::infer::solver::barrier::solve_barrier_vars();
+        let failures = crate::ccl::infer::solver::barrier::solve_barrier_vars(solver);
         assert!(
             !failures.is_empty(),
             "`Int ⇒ Bool` reached `{barrier:?}` after its extrusion to `{extruded}` and \
@@ -5169,6 +5433,7 @@ mod tests {
 
     #[test]
     fn barrier_var_negative_extrusion_carries_later_upper_bounds() {
+        let solver = &mut Solver::new();
         // `B` at level 1 extrudes negatively to `B'` at level 0, which the outer scope
         // gives the lower bound `Int ⇒ Bool`. An upper bound `Int ⇒ Int` that reaches `B`
         // after the extrusion meets that lower bound through `B' <: ?v <: B`, as one
@@ -5180,14 +5445,16 @@ mod tests {
         // resolution `Int ⇒ (Int ∨ Bool)` would not coalesce, which the barrier check
         // skips rather than reports.
         let arena = crate::ccl::infer::InferArena::new();
-        let b = fresh_var(1);
+        let b = fresh_var(solver, 1);
         let barrier = BarrierVar::fresh(
+            solver,
             Rc::from(Vec::new()),
             Vec::new(),
             vec![BarrierUpper::unreported(Bound::conc(b))],
         );
-        assert_eq!(barrier.level(), 1);
+        assert_eq!(barrier.level(solver), 1);
         let extruded = extrude(
+            solver,
             &Type::BarrierVar(Rc::clone(&barrier)),
             false,
             0,
@@ -5195,19 +5462,21 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &fun(prim(BaseType::Int), prim(BaseType::Bool)),
             &extruded,
             &mut cache,
         )
         .expect("the extruded barrier variable takes the outer lower bound");
         constrain_subtype(
+            solver,
             &Type::BarrierVar(Rc::clone(&barrier)),
             &fun(prim(BaseType::Int), prim(BaseType::Int)),
             &mut cache,
         )
         .expect("the original barrier variable takes the later upper bound");
 
-        let failures = crate::ccl::infer::solver::barrier::solve_barrier_vars();
+        let failures = crate::ccl::infer::solver::barrier::solve_barrier_vars(solver);
         assert!(
             !failures.is_empty()
                 && failures.iter().all(|f| matches!(
@@ -5222,24 +5491,25 @@ mod tests {
 
     #[test]
     fn feed_extrudes_with_two_way_proxy() {
+        let solver = &mut Solver::new();
         // Extruding feed(D, ?v@1) to level 0 must produce feed(D, ?proxy@0)
         // with the original linked to the proxy in BOTH directions — the
         // invariant value may neither lose writes (lower) nor reads (upper)
         // across the level boundary.
-        let v1 = fresh_var(1);
+        let v1 = fresh_var(solver, 1);
         let h = feed_ty(Type::UIntRange(3), v1.clone());
-        let out = extrude(&h, true, 0, &mut ExtrudeCache::new());
+        let out = extrude(solver, &h, true, 0, &mut ExtrudeCache::new());
         let Some((_, value, _)) = out.history_parts() else {
             panic!("extrude changed the constructor: {out}");
         };
         let Type::Infer(proxy) = value else {
             panic!("extruded value should be the proxy var, got {value}");
         };
-        assert_eq!(proxy.level(), 0);
+        assert_eq!(proxy.level(solver), 0);
         let Type::Infer(orig) = &v1 else {
             unreachable!("fresh_var yields Type::Infer");
         };
-        let bounds = orig.bounds.borrow();
+        let bounds = orig.bounds(solver);
         let proxy_ty = Type::Infer(Rc::clone(proxy));
         assert!(
             bounds.upper().iter().any(|b| b.ty == proxy_ty),
@@ -5253,6 +5523,7 @@ mod tests {
 
     #[test]
     fn invariant_extrude_upgrades_a_one_way_polar_cache_hit() {
+        let solver = &mut Solver::new();
         // The same variable appears in BOTH a polar position and an invariant
         // (`Feed` value) payload within one type. The structural walk extrudes
         // the polar occurrence first — minting a *one-way* proxy cached under
@@ -5260,7 +5531,7 @@ mod tests {
         // `extrude_invariant` hits the cache. The cached proxy must be upgraded
         // to link the original in BOTH directions; otherwise the invariant
         // payload silently loses one bound direction across the level boundary.
-        let v1 = fresh_var(1);
+        let v1 = fresh_var(solver, 1);
         let Type::Infer(orig) = &v1 else {
             unreachable!("fresh_var yields Type::Infer");
         };
@@ -5268,7 +5539,7 @@ mod tests {
         // value (invariant), so the one-way polar proxy lands in the cache
         // first and the `Feed` extrusion is the cache hit under test.
         let ty = Type::Tuple(vec![v1.clone(), feed_ty(Type::UIntRange(3), v1.clone())]);
-        let out = extrude(&ty, true, 0, &mut ExtrudeCache::new());
+        let out = extrude(solver, &ty, true, 0, &mut ExtrudeCache::new());
         let Type::Tuple(elems) = &out else {
             panic!("extrude changed the constructor: {out}");
         };
@@ -5292,7 +5563,7 @@ mod tests {
         );
         // Both bound directions must survive the cache hit.
         let proxy_ty = Type::Infer(Rc::clone(feed_proxy));
-        let bounds = orig.bounds.borrow();
+        let bounds = orig.bounds(solver);
         assert!(
             bounds.upper().iter().any(|b| b.ty == proxy_ty),
             "original is missing the upper (positive) link to its proxy"
@@ -5320,33 +5591,41 @@ mod tests {
 
     #[test]
     fn mut_meets_mut_invariantly() {
+        let solver = &mut Solver::new();
         // Mut(?v0,?d0) <: Mut(?v1,?d1) equates values AND domains (a borrow):
         // the callee's per-call domain resolves to the argument mutable variable's domain,
         // and the value is invariant (read + write). A value flowing into v1
         // reaches v0 through the two-way edge, so a conflicting read of v0 fails.
-        let (v0, d0, v1, d1) = (fresh_var(0), fresh_var(0), fresh_var(0), fresh_var(0));
+        let (v0, d0, v1, d1) = (
+            fresh_var(solver, 0),
+            fresh_var(solver, 0),
+            fresh_var(solver, 0),
+            fresh_var(solver, 0),
+        );
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &mut_ty(d0.clone(), v0.clone()),
             &mut_ty(d1.clone(), v1.clone()),
             &mut cache,
         )
         .unwrap();
-        constrain_subtype(&prim(BaseType::Int), &v1, &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::Int), &v1, &mut cache).unwrap();
         assert!(matches!(
-            constrain_subtype(&v0, &prim(BaseType::String), &mut cache),
+            constrain_subtype(solver, &v0, &prim(BaseType::String), &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
         // The domains equated too: a value pinned on d1 conflicts on d0.
-        constrain_subtype(&prim(BaseType::UInt), &d1, &mut cache).unwrap();
+        constrain_subtype(solver, &prim(BaseType::UInt), &d1, &mut cache).unwrap();
         assert!(matches!(
-            constrain_subtype(&d0, &prim(BaseType::String), &mut cache),
+            constrain_subtype(solver, &d0, &prim(BaseType::String), &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
 
     #[test]
     fn a_value_does_not_satisfy_a_mut_demand() {
+        let solver = &mut Solver::new();
         // `Int <: Mut(Int, D)` is **not** a subtyping fact, the mirror of
         // `Mut(V) <: V` not being one: a mutable variable is neither above nor below its
         // value, and a relation that coerces either way cannot tell a read from a
@@ -5356,7 +5635,7 @@ mod tests {
         let m = mut_ty(prim(BaseType::UInt), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
         assert!(matches!(
-            constrain_subtype(&prim(BaseType::Int), &m, &mut cache),
+            constrain_subtype(solver, &prim(BaseType::Int), &m, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
     }
@@ -5366,6 +5645,7 @@ mod tests {
     /// compiler minted the key.
     #[test]
     fn a_meet_over_a_codomain_binder_names_only_a_written_binder() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
         for (binder, what) in [
             (
@@ -5378,13 +5658,14 @@ mod tests {
                  related to a type that reads the key,",
             ),
         ] {
-            let value = Type::fun(prim(BaseType::Int), fresh_var(0));
-            let demand = Type::pi(
+            let value = Type::fun(prim(BaseType::Int), fresh_var(solver, 0));
+            let demand = Type::pi_in(
+                solver,
                 binder.clone(),
                 prim(BaseType::Int),
                 Type::refined_one(prim(BaseType::Int), gt_refinement(TypedExpr::var(binder))),
             );
-            let err = constrain_subtype(&value, &demand, &mut ConstrainCache::new())
+            let err = constrain_subtype(solver, &value, &demand, &mut ConstrainCache::new())
                 .expect_err("a meet over the binder");
             let ConstrainError::NotCompiledYet(got) = err else {
                 panic!("expected not compiled yet, got {err:?}")
@@ -5406,8 +5687,9 @@ mod tests {
         Refinement::born(Rc::new(pred))
     }
 
-    fn coalesce(ty: &Type) -> Type {
-        coalesce_compact(&compact_type(ty)).expect("coalesce")
+    fn coalesce(solver: &mut Solver, ty: &Type) -> Type {
+        let c = compact_type(solver, ty);
+        coalesce_compact(solver, &c).expect("coalesce")
     }
 
     /// The refinement predicate of a `Fun(Refinement(_, r), _)`, rendered.
@@ -5424,10 +5706,12 @@ mod tests {
     // renaming the codomain refinement's reference to the bound key.
     #[test]
     fn pi_correspondence_renames_codomain_refinement() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
         // The codomain stands under the expected function's binder `x`, which it names
         // once the correspondence lands.
         let result = Type::Infer(InferVar::fresh_in(
+            solver,
             0,
             &crate::ccl::infer_var::Telescope::empty().extended(Name::from("x")),
         ));
@@ -5436,7 +5720,8 @@ mod tests {
         };
 
         // g : (k: Int) ⇒ ({i | i > k} ⇒ Int)
-        let g_ty = Type::pi(
+        let g_ty = Type::pi_in(
+            solver,
             "k",
             prim(BaseType::Int),
             Type::fun(
@@ -5445,14 +5730,14 @@ mod tests {
             ),
         );
         // expected : (x: Int) ⇒ result
-        let expected = Type::pi("x", prim(BaseType::Int), result.clone());
+        let expected = Type::pi_in(solver, "x", prim(BaseType::Int), result.clone());
 
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&g_ty, &expected, &mut cache).expect("constrain");
+        constrain_subtype(solver, &g_ty, &expected, &mut cache).expect("constrain");
 
         // result coalesces to `{i | i > x} ⇒ Int` — k renamed to the expected
         // binder x by the derived correspondence.
-        let res = coalesce(&Type::Infer(Rc::clone(result_var)));
+        let res = coalesce(solver, &Type::Infer(Rc::clone(result_var)));
         assert_eq!(domain_predicate(&res), "__elem > x");
         drop(arena);
     }
@@ -5461,9 +5746,11 @@ mod tests {
     // dependent application `g(0)`.
     #[test]
     fn dependent_application_discharges_through_coalesce() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
         // Under `x`, as in [`pi_correspondence_renames_codomain_refinement`].
         let result = Type::Infer(InferVar::fresh_in(
+            solver,
             0,
             &crate::ccl::infer_var::Telescope::empty().extended(Name::from("x")),
         ));
@@ -5471,7 +5758,8 @@ mod tests {
             unreachable!()
         };
 
-        let g_ty = Type::pi(
+        let g_ty = Type::pi_in(
+            solver,
             "k",
             prim(BaseType::Int),
             Type::fun(
@@ -5479,26 +5767,24 @@ mod tests {
                 prim(BaseType::Int),
             ),
         );
-        let expected = Type::pi("x", prim(BaseType::Int), result.clone());
+        let expected = Type::pi_in(solver, "x", prim(BaseType::Int), result.clone());
         let mut cache = ConstrainCache::new();
-        constrain_subtype(&g_ty, &expected, &mut cache).expect("constrain");
+        constrain_subtype(solver, &g_ty, &expected, &mut cache).expect("constrain");
 
         // The application term γ: its type is `result` under the discharge
         // [x ↦ 0] (what emit_apply mints).
-        let gamma = fresh_var(0);
+        let gamma = fresh_var(solver, 0);
         let Type::Infer(gamma_var) = &gamma else {
             unreachable!()
         };
-        gamma_var
-            .bounds
-            .borrow_mut()
-            .lower_mut()
-            .push(Bound::with_subst(
-                Type::Infer(Rc::clone(result_var)),
-                Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
-            ));
+        let bound = Bound::with_subst(
+            solver,
+            Type::Infer(Rc::clone(result_var)),
+            Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
+        );
+        gamma_var.bounds_mut(solver).lower_mut().push(bound);
 
-        let app_ty = coalesce(&Type::Infer(Rc::clone(gamma_var)));
+        let app_ty = coalesce(solver, &Type::Infer(Rc::clone(gamma_var)));
         // g(0) : {i | i > 0} ⇒ Int — both the correspondence rename and the
         // discharge fired, composed along the coalesce walk.
         assert_eq!(domain_predicate(&app_ty), "__elem > 0");
@@ -5507,8 +5793,9 @@ mod tests {
 
     /// `g : (k: Int) ⇒ ({i | i > k} ⇒ Int)`, shared by the dependent-edge
     /// order tests below.
-    fn dependent_g_ty() -> Type {
-        Type::pi(
+    fn dependent_g_ty(solver: &mut Solver) -> Type {
+        Type::pi_in(
+            solver,
             "k",
             prim(BaseType::Int),
             Type::fun(
@@ -5530,46 +5817,50 @@ mod tests {
     // `i > 0`.
     #[test]
     fn dependent_discharge_survives_opaque_constraint_order() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
         // The codomain stands under `x`, so it is minted where `x` is in scope.
         let result = Type::Infer(InferVar::fresh_in(
+            solver,
             0,
             &crate::ccl::infer_var::Telescope::empty().extended(Name::from("x")),
         ));
         let Type::Infer(result_var) = &result else {
             unreachable!()
         };
-        let expected = Type::pi("x", prim(BaseType::Int), result.clone());
+        let expected = Type::pi_in(solver, "x", prim(BaseType::Int), result.clone());
         let mut cache = ConstrainCache::new();
 
         // g(0): the application's type is `result` under [x ↦ 0].
-        let gamma = fresh_var(0);
+        let gamma = fresh_var(solver, 0);
         let Type::Infer(gamma_var) = &gamma else {
             unreachable!()
         };
-        gamma_var
-            .bounds
-            .borrow_mut()
-            .lower_mut()
-            .push(Bound::with_subst(
-                Type::Infer(Rc::clone(result_var)),
-                Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
-            ));
+        let bound = Bound::with_subst(
+            solver,
+            Type::Infer(Rc::clone(result_var)),
+            Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
+        );
+        gamma_var.bounds_mut(solver).lower_mut().push(bound);
 
         // The consumer edge first: g(0) flows into an argument slot.
-        let consumer = fresh_var(0);
+        let consumer = fresh_var(solver, 0);
         let Type::Infer(consumer_var) = &consumer else {
             unreachable!()
         };
-        constrain_subtype(&gamma, &consumer, &mut cache).expect("g(0) <: consumer");
+        constrain_subtype(solver, &gamma, &consumer, &mut cache).expect("g(0) <: consumer");
 
         // The function's concrete type arrives last (opaque order).
-        constrain_subtype(&dependent_g_ty(), &expected, &mut cache).expect("g <: expected");
+        {
+            let g_ty = dependent_g_ty(solver);
+            constrain_subtype(solver, &g_ty, &expected, &mut cache)
+        }
+        .expect("g <: expected");
 
         // Both materializations must show the discharged predicate.
-        let app_ty = coalesce(&Type::Infer(Rc::clone(gamma_var)));
+        let app_ty = coalesce(solver, &Type::Infer(Rc::clone(gamma_var)));
         assert_eq!(domain_predicate(&app_ty), "__elem > 0", "result node");
-        let consumer_ty = coalesce(&Type::Infer(Rc::clone(consumer_var)));
+        let consumer_ty = coalesce(solver, &Type::Infer(Rc::clone(consumer_var)));
         assert_eq!(
             domain_predicate(&consumer_ty),
             "__elem > 0",
@@ -5584,35 +5875,39 @@ mod tests {
     // swallows the second edge; V must receive both discharged copies.
     #[test]
     fn distinct_discharges_of_one_codomain_both_recorded() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
-        let g_ty = dependent_g_ty();
+        let g_ty = dependent_g_ty(solver);
         let mut cache = ConstrainCache::new();
-        let v = fresh_var(0);
+        let v = fresh_var(solver, 0);
         let Type::Infer(vv) = &v else { unreachable!() };
 
         for lit in [0i64, 1] {
             // The codomain stands under `k`, so it is minted where `k` is in scope.
             let r = Type::Infer(InferVar::fresh_in(
+                solver,
                 0,
                 &crate::ccl::infer_var::Telescope::empty().extended(Name::from("k")),
             ));
-            let expected = Type::pi("k", prim(BaseType::Int), r.clone());
-            constrain_subtype(&g_ty, &expected, &mut cache).expect("g <: expected");
-            let app = fresh_var(0);
+            let expected = Type::pi_in(solver, "k", prim(BaseType::Int), r.clone());
+            constrain_subtype(solver, &g_ty, &expected, &mut cache).expect("g <: expected");
+            let app = fresh_var(solver, 0);
             let Type::Infer(av) = &app else {
                 unreachable!()
             };
-            av.bounds.borrow_mut().lower_mut().push(Bound::with_subst(
+            let bound = Bound::with_subst(
+                solver,
                 r.clone(),
                 Subst::discharge("k", TypedExpr::lit(Lit::Int(lit))),
-            ));
-            constrain_subtype(&app, &v, &mut cache).expect("app <: V");
+            );
+            av.bounds_mut(solver).lower_mut().push(bound);
+            constrain_subtype(solver, &app, &v, &mut cache).expect("app <: V");
         }
 
-        let lows = Rc::clone(vv.bounds.borrow().lower());
+        let lows = Rc::clone(vv.bounds(solver).lower());
         let rendered: Vec<String> = lows
             .iter()
-            .map(|b| format!("{}", b.materialize()))
+            .map(|b| format!("{}", b.materialize(solver)))
             .collect();
         assert_eq!(
             lows.len(),
@@ -5631,12 +5926,13 @@ mod tests {
     // recognizes the captures as the same written term.
     #[test]
     fn bridge_unifies_same_fiber_captures_with_distinct_ty_slots() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
         // Non-var capture (`y + 1`) so neither side is rename-shaped; fresh
         // slot per capture, as emission would mint.
-        let capture = || {
+        let mut capture = || {
             let mut y = TypedExpr::var("y");
-            y.ty = fresh_var(0);
+            y.ty = fresh_var(solver, 0);
             TypedExpr::binop(
                 y,
                 BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
@@ -5647,7 +5943,7 @@ mod tests {
         let hi = Subst::discharge("k", capture());
         assert_ne!(lo, hi, "premise: strict equality misses (distinct slots)");
 
-        let (tau_l, tau_u) = bridge_holder_gap(&lo, &hi, None).expect("one fiber bridges");
+        let (tau_l, tau_u) = bridge_holder_gap(solver, &lo, &hi, None).expect("one fiber bridges");
         assert!(
             tau_l.is_id() && tau_u.is_id(),
             "same-written captures must bridge as the same fiber"
@@ -5662,10 +5958,11 @@ mod tests {
     // bridge from conflating genuinely different fibers).
     #[test]
     fn eq_modulo_ty_slots_ignores_slots_but_not_structure() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
-        let capture = |name: &str, lit: i64| {
+        let mut capture = |name: &str, lit: i64| {
             let mut v = TypedExpr::var(name);
-            v.ty = fresh_var(0);
+            v.ty = fresh_var(solver, 0);
             Subst::discharge(
                 "k",
                 TypedExpr::binop(
@@ -5683,10 +5980,10 @@ mod tests {
         assert!(!capture("y", 1).eq_modulo_ty_slots(&capture("z", 1)));
         // Binder slots are blind too: identical lambda captures whose param
         // slots differ compare equal.
-        let lam = || {
+        let mut lam = || {
             let mut l = TypedExpr::lambda("w", Occurrence::mint(), Type::Hole, TypedExpr::var("w"));
             if let TypedExprNode::Lambda { params, .. } = &mut l.node {
-                params[0].ty = fresh_var(0);
+                params[0].ty = fresh_var(solver, 0);
             }
             Subst::discharge("k", l)
         };
@@ -5717,15 +6014,16 @@ mod tests {
     /// covariant edge on the bounds.
     #[test]
     fn a_map_orders_by_its_key_bound() {
+        let solver = &mut Solver::new();
         let string = || prim(BaseType::String);
         let narrow = Type::map_of(refined(prim(BaseType::Int), 7), string());
         let wide = Type::map_of(prim(BaseType::Int), string());
         assert!(
-            constrain_subtype(&narrow, &wide, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(solver, &narrow, &wide, &mut ConstrainCache::new()).is_ok(),
             "a map keyed by a refined Int satisfies a demand for one keyed by Int"
         );
         assert!(
-            constrain_subtype(&wide, &narrow, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &wide, &narrow, &mut ConstrainCache::new()).is_err(),
             "and not conversely"
         );
     }
@@ -5741,19 +6039,20 @@ mod tests {
     /// domains at once and nothing would flow into it.
     #[test]
     fn a_map_key_is_inferred_from_the_domains_that_reach_it() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
-        let key = fresh_var(0);
+        let key = fresh_var(solver, 0);
         let Type::Infer(kv) = key.clone() else {
             unreachable!("fresh_var is an inference variable")
         };
         let joined = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
         let demand = Type::map_of(key, prim(BaseType::Int));
-        constrain_subtype(&joined, &demand, &mut ConstrainCache::new())
+        constrain_subtype(solver, &joined, &demand, &mut ConstrainCache::new())
             .expect("named domains lie below a bound nothing has fixed");
-        let lows = Rc::clone(kv.bounds.borrow().lower());
+        let lows = Rc::clone(kv.bounds(solver).lower());
         let rendered: Vec<String> = lows
             .iter()
-            .map(|b| format!("{}", b.materialize()))
+            .map(|b| format!("{}", b.materialize(solver)))
             .collect();
         assert_eq!(
             rendered,
@@ -5768,9 +6067,10 @@ mod tests {
     /// collection over an enumerable set of keys.
     #[test]
     fn a_map_kind_is_contained_in_no_candidate_set() {
+        let solver = &mut Solver::new();
         let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
         let named = conditional(vec![Type::UIntRange(2)]);
-        assert!(constrain_subtype(&map, &named, &mut ConstrainCache::new()).is_err());
+        assert!(constrain_subtype(solver, &map, &named, &mut ConstrainCache::new()).is_err());
     }
 
     /// **Candidates lie below a kind that admits every one of them.** The premise is set
@@ -5779,6 +6079,7 @@ mod tests {
     /// other here: a `Map` lies below `Collection`, and `Collection` below no `Map`.
     #[test]
     fn candidates_lie_below_a_kind_that_admits_them() {
+        let solver = &mut Solver::new();
         let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
         let ranges = sum(TypeKind::UIntRanges);
         let named = sum(TypeKind::Enumerated(vec![
@@ -5790,22 +6091,22 @@ mod tests {
         let key_bound = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
 
         assert!(
-            constrain_subtype(&named, &ranges, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(solver, &named, &ranges, &mut ConstrainCache::new()).is_ok(),
             "every candidate is a range"
         );
         assert!(
-            constrain_subtype(&filtered, &ranges, &mut ConstrainCache::new()).is_err(),
+            constrain_subtype(solver, &filtered, &ranges, &mut ConstrainCache::new()).is_err(),
             "a refined range is not a range, so a filtered collection is not a `List`"
         );
         for k in [&named, &ranges, &universe, &key_bound] {
             assert!(
-                constrain_subtype(k, &universe, &mut ConstrainCache::new()).is_ok(),
+                constrain_subtype(solver, k, &universe, &mut ConstrainCache::new()).is_ok(),
                 "{k} <: ⊤"
             );
         }
         for narrower in [&ranges, &key_bound] {
             assert!(
-                constrain_subtype(&universe, narrower, &mut ConstrainCache::new()).is_err(),
+                constrain_subtype(solver, &universe, narrower, &mut ConstrainCache::new()).is_err(),
                 "⊤ is below nothing narrower, and {narrower} is narrower"
             );
         }
@@ -5817,20 +6118,22 @@ mod tests {
     /// uses can supply (`test_kinding_constraint_survives_instantiation`).
     #[test]
     fn an_unresolved_candidate_takes_the_kinding_edge() {
+        let solver = &mut Solver::new();
         let arena = crate::ccl::infer::InferArena::new();
         let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
-        let d = fresh_var(0);
+        let d = fresh_var(solver, 0);
         let Type::Infer(v) = d.clone() else {
             unreachable!("fresh_var is an inference variable")
         };
         constrain_subtype(
+            solver,
             &sum(TypeKind::Enumerated(vec![d])),
             &sum(TypeKind::UIntRanges),
             &mut ConstrainCache::new(),
         )
         .expect("an unresolved candidate defers rather than rejecting");
         assert_eq!(
-            v.bounds.borrow().type_kinds,
+            v.bounds(solver).type_kinds,
             vec![TypeKind::UIntRanges],
             "the demand rides the candidate until it resolves"
         );
@@ -5839,6 +6142,7 @@ mod tests {
 
     #[test]
     fn conditional_is_subtype_by_candidate_subset() {
+        let solver = &mut Solver::new();
         // A conditional collection is a Sigma over candidate domains;
         // the kind premise is by-value subset — every lhs candidate domain
         // appears among the rhs candidates. The reverse (rhs has an extra
@@ -5849,23 +6153,27 @@ mod tests {
             Type::UIntRange(3),
             Type::UIntRange(4),
         ]);
-        assert!(constrain_subtype(&sub, &sup, &mut ConstrainCache::new()).is_ok());
-        assert!(constrain_subtype(&sup, &sub, &mut ConstrainCache::new()).is_err());
+        assert!(constrain_subtype(solver, &sub, &sup, &mut ConstrainCache::new()).is_ok());
+        assert!(constrain_subtype(solver, &sup, &sub, &mut ConstrainCache::new()).is_err());
     }
 
     #[test]
     fn conditional_consumed_as_fun() {
+        let solver = &mut Solver::new();
         // A conditional collection reaching a consumer pins the consumer's kind
         // variable; a *fresh* domain var accumulates the witness (the `sum` /
         // comprehension case).
         let cond = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
-        let consumer = Type::consumer_fun(fresh_var(0), prim(BaseType::Int));
-        assert!(constrain_subtype(&cond, &consumer, &mut ConstrainCache::new()).is_ok());
+        let consumer = {
+            let fresh = fresh_var(solver, 0);
+            Type::consumer_fun(solver, fresh, prim(BaseType::Int))
+        };
+        assert!(constrain_subtype(solver, &cond, &consumer, &mut ConstrainCache::new()).is_ok());
         // A consumer demanding a *concrete narrower* domain fails: the concrete type
         // meets the witness at every candidate, and `0..3` is not `0..2` — the
         // conditional collection never silently narrows to a single domain.
-        let narrow = Type::consumer_fun(Type::UIntRange(2), prim(BaseType::Int));
-        assert!(constrain_subtype(&cond, &narrow, &mut ConstrainCache::new()).is_err());
+        let narrow = Type::consumer_fun(solver, Type::UIntRange(2), prim(BaseType::Int));
+        assert!(constrain_subtype(solver, &cond, &narrow, &mut ConstrainCache::new()).is_err());
     }
 
     // --- `UIntRanges`-kind Sigma rules (List): consumption, subtyping ---
@@ -5881,14 +6189,19 @@ mod tests {
     /// the suite says why.
     #[test]
     fn a_kind_naming_no_candidates_pins_a_consumer() {
+        let solver = &mut Solver::new();
         let int = prim(BaseType::Int);
         for kind in [TypeKind::UIntRanges, TypeKind::Type] {
             let collection = Type::sum_over(kind.clone(), None, int.clone());
             // A consumer with a fresh domain variable: the common case (`sum`, a
             // comprehension). Its domain accumulates the witness.
-            let consumer = Type::consumer_fun(fresh_var(0), int.clone());
+            let consumer = {
+                let fresh = fresh_var(solver, 0);
+                Type::consumer_fun(solver, fresh, int.clone())
+            };
             assert!(
-                constrain_subtype(&collection, &consumer, &mut ConstrainCache::new()).is_ok(),
+                constrain_subtype(solver, &collection, &consumer, &mut ConstrainCache::new())
+                    .is_ok(),
                 "a {kind} collection must be consumable: {collection}"
             );
         }
@@ -5900,6 +6213,7 @@ mod tests {
     /// `List`-annotated parameter depends on.
     #[test]
     fn a_boxed_collection_is_below_a_list_annotation() {
+        let solver = &mut Solver::new();
         let int = prim(BaseType::Int);
         let boxed = Type::sum_over(
             TypeKind::Enumerated(vec![Type::UIntRange(2)]),
@@ -5908,7 +6222,7 @@ mod tests {
         );
         let list = Type::list_of(int);
         assert!(
-            constrain_subtype(&boxed, &list, &mut ConstrainCache::new()).is_ok(),
+            constrain_subtype(solver, &boxed, &list, &mut ConstrainCache::new()).is_ok(),
             "box(xs) must reach List(V) by the Σ rule"
         );
     }
@@ -5921,6 +6235,7 @@ mod tests {
 
     #[test]
     fn kind_data_where_compute_is_rejected() {
+        let solver = &mut Solver::new();
         // `Data ⋠ Compute`: there is no upcast from a collection to a
         // compute function. A collection's domain is invariant — it *is* the data — so
         // re-viewing it as a compute function, whose domain is contravariant, is not a
@@ -5929,6 +6244,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         assert!(matches!(
             constrain_subtype(
+                solver,
                 &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &mut cache,
@@ -5939,11 +6255,13 @@ mod tests {
 
     #[test]
     fn kind_compute_where_data_is_rejected() {
+        let solver = &mut Solver::new();
         // `Compute ⋠ Data`: a compute function supplied where a collection is demanded is
         // the rejection (the silent-row-loss guard). `0..3 ⇒ Int ⊀ 0..3 ⤇ Int`.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
             constrain_subtype(
+                solver,
                 &fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
                 &mut cache,
@@ -5966,33 +6284,36 @@ mod tests {
 
     #[test]
     fn a_var_var_kind_edge_makes_each_side_read_the_other_s_pin() {
+        let solver = &mut Solver::new();
         // The edge relates the two kinds, so a pin either side carries is a pin
         // both read — whichever side it was recorded on.
-        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
         let mut cache = ConstrainCache::new();
         // Pin `a` to compute, leaving `b` unpinned.
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &fun_at(FunKind::Compute),
             &mut cache,
         )
         .expect("a var meeting Compute records the pin");
-        assert_eq!(a.resolved(), KindPin::Compute);
-        assert_eq!(b.resolved(), KindPin::Unpinned);
+        assert_eq!(a.resolved_in(solver), KindPin::Compute);
+        assert_eq!(b.resolved_in(solver), KindPin::Unpinned);
 
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&b))),
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &mut cache,
         )
         .expect("a var-var kind edge is never a rejection");
         assert_eq!(
-            b.resolved(),
+            b.resolved_in(solver),
             KindPin::Compute,
             "the unpinned side reads the other's pin"
         );
         assert_eq!(
-            a.resolved(),
+            a.resolved_in(solver),
             KindPin::Compute,
             "and the pinned side is unchanged"
         );
@@ -6003,19 +6324,22 @@ mod tests {
     /// component ever acquired rather than the ones present when the edge landed.
     #[test]
     fn a_pin_arriving_after_a_var_var_kind_edge_still_crosses_it() {
-        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let solver = &mut Solver::new();
+        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
         // The edge first, both sides unpinned — nothing to carry.
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &fun_at(FunKind::Var(Rc::clone(&b))),
             &mut ConstrainCache::new(),
         )
         .expect("a var-var kind edge is never a rejection");
-        assert_eq!(a.resolved(), KindPin::Unpinned);
-        assert_eq!(b.resolved(), KindPin::Unpinned);
+        assert_eq!(a.resolved_in(solver), KindPin::Unpinned);
+        assert_eq!(b.resolved_in(solver), KindPin::Unpinned);
 
         // Then a concrete kind reaches `a` only.
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &fun_at(FunKind::Data(None)),
             &mut ConstrainCache::new(),
@@ -6023,9 +6347,9 @@ mod tests {
         .expect("a var meeting Data records the pin");
         // `Data(None)` is a *plain* collection, one of the three concrete kinds — the pin
         // records which, not merely that it is not a compute function.
-        assert_eq!(a.resolved(), KindPin::Plain);
+        assert_eq!(a.resolved_in(solver), KindPin::Plain);
         assert_eq!(
-            b.resolved(),
+            b.resolved_in(solver),
             KindPin::Plain,
             "the far side of the edge reads a pin that arrived after it"
         );
@@ -6035,13 +6359,15 @@ mod tests {
     /// component and not just one edge's far end.
     #[test]
     fn a_pin_crosses_a_chain_of_var_var_kind_edges() {
+        let solver = &mut Solver::new();
         let (a, b, c) = (
-            FunKindVar::fresh(),
-            FunKindVar::fresh(),
-            FunKindVar::fresh(),
+            FunKindVar::fresh(solver),
+            FunKindVar::fresh(solver),
+            FunKindVar::fresh(solver),
         );
         for (x, y) in [(&a, &b), (&b, &c)] {
             constrain_subtype(
+                solver,
                 &fun_at(FunKind::Var(Rc::clone(x))),
                 &fun_at(FunKind::Var(Rc::clone(y))),
                 &mut ConstrainCache::new(),
@@ -6049,18 +6375,19 @@ mod tests {
             .expect("a var-var kind edge is never a rejection");
         }
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &fun_at(FunKind::Data(None)),
             &mut ConstrainCache::new(),
         )
         .unwrap();
         assert_eq!(
-            c.resolved(),
+            c.resolved_in(solver),
             KindPin::Plain,
             "two edges away, and still one answer"
         );
-        assert_eq!(b.resolved(), KindPin::Plain);
-        assert_eq!(a.resolved(), KindPin::Plain);
+        assert_eq!(b.resolved_in(solver), KindPin::Plain);
+        assert_eq!(a.resolved_in(solver), KindPin::Plain);
     }
 
     /// **A plain collection and a sum do not merge.** Neither is below the other, so one
@@ -6068,24 +6395,31 @@ mod tests {
     /// compute function meeting a collection is, and read at the same place.
     #[test]
     fn a_plain_collection_and_a_sum_do_not_merge() {
-        let v = FunKindVar::fresh();
+        let solver = &mut Solver::new();
+        let v = FunKindVar::fresh(solver);
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Data(None)),
             &fun_at(FunKind::Var(Rc::clone(&v))),
             &mut cache,
         )
         .expect("a plain collection pins the var plain");
-        assert_eq!(v.resolved(), KindPin::Plain);
+        assert_eq!(v.resolved_in(solver), KindPin::Plain);
 
         let sum = Type::sum_over(
             TypeKind::Enumerated(vec![Type::UIntRange(3)]),
             None,
             prim(BaseType::Int),
         );
-        let _ = constrain_subtype(&sum, &fun_at(FunKind::Var(Rc::clone(&v))), &mut cache);
+        let _ = constrain_subtype(
+            solver,
+            &sum,
+            &fun_at(FunKind::Var(Rc::clone(&v))),
+            &mut cache,
+        );
         assert_eq!(
-            v.resolved(),
+            v.resolved_in(solver),
             KindPin::Conflict,
             "a sum reaching a variable already pinned to a plain collection is the conflict"
         );
@@ -6095,17 +6429,20 @@ mod tests {
     /// read from every member — the pins are joined, never arbitrated.
     #[test]
     fn a_var_var_kind_edge_between_disagreeing_pins_conflicts_from_either_end() {
+        let solver = &mut Solver::new();
         // The pin crosses the edge, so the *second* concrete kind meets a component that
         // already holds the first — and a concrete kind settles the variable it meets, so
         // the contradiction is reported at that edge rather than carried to coalesce.
-        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &fun_at(FunKind::Var(Rc::clone(&b))),
             &mut ConstrainCache::new(),
         )
         .expect("a var-var kind edge is never a rejection");
         constrain_subtype(
+            solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
             &fun_at(FunKind::Compute),
             &mut ConstrainCache::new(),
@@ -6114,6 +6451,7 @@ mod tests {
         assert!(
             matches!(
                 constrain_subtype(
+                    solver,
                     &fun_at(FunKind::Var(Rc::clone(&b))),
                     &fun_at(FunKind::Data(None)),
                     &mut ConstrainCache::new(),
@@ -6122,26 +6460,29 @@ mod tests {
             ),
             "a collection demanded of a component pinned compute, read from the far end"
         );
-        assert_eq!(a.resolved(), KindPin::Conflict);
-        assert_eq!(b.resolved(), KindPin::Conflict);
+        assert_eq!(a.resolved_in(solver), KindPin::Conflict);
+        assert_eq!(b.resolved_in(solver), KindPin::Conflict);
     }
 
     #[test]
     fn a_var_var_kind_edge_between_disagreeing_pins_is_a_conflict() {
+        let solver = &mut Solver::new();
         // Absorption, not arbitration: holding both points is `Conflict`, exactly as on a
         // concrete edge — and it is the edge that *completes* the conflict that reports it,
         // whichever kind of edge that is. A variable between the two ends hides nothing:
         // `resolved` folds the whole component.
         let fun_over = fun_at;
-        let (a, b) = (FunKindVar::fresh(), FunKindVar::fresh());
+        let (a, b) = (FunKindVar::fresh(solver), FunKindVar::fresh(solver));
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &fun_over(FunKind::Var(Rc::clone(&a))),
             &fun_over(FunKind::Compute),
             &mut cache,
         )
         .unwrap();
         constrain_subtype(
+            solver,
             &fun_over(FunKind::Var(Rc::clone(&b))),
             &fun_over(FunKind::Data(None)),
             &mut cache,
@@ -6150,6 +6491,7 @@ mod tests {
         assert!(
             matches!(
                 constrain_subtype(
+                    solver,
                     &fun_over(FunKind::Var(Rc::clone(&a))),
                     &fun_over(FunKind::Var(Rc::clone(&b))),
                     &mut cache,
@@ -6159,16 +6501,17 @@ mod tests {
             "relating a compute-pinned kind to a data-pinned one is the same rejection a \
              concrete pair is"
         );
-        assert_eq!(a.resolved(), KindPin::Conflict);
-        assert_eq!(b.resolved(), KindPin::Conflict);
+        assert_eq!(a.resolved_in(solver), KindPin::Conflict);
+        assert_eq!(b.resolved_in(solver), KindPin::Conflict);
     }
 
     #[test]
     fn kind_var_demanded_as_data_is_pinned_data() {
+        let solver = &mut Solver::new();
         // A kind var meeting `Data` is *pinned* to it, never an eager rejection,
         // and resolves at coalesce. A compute function meeting the same var would
         // pin it the other way, and holding both points is `KindPin::Conflict`.
-        let v = FunKindVar::fresh();
+        let v = FunKindVar::fresh(solver);
         let var_fun = Type::Fun {
             binder: FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&v)),
@@ -6178,13 +6521,14 @@ mod tests {
         };
         let mut cache = ConstrainCache::new();
         constrain_subtype(
+            solver,
             &var_fun,
             &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
             &mut cache,
         )
         .expect("a var meeting Data records the pin, never an eager rejection");
         assert_eq!(
-            v.resolved(),
+            v.resolved_in(solver),
             KindPin::Plain,
             "pinned to a plain collection, and no compute function met this var"
         );

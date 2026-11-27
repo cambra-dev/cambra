@@ -6,7 +6,7 @@ use crate::ccl::BaseType;
 use crate::interpreter::{ColumnValue, Extent, Tile, Tiling};
 
 /// Types of aggregations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum AggregateKind {
     Sum,
     Max,

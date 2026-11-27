@@ -2,6 +2,7 @@
 // InferCtx (Step 7c)
 // ---------------------------------------------------------------------------
 
+use crate::ccl::infer::solver::Solver;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -83,8 +84,8 @@ pub(super) struct Binding {
 /// [`smt_sub`](super::solver::smt::smt_sub) assumes nothing of the value beyond
 /// equality and the refinements its type states.
 impl ScopeEnv for ScopeStack<Name, Binding> {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
-        value_type(&self.lookup(name)?.scheme.body)
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
+        value_type(solver, &self.lookup(name)?.scheme.body)
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -114,6 +115,7 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
 /// That sharing decision is separate from function generalization; see
 /// `src/ccl/design/type-inference.md`, "Generalizing a collection is filter pushdown".
 pub(super) fn should_generalize(
+    solver: &mut Solver,
     def: &Expr,
     level: Level,
     generalized: impl FnOnce(&Name) -> bool,
@@ -124,14 +126,14 @@ pub(super) fn should_generalize(
         TypedExprNode::Lambda { .. } => !matches!(
             &def.ty,
             Type::Fun { fun_kind, .. }
-                if matches!(fun_kind.resolved(), KindPin::Plain | KindPin::Sum(_))
+                if matches!(fun_kind.resolved_in(solver), KindPin::Plain | KindPin::Sum(_))
         ),
         TypedExprNode::Var(name) => generalized(name),
         TypedExprNode::TraitFn { .. } => true,
         _ => false,
     };
     polymorphic_form
-        && (type_level(&def.ty) > level
+        && (type_level(solver, &def.ty) > level
             || crate::ccl::capabilities::input_capability_level(&def.ty) > level)
 }
 
@@ -141,6 +143,8 @@ pub(super) fn should_generalize(
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
 pub(super) struct InferCtx {
+    /// The run's solver: everything recorded on the variables this context mints.
+    pub(super) solver: Solver,
     /// The program's trait instances, from which every obligation emission mints takes
     /// its candidates.
     pub(super) instances: Rc<InstanceTable>,
@@ -254,6 +258,9 @@ pub(super) struct InferCtx {
     /// that shared an id across a `let` RHS boundary would silently take the first
     /// level it saw.
     shared_holes: RefCell<HashMap<u32, Type>>,
+    /// The variable each [`Type::Undetermined`] reaching this run stands for
+    /// ([`Self::normalize_annotation`]), minted at its first occurrence.
+    undetermined: RefCell<HashMap<crate::ccl::InferVarId, Type>>,
     /// The type parameters the `Poly`s open at the current emission position have
     /// minted, innermost last: each declared parameter's id with the opened
     /// [`Type::Param`] that [`normalize_annotation`](Self::normalize_annotation)
@@ -409,7 +416,7 @@ impl DeferredMethod {
     /// may still settle. A receiver only the definition's own variables reach, as an element
     /// of a member family under `forall` whose bound's holes the scheme does not carry, is
     /// settled by nothing but the definition's uses, so the call is the scheme's.
-    fn receiver_reaches_below(&self, cutoff: Level) -> bool {
+    fn receiver_reaches_below(&self, solver: &Solver, cutoff: Level) -> bool {
         let mut pending: Vec<Rc<InferVar>> = self
             .obligation
             .operands()
@@ -422,13 +429,13 @@ impl DeferredMethod {
             .collect();
         let mut seen = HashSet::new();
         while let Some(v) = pending.pop() {
-            if v.level() <= cutoff {
+            if v.level(solver) <= cutoff {
                 return true;
             }
             if !seen.insert(v.uid) {
                 continue;
             }
-            let bounds = v.bounds.borrow();
+            let bounds = v.bounds(solver);
             for bound in bounds.lower().iter().chain(bounds.upper().iter()) {
                 if let Type::Infer(u) = &bound.ty {
                     pending.push(Rc::clone(u));
@@ -553,41 +560,51 @@ struct OrderedLoop {
 /// iteration, and so does an exception, which a `try` in the body would have stopped before it
 /// reached `var` (`docs/chl-spec.md`, "Ordered loops"). `WriteTxn(x)` orders nothing:
 /// the run's transactions commit in commit order, whatever position the iteration has.
-fn iterations_interact(var: &Rc<CapabilityVar>, declared: &HashSet<Name>) -> bool {
-    interacting(var, declared).is_some()
+fn iterations_interact(
+    solver: &mut Solver,
+    var: &Rc<CapabilityVar>,
+    declared: &HashSet<Name>,
+) -> bool {
+    interacting(solver, var, declared).is_some()
 }
 
 /// What an unordered loop's refusal says of a source whose positions are keys of type `key`.
-fn keys_detail(key: &Type) -> String {
+fn keys_detail(solver: &mut Solver, key: &Type) -> String {
     format!(
         "keys of type `{}`, which have no order",
-        crate::ccl::chl_print::chl_type(&crate::ccl::ccl_utils::strip_refinements(key))
+        crate::ccl::chl_print::chl_type(&crate::ccl::ccl_utils::strip_refinements_in(solver, key))
     )
 }
 
 /// What an unordered loop's refusal says of a source whose positions have type `positions`,
 /// as emission required `Orderable` of them: a concatenation's are a variant of its parts'.
-pub(super) fn positions_detail(positions: &Type) -> String {
+pub(super) fn positions_detail(solver: &mut Solver, positions: &Type) -> String {
     match positions.peel_refinements() {
         Type::Variant(..) => {
             "the positions of a concatenation, which puts neither part first".to_string()
         }
         other => format!(
             "positions of type `{}`, which have no order",
-            crate::ccl::chl_print::chl_type(&crate::ccl::ccl_utils::strip_refinements(other))
+            crate::ccl::chl_print::chl_type(&crate::ccl::ccl_utils::strip_refinements_in(
+                solver, other
+            ))
         ),
     }
 }
 
 /// The capability that makes a loop's iterations interact, as [`iterations_interact`] reads it.
-fn interacting(var: &Rc<CapabilityVar>, declared: &HashSet<Name>) -> Option<LocatedCapability> {
+fn interacting(
+    solver: &mut Solver,
+    var: &Rc<CapabilityVar>,
+    declared: &HashSet<Name>,
+) -> Option<LocatedCapability> {
     // A write to a variable the iteration declares stays in it. `Effect` and `Write(*)` hold a
     // write to every variable, the accumulators outside the loop's too.
-    var.resolved().into_iter().find(|l| match &l.item {
+    var.resolved(solver).into_iter().find(|l| match &l.item {
         Capability::Causes(Effect::Write(x)) => !declared.contains(x),
         // `Effect` and `Write(*)` hold a write to every variable, the accumulators outside the
         // loop's too, and `Raise(*)` an exception of every type.
-        item => item.orders_a_loop(),
+        item => item.orders_a_loop(solver),
     })
 }
 
@@ -601,19 +618,23 @@ struct TryFrame {
 
 /// The capabilities of every function nested in `ty`, including functions reached through
 /// inference variables' lower bounds, and not a collection's own. Scope checks read the whole value a scope hands outward.
-fn type_capabilities(ty: &Type) -> Vec<LocatedCapability> {
-    fn collect(ty: &Type, seen: &mut HashSet<*const InferVar>, out: &mut Vec<LocatedCapability>) {
+fn type_capabilities(solver: &mut Solver, ty: &Type) -> Vec<LocatedCapability> {
+    fn collect(
+        solver: &mut Solver,
+        ty: &Type,
+        seen: &mut HashSet<*const InferVar>,
+        out: &mut Vec<LocatedCapability>,
+    ) {
         if let Type::Infer(v) = ty.peel_refinements() {
             if seen.insert(Rc::as_ptr(v)) {
                 let lowers: Vec<Type> = v
-                    .bounds
-                    .borrow()
+                    .bounds(solver)
                     .lower()
                     .iter()
                     .map(|b| b.ty.clone())
                     .collect();
                 for lower in lowers {
-                    collect(&lower, seen, out);
+                    collect(solver, &lower, seen, out);
                 }
             }
             return;
@@ -626,17 +647,17 @@ fn type_capabilities(ty: &Type) -> Vec<LocatedCapability> {
             fun_kind,
             ..
         } = ty
-            && !fun_kind.resolved().is_data()
+            && !fun_kind.resolved_in(solver).is_data()
         {
             out.extend(match capabilities.repr() {
-                Repr::Var(v) => v.resolved().into_iter().collect(),
-                _ => Capabilities::capabilities_of(capabilities),
+                Repr::Var(v) => v.resolved(solver).into_iter().collect(),
+                _ => Capabilities::capabilities_of(solver, capabilities),
             });
         }
-        ty.walk_children(|child| collect(child, seen, out));
+        ty.walk_children(|child| collect(solver, child, seen, out));
     }
     let mut out = Vec::new();
-    collect(ty, &mut HashSet::new(), &mut out);
+    collect(solver, ty, &mut HashSet::new(), &mut out);
     out.sort();
     out.dedup();
     out
@@ -644,7 +665,7 @@ fn type_capabilities(ty: &Type) -> Vec<LocatedCapability> {
 
 /// Whether a value other than an inference variable flows into `ty`, directly or through the
 /// lower bounds of the variables flowing into it.
-fn receives_a_value(ty: &Type) -> bool {
+fn receives_a_value(solver: &mut Solver, ty: &Type) -> bool {
     let mut seen = HashSet::new();
     let mut stack = vec![ty.clone()];
     while let Some(ty) = stack.pop() {
@@ -654,7 +675,7 @@ fn receives_a_value(ty: &Type) -> bool {
         if !seen.insert(Rc::as_ptr(v)) {
             continue;
         }
-        stack.extend(v.bounds.borrow().lower().iter().map(|b| b.ty.clone()));
+        stack.extend(v.bounds(solver).lower().iter().map(|b| b.ty.clone()));
     }
     false
 }
@@ -715,8 +736,9 @@ struct Declared {
 impl Declared {
     /// Whether `top` names something declared: it holds writes or reads and a mutable variable
     /// is declared, or appends and a feed is.
-    fn named_by(self, top: &Every) -> bool {
-        (self.variable && top.names_mutable_variables()) || (self.feed && top.names_feeds())
+    fn named_by(self, solver: &mut Solver, top: &Every) -> bool {
+        (self.variable && top.names_mutable_variables(solver))
+            || (self.feed && top.names_feeds(solver))
     }
 }
 
@@ -802,18 +824,20 @@ pub(super) struct SolverScope<'a> {
 }
 
 impl ScopeEnv for SolverScope<'_> {
-    fn binder_type(&self, name: &Name) -> Option<Type> {
-        if let Some(ty) = self.scopes.binder_type(name) {
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
+        if let Some(ty) = self.scopes.binder_type(solver, name) {
             return Some(
                 match self.scope_exits.get(name).and_then(|exits| exits.last()) {
                     Some(ScopeExit::Discharge(definition)) => {
-                        crate::ccl::infer::solver::smt::defined_as(ty, definition)
+                        crate::ccl::infer::solver::smt::defined_as(solver, ty, definition)
                     }
                     _ => ty,
                 },
             );
         }
-        self.opaque_binders.get(name).and_then(value_type)
+        self.opaque_binders
+            .get(name)
+            .and_then(|ty| value_type(solver, ty))
     }
     fn facts(&self) -> Vec<Expr> {
         self.facts.iter().map(Expr::clone_preserving_ids).collect()
@@ -838,7 +862,7 @@ impl InferCtx {
         for p in params {
             let opened = match p {
                 super::ModuleCheckParam::Inferred(param) => {
-                    let var = InferVar::fresh_in(self.level, &self.telescope);
+                    let var = InferVar::fresh_in(&mut self.solver, self.level, &self.telescope);
                     variables.insert(var.uid, Rc::clone(param));
                     Type::Infer(var)
                 }
@@ -866,18 +890,21 @@ impl InferCtx {
 
     /// `root` seeds [`current_node_id`](Self::current_node_id) so the context is
     /// never in a state where an error has no node to blame.
-    pub(super) fn new(sources: HashMap<String, Type>, root: NodeId) -> Self {
+    pub(super) fn new(mut solver: Solver, sources: HashMap<String, Type>, root: NodeId) -> Self {
         let telescope = Telescope::empty();
+        let schemes = OperatorSchemes::new(&mut solver);
         Self {
+            solver,
             scopes: ScopeStack::default(),
             sources,
             cache: ConstrainCache::new(),
-            schemes: OperatorSchemes::new(),
+            schemes,
             level: 0,
             pred_memo: Default::default(),
             lit_singletons: HashMap::new(),
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
+            undetermined: RefCell::new(HashMap::new()),
             opened_params: Vec::new(),
             opened_clause_params: HashMap::new(),
             instance_effects: Default::default(),
@@ -940,7 +967,7 @@ impl InferCtx {
 
     /// What the module's top level requires and causes, less what its scopes discharge
     /// (`docs/chl-spec.md`, "Shareable modules").
-    pub(super) fn top_level_capabilities(&self) -> Vec<LocatedCapability> {
+    pub(super) fn top_level_capabilities(&mut self) -> Vec<LocatedCapability> {
         let root = self
             .root_capabilities
             .as_ref()
@@ -948,7 +975,7 @@ impl InferCtx {
         // What names a variable the top level binds stops at the root, which stands outside
         // every top-level binder: what crossed an edge into it already has, and what it records
         // itself is kept to the variables it binds.
-        root.resolved()
+        root.resolved(&mut self.solver)
             .into_iter()
             .filter(|c| root.in_scope(&c.item))
             .collect()
@@ -957,11 +984,11 @@ impl InferCtx {
     /// An error at each `raise` whose value's type, once emission has resolved it, holds a
     /// function the compiler does not carry as an exception yet
     /// ([`crate::ccl::capabilities::uncompiled_exception_part`]).
-    pub(super) fn uncompiled_exceptions(&self) -> Vec<LocatedInferError> {
+    pub(super) fn uncompiled_exceptions(&mut self) -> Vec<LocatedInferError> {
         self.effect_raises
             .iter()
             .filter_map(|(site, ty)| {
-                let ty = crate::ccl::infer::solve::resolve_var_type(ty).ok()?;
+                let ty = crate::ccl::infer::solve::resolve_var_type(&mut self.solver, ty).ok()?;
                 // A part still a variable is reported where its type is.
                 let part = crate::ccl::capabilities::uncompiled_exception_part(&ty)?;
                 if matches!(part, Type::Infer(_)) {
@@ -995,7 +1022,7 @@ impl InferCtx {
         let open: HashSet<CapabilityVarId> = self
             .capability_calls_of_variables
             .iter()
-            .filter(|(_, callee)| !receives_a_value(callee))
+            .filter(|(_, callee)| !receives_a_value(&mut self.solver, callee))
             .map(|(call, _)| call.uid)
             .collect();
         let mut errors = Vec::new();
@@ -1029,10 +1056,16 @@ impl InferCtx {
             }
             // `Effect` and `Raise(*)` raise every type, so each clause would take part of one
             // (`docs/chl-spec.md`, "Exceptions").
-            let raises_anything = t.var.resolved().into_iter().find_map(|c| match c.item {
-                Capability::Every(every) if every.raises_anything() => Some(every),
-                _ => None,
-            });
+            let raises_anything =
+                t.var
+                    .resolved(&mut self.solver)
+                    .into_iter()
+                    .find_map(|c| match c.item {
+                        Capability::Every(every) if every.raises_anything(&mut self.solver) => {
+                            Some(every)
+                        }
+                        _ => None,
+                    });
             if let Some(top) = raises_anything {
                 errors.push(LocatedInferError::new(
                     InferError::ExceptAroundEveryRaise {
@@ -1045,18 +1078,18 @@ impl InferCtx {
                 continue;
             }
             let mut hits = vec![0usize; t.clauses.len()];
-            for capability in t.var.resolved() {
+            for capability in t.var.resolved(&mut self.solver) {
                 let Capability::Causes(Effect::Raise(raised)) = &capability.item else {
                     continue;
                 };
                 // A type still holding a variable generalizes into a type parameter, which
                 // reaches every clause (`covers`).
-                let Some(ty) = raised.decided_type() else {
+                let Some(ty) = raised.decided_type(&mut self.solver) else {
                     continue;
                 };
                 use crate::ccl::capabilities::Sent;
                 if let Sent::To(i) | Sent::Partly(i) =
-                    crate::ccl::capabilities::sent(&t.clauses, &ty)
+                    crate::ccl::capabilities::sent(&mut self.solver, &t.clauses, &ty)
                 {
                     hits[i] += 1;
                 }
@@ -1064,15 +1097,22 @@ impl InferCtx {
             // A clause variable whose bound holds `Raise(*)`, `E <: Effect`, may raise every type
             // at a use, so a clause the stated exceptions leave idle is one it would take part
             // of: the writer states what the call raises beside it.
-            let raising_variable = t.var.resolved().into_iter().find(|c| match &c.item {
-                Capability::Param(p) => {
-                    p.of_causes
-                        && Every::of_direction(true)
-                            .less(p.except.iter().chain(&p.param.clause_except).cloned())
-                            .raises_anything()
-                }
-                _ => false,
-            });
+            let raising_variable = t
+                .var
+                .resolved(&mut self.solver)
+                .into_iter()
+                .find(|c| match &c.item {
+                    Capability::Param(p) => {
+                        p.of_causes
+                            && Every::of_direction(true)
+                                .less(
+                                    &mut self.solver,
+                                    p.except.iter().chain(&p.param.clause_except).cloned(),
+                                )
+                                .raises_anything(&mut self.solver)
+                    }
+                    _ => false,
+                });
             for (catches, _) in t.clauses.iter().zip(&hits).filter(|(_, n)| **n == 0) {
                 let error = match &raising_variable {
                     Some(variable) => InferError::ExceptAroundEveryRaise {
@@ -1277,7 +1317,7 @@ impl InferCtx {
     /// effects"): each one naming an induction variable, which `docs/chl-spec.md`, "9.10
     /// Induction variables stay in their module", keeps in its module, and each append to a
     /// private feed, which makes the feed the run's.
-    pub(super) fn exported_capabilities(&self) -> ExportedCapabilities {
+    pub(super) fn exported_capabilities(&mut self) -> ExportedCapabilities {
         let mut out = ExportedCapabilities::default();
         // A top naming every variable of a family names this module's own where its top level
         // binds one that stays in the module: `Effect`, `Context`, `Write(*)` and `Read(*)` an
@@ -1285,9 +1325,11 @@ impl InferCtx {
         let root = &self.capability_frames[0];
         let own = root.declares;
         for (name, ty, node) in &self.capability_public {
-            for capability in type_capabilities(ty) {
-                let every =
-                    matches!(&capability.item, Capability::Every(every) if own.named_by(every));
+            for capability in type_capabilities(&mut self.solver, ty) {
+                let every = matches!(
+                    &capability.item,
+                    Capability::Every(every) if own.named_by(&mut self.solver, every)
+                );
                 // A public member's type stands at the top level, so a variable it names that the
                 // root scope does not bind is one the top level binds.
                 if !capability.item.names_outside(&root.outer) && !every {
@@ -1308,14 +1350,19 @@ impl InferCtx {
     /// the variable (`docs/chl-spec.md`, "Discharging requirements and effects"). A write or an
     /// append handing out a function that acts on a place is an error whatever its scope: no
     /// place is inside a place (`docs/chl-spec.md`, "Places and values").
-    pub(super) fn escaping_results(&self) -> Vec<LocatedInferError> {
-        let beyond =
-            |capabilities: Vec<LocatedCapability>, outlived_by: &Telescope, declares: Declared| {
-                capabilities.into_iter().find(|l| {
-                    l.item.names_outside(outlived_by)
-                        || matches!(&l.item, Capability::Every(every) if declares.named_by(every))
-                })
-            };
+    pub(super) fn escaping_results(&mut self) -> Vec<LocatedInferError> {
+        let beyond = |solver: &mut Solver,
+                      capabilities: Vec<LocatedCapability>,
+                      outlived_by: &Telescope,
+                      declares: Declared| {
+            capabilities.into_iter().find(|l| {
+                l.item.names_outside(outlived_by)
+                    || matches!(
+                        &l.item,
+                        Capability::Every(every) if declares.named_by(solver, every)
+                    )
+            })
+        };
         let located = |error, node_id| LocatedInferError {
             error,
             node_id,
@@ -1323,70 +1370,81 @@ impl InferCtx {
             related: crate::ccl::infer::api::RelatedPositions::default(),
         };
         // The error is at the value returned, with the function returning it beside it.
-        let returned = self.results.iter().filter_map(|r| {
-            let capability = beyond(type_capabilities(&r.ty), &r.outlived_by, r.declares)?;
-            let mut error = located(
-                InferError::EscapesItsVariable {
-                    item: capability.item.to_string(),
-                    every: matches!(capability.item, Capability::Every(_)),
-                },
-                r.returned,
-            );
-            if r.returned != r.function {
-                error.related.set(crate::ccl::infer::api::Related {
-                    origin: Origin::Node(r.function),
-                    role: crate::ccl::infer::api::RelatedRole::Function,
-                });
-            }
-            Some(error)
-        });
-        let handed_out = self.handed_out.iter().filter_map(|h| {
-            let capabilities = type_capabilities(&h.ty);
-            // The place rule comes first: a writer is refused even where it would not outlive
-            // what it writes, and reporting its scope would misstate why.
-            if let Some(effect) = capabilities.iter().find_map(|l| l.item.effect_on_a_place()) {
-                return Some(located(
-                    InferError::HandsOutAWriter {
-                        effect: effect.to_string(),
+        let returned: Vec<LocatedInferError> = self
+            .results
+            .iter()
+            .filter_map(|r| {
+                let capabilities = type_capabilities(&mut self.solver, &r.ty);
+                let capability =
+                    beyond(&mut self.solver, capabilities, &r.outlived_by, r.declares)?;
+                let mut error = located(
+                    InferError::EscapesItsVariable {
+                        item: capability.item.to_string(),
+                        every: matches!(capability.item, Capability::Every(_)),
+                    },
+                    r.returned,
+                );
+                if r.returned != r.function {
+                    error.related.set(crate::ccl::infer::api::Related {
+                        origin: Origin::Node(r.function),
+                        role: crate::ccl::infer::api::RelatedRole::Function,
+                    });
+                }
+                Some(error)
+            })
+            .collect();
+        let handed_out: Vec<LocatedInferError> = self
+            .handed_out
+            .iter()
+            .filter_map(|h| {
+                let capabilities = type_capabilities(&mut self.solver, &h.ty);
+                // The place rule comes first: a writer is refused even where it would not outlive
+                // what it writes, and reporting its scope would misstate why.
+                if let Some(effect) = capabilities.iter().find_map(|l| l.item.effect_on_a_place()) {
+                    return Some(located(
+                        InferError::HandsOutAWriter {
+                            effect: effect.to_string(),
+                            target: h.target.to_string(),
+                            appends: h.appends,
+                        },
+                        h.node,
+                    ));
+                }
+                let capability =
+                    beyond(&mut self.solver, capabilities, &h.outlived_by, h.declares)?;
+                Some(located(
+                    InferError::HandsOutItsVariable {
+                        item: capability.item.to_string(),
+                        every: matches!(capability.item, Capability::Every(_)),
                         target: h.target.to_string(),
                         appends: h.appends,
                     },
                     h.node,
-                ));
-            }
-            let capability = beyond(capabilities, &h.outlived_by, h.declares)?;
-            Some(located(
-                InferError::HandsOutItsVariable {
-                    item: capability.item.to_string(),
-                    every: matches!(capability.item, Capability::Every(_)),
-                    target: h.target.to_string(),
-                    appends: h.appends,
-                },
-                h.node,
-            ))
-        });
-        returned.chain(handed_out).collect()
+                ))
+            })
+            .collect();
+        returned.into_iter().chain(handed_out).collect()
     }
 
     /// `item`, which the bounded clause at `clause` does not list, as the definition's printed
     /// contract spells it: an ordering requirement over positions inference typed names them
     /// as the contract does, not as an inference variable.
     pub(super) fn item_beyond_clause(
-        &self,
+        &mut self,
         item: &Capability,
         clause: chl_parser::ast::Span,
     ) -> String {
-        let named = || {
+        let mut named = || {
             let Capability::Requires(r) = item else {
                 return None;
             };
             let id = r.ordering()?.id;
             let bounded = self.bounded_requires.iter().find(|b| b.at == clause)?;
-            let inferred = poly_for_display(&bounded.ty, bounded.level)?;
-            fn find(ty: &Type, id: u32) -> Option<Requirement> {
+            let inferred = poly_for_display(&mut self.solver, &bounded.ty, bounded.level)?;
+            fn find(solver: &mut Solver, ty: &Type, id: u32) -> Option<Requirement> {
                 if let Type::Fun { capabilities, .. } = ty
                     && let Some(r) = capabilities
-                        .set()
+                        .set_in(solver)
                         .requires
                         .into_iter()
                         .find(|r| r.ordering().is_some_and(|o| o.id == id))
@@ -1396,22 +1454,23 @@ impl InferCtx {
                 let mut found = None;
                 ty.walk_children(|child| {
                     if found.is_none() {
-                        found = find(child, id);
+                        found = find(solver, child, id);
                     }
                 });
                 found
             }
-            find(&inferred.poly.body, id).map(|r| r.to_string())
+            find(&mut self.solver, &inferred.poly.body, id).map(|r| r.to_string())
         };
         named().unwrap_or_else(|| item.to_string())
     }
 
     /// An error at each `def` whose bounded `requires` clause a trait requirement inference
     /// added exceeds, with the clause as the secondary label.
-    pub(super) fn requirements_beyond_clauses(&self) -> Vec<LocatedInferError> {
+    pub(super) fn requirements_beyond_clauses(&mut self) -> Vec<LocatedInferError> {
         let mut out = Vec::new();
         for bounded in &self.bounded_requires {
-            let Some(inferred) = poly_for_display(&bounded.ty, bounded.level) else {
+            let Some(inferred) = poly_for_display(&mut self.solver, &bounded.ty, bounded.level)
+            else {
                 continue;
             };
             let beyond: Vec<_> = inferred
@@ -1453,11 +1512,13 @@ impl InferCtx {
         let mut errors = Vec::new();
         for l in std::mem::take(&mut self.ordered_loops) {
             let positions =
-                crate::ccl::infer::solve::resolve_var_type(&l.positions).unwrap_or(l.positions);
+                crate::ccl::infer::solve::resolve_var_type(&mut self.solver, &l.positions)
+                    .unwrap_or(l.positions);
             let Type::WitnessRef(id) = positions.peel_refinements() else {
                 continue;
             };
-            let iter = crate::ccl::infer::solve::resolve_var_type(&l.iter).unwrap_or(l.iter);
+            let iter = crate::ccl::infer::solve::resolve_var_type(&mut self.solver, &l.iter)
+                .unwrap_or(l.iter);
             // Resolving the source renames its binders, so a sum of one binder names the
             // positions by being one.
             let kind = match iter.peel_refinements().sum() {
@@ -1479,7 +1540,7 @@ impl InferCtx {
                     {
                         continue;
                     }
-                    keys_detail(&key)
+                    keys_detail(&mut self.solver, &key)
                 }
                 Some(TypeKind::Type) => {
                     "the positions of a collection, which have no order".to_string()
@@ -1494,19 +1555,19 @@ impl InferCtx {
     /// The error refusing the ordered loop `node` over the source at `source`, whose positions
     /// `detail` describes, naming what orders the loop.
     pub(super) fn unordered_loop_error(
-        &self,
+        &mut self,
         node: NodeId,
         source: NodeId,
         detail: String,
     ) -> Option<LocatedInferError> {
         let l = self.effect_loops.iter().find(|l| l.node == node)?;
-        let why = match interacting(&l.var, &l.declared)?.item {
+        let why = match interacting(&mut self.solver, &l.var, &l.declared)?.item {
             Capability::Causes(Effect::Write(x)) => {
                 format!("its body writes `{x}`, a variable bound outside it")
             }
             // A polymorphic definition is refused where it stands, and there the exception's type
             // may be one its uses decide.
-            Capability::Causes(Effect::Raise(raised)) => match raised.resolved() {
+            Capability::Causes(Effect::Raise(raised)) => match raised.resolved(&mut self.solver) {
                 Some(ty) => format!(
                     "an exception of type `{}` may escape its body",
                     crate::ccl::chl_print::chl_type(&ty)
@@ -1562,18 +1623,18 @@ impl InferCtx {
             let Some(order) = requirement.ordering() else {
                 continue;
             };
-            if requirement.is_satisfied() {
+            if requirement.is_satisfied(&mut self.solver) {
                 order.satisfied.set(true);
                 continue;
             }
-            let set = order.capabilities.set();
-            let capability = set.items().find(Capability::orders_a_loop);
+            let set = order.capabilities.set_in(&mut self.solver);
+            let capability = set.items().find(|x| x.orders_a_loop(&mut self.solver));
             let why = |capability: &Capability| match order.at_use {
                 true => format!("the loop's body causes `{capability}`"),
                 false => format!("its body causes `{capability}`"),
             };
-            let positions = order.position_type();
-            let detail = positions_detail(&positions);
+            let positions = order.position_type(&mut self.solver);
+            let detail = positions_detail(&mut self.solver, &positions);
             if matches!(positions.peel_refinements(), Type::WitnessRef(_)) {
                 if let Some(capability) = capability {
                     errors.push(LocatedInferError::new(
@@ -1599,10 +1660,11 @@ impl InferCtx {
             }) {
                 continue;
             }
-            let positions = crate::ccl::ccl_utils::strip_refinements(&positions);
+            let positions =
+                crate::ccl::ccl_utils::strip_refinements_in(&mut self.solver, &positions);
             let saved_level = self.level;
             let saved_telescope = self.telescope.clone();
-            self.level = self.level.max(type_level(&order.positions));
+            self.level = self.level.max(type_level(&self.solver, &order.positions));
             if let Type::Infer(v) = order.positions.peel_refinements() {
                 self.telescope = v.telescope.clone();
             }
@@ -1657,13 +1719,12 @@ impl InferCtx {
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
     /// at the definition, where each use fills a copy of its own, so a statement or a block
     /// reaching one may do something and is not reported.
-    pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
+    pub(super) fn does_nothing(&mut self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &CapabilityVar| {
             self.capability_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
         };
-        let idle = |var: &CapabilityVar| {
-            crate::ccl::capabilities::set_of(&var.resolved()).causes_nothing()
-                && !var.reaches(&undetermined)
+        let mut idle = |var: &CapabilityVar| {
+            var.resolved_set(&mut self.solver).causes_nothing() && !var.reaches(&undetermined)
         };
         let empty: Vec<&(NodeId, Rc<CapabilityVar>)> = self
             .capability_transactions
@@ -1686,7 +1747,7 @@ impl InferCtx {
 
     /// `item` as a capability recorded at the current node, bound where the variable it names
     /// binds.
-    fn capability(&self, item: Capability) -> LocatedCapability {
+    fn capability(&mut self, item: Capability) -> LocatedCapability {
         LocatedCapability {
             at: Some(self.current_node_id),
             ..self.stated_capability(item)
@@ -1713,7 +1774,7 @@ impl InferCtx {
     }
 
     /// `item` as a capability a written clause states, bound where the variable it names binds.
-    fn stated_capability(&self, item: Capability) -> LocatedCapability {
+    fn stated_capability(&mut self, item: Capability) -> LocatedCapability {
         let item = match item {
             Capability::Requires(r) if r.ordering().is_some() => {
                 let order = r.ordering().unwrap();
@@ -1738,7 +1799,7 @@ impl InferCtx {
     }
 
     /// The capability variable each parameter `set` names opened to.
-    fn clause_param_vars(&self, set: &CapabilitySet) -> Vec<Rc<CapabilityVar>> {
+    fn clause_param_vars(&mut self, set: &CapabilitySet) -> Vec<Rc<CapabilityVar>> {
         set.params
             .iter()
             .map(|p| {
@@ -1758,7 +1819,10 @@ impl InferCtx {
     /// The variable an instance's associated effect type `param` collects on, bounded by what
     /// its bound in the trait takes away, `Writes <: Effect except RunTransaction`
     /// (`docs/chl-spec.md`, "Effects in traits").
-    fn instance_effect(&self, param: &crate::ccl::capabilities::ClauseParam) -> Rc<CapabilityVar> {
+    fn instance_effect(
+        &mut self,
+        param: &crate::ccl::capabilities::ClauseParam,
+    ) -> Rc<CapabilityVar> {
         Rc::clone(
             self.instance_effects
                 .borrow_mut()
@@ -1769,10 +1833,9 @@ impl InferCtx {
                     let var = CapabilityVar::fresh(0, &self.capability_frames[0].outer);
                     if !param.param.clause_except.is_empty() {
                         let mut set = CapabilitySet::default();
-                        set.add_every(
-                            Every::of_direction(param.of_causes)
-                                .less(param.param.clause_except.clone()),
-                        );
+                        let every = Every::of_direction(param.of_causes)
+                            .less(&mut self.solver, param.param.clause_except.clone());
+                        set.add_every_in(&mut self.solver, every);
                         var.bound_above(Upper {
                             set,
                             of_requires: !param.of_causes,
@@ -1871,7 +1934,7 @@ impl InferCtx {
 
     /// Settle `link` whatever its obligation has decided: by what it selected, or by every
     /// instance and requirement still answering it.
-    fn settle_at_last(&self, link: &EffectLink) {
+    fn settle_at_last(&mut self, link: &EffectLink) {
         if self.settle(link) {
             return;
         }
@@ -1904,7 +1967,7 @@ impl InferCtx {
     }
 
     fn settle_links_since(&mut self, start: usize, scheme: &Type) {
-        let carried: HashSet<_> = scheme_obligations(scheme, self.level)
+        let carried: HashSet<_> = scheme_obligations(&mut self.solver, scheme, self.level)
             .iter()
             .map(|o| o.uid)
             .collect();
@@ -1922,7 +1985,7 @@ impl InferCtx {
 
     /// Give `link`'s target what answers its obligation: the selected instance's associated
     /// effect type, or the one a requirement in scope gives it. Whether it is settled.
-    fn settle(&self, link: &EffectLink) -> bool {
+    fn settle(&mut self, link: &EffectLink) -> bool {
         if let Some(instance) = link.obligation.selected_instance() {
             if let Some((_, own)) = instance
                 .effect_assocs
@@ -1954,7 +2017,7 @@ impl InferCtx {
     /// exact. A parameter in the bound is the opened one, which the variable it opened to
     /// names.
     fn bound_written(
-        &self,
+        &mut self,
         var: &Rc<CapabilityVar>,
         written: &crate::ccl::capabilities::Written,
         blame: Blame,
@@ -2011,9 +2074,9 @@ impl InferCtx {
                 .collect();
             if rigid.is_empty() {
                 if !param.except.is_empty() {
-                    set.add_every(
-                        Every::of_direction(param.of_causes).less(param.except.iter().cloned()),
-                    );
+                    let every = Every::of_direction(param.of_causes)
+                        .less(&mut self.solver, param.except.iter().cloned());
+                    set.add_every_in(&mut self.solver, every);
                 } else if param.of_causes {
                     open_causes = true;
                 } else {
@@ -2036,7 +2099,7 @@ impl InferCtx {
 
     /// Normalize the operands of built-in requirements before recording and bounding a clause.
     fn normalize_written(
-        &self,
+        &mut self,
         written: &crate::ccl::capabilities::Written,
     ) -> crate::ccl::capabilities::Written {
         let mut written = written.clone();
@@ -2060,7 +2123,7 @@ impl InferCtx {
         reason = "an `Item` reaches a `Type` only through its requirement's trait declaration, \
                   and a trait hashes and orders by its module path and name"
     )]
-    fn normalize_capabilities(&self, capabilities: &Capabilities) -> Capabilities {
+    fn normalize_capabilities(&mut self, capabilities: &Capabilities) -> Capabilities {
         let Repr::Written(written) = capabilities.repr() else {
             return capabilities.clone();
         };
@@ -2238,7 +2301,10 @@ impl InferCtx {
                         ) =>
                 {
                     // In the spelling a predicate takes it in, once for every reader.
-                    ScopeExit::Discharge(Rc::new(crate::ccl::ccl_utils::predicate_term(definition)))
+                    ScopeExit::Discharge(Rc::new(crate::ccl::ccl_utils::predicate_term(
+                        &mut self.solver,
+                        definition,
+                    )))
                 }
                 _ => ScopeExit::Keep,
             }
@@ -2282,7 +2348,11 @@ impl InferCtx {
             // of its uses a disconnected copy; they move down to the binding's level.
             PolyScheme::poly(
                 self.level + 1,
-                crate::ccl::infer::solver::constrain::lower_levels(bound_ty, self.level),
+                crate::ccl::infer::solver::constrain::lower_levels(
+                    &mut self.solver,
+                    bound_ty,
+                    self.level,
+                ),
             )
         };
         let entry = Binding {
@@ -2301,7 +2371,7 @@ impl InferCtx {
     pub(super) fn instantiate_binding(&mut self, name: &Name) -> Result<Type, LocatedInferError> {
         self.note_use(name);
         match self.scopes.lookup(name) {
-            Some(binding) => Ok(binding.scheme.instantiate(self.level)),
+            Some(binding) => Ok(binding.scheme.instantiate(&mut self.solver, self.level)),
             None => Err(self.raise(InferError::UnboundVariable(name.to_string()))),
         }
     }
@@ -2392,6 +2462,7 @@ impl InferCtx {
             selected: Rc::clone(&self.selected_methods),
         };
         let obligation = TraitObligation::new_method(
+            &mut self.solver,
             &self.instances,
             name,
             call,
@@ -2403,7 +2474,7 @@ impl InferCtx {
         // assumptions in scope here, as a call of it where it stands would be.
         obligation.assume(&self.assumptions);
         let position = self.fresh();
-        obligation.watch(&position, 0);
+        obligation.watch(&mut self.solver, &position, 0);
         self.method_calls
             .last_mut()
             .expect("the program's own method calls are collected throughout")
@@ -2431,12 +2502,13 @@ impl InferCtx {
             self.value_at.or(self.here()),
             self.demand_at.or(self.here()),
         );
-        let result = call.instantiate_method(scheme, &mut self.cache);
-        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        let result = call.instantiate_method(&mut self.solver, scheme, &mut self.cache);
+        self.cache
+            .report_recorded(&mut self.solver, || EdgeReport::Labeled(at()));
         result.map_err(|e| {
             let failure = self.cache.take_failure();
-            self.raise(map_constrain_err(e, &at()))
-                .with_failure(failure)
+            let error = map_constrain_err(&mut self.solver, e, &at());
+            self.raise(error).with_failure(failure)
         })
     }
 
@@ -2468,7 +2540,7 @@ impl InferCtx {
                 if let (Type::Infer(copy), Type::Infer(original)) =
                     (&position, operand.peel_refinements())
                 {
-                    copy.inherit_witness_placement(original);
+                    copy.inherit_witness_placement(&mut self.solver, original);
                 }
                 position
             })
@@ -2505,7 +2577,7 @@ impl InferCtx {
         }
         obligation.assume(&self.assumptions);
         for (i, position) in positions.iter().enumerate() {
-            obligation.watch(position, i as u8);
+            obligation.watch(&mut self.solver, position, i as u8);
         }
         // An associated type declared with a bound is below it at every obligation
         // (`docs/chl-spec.md`, "Declaring a trait"). The bound names the trait's operands and
@@ -2545,13 +2617,16 @@ impl InferCtx {
             self.value_at.or(self.here()),
             self.demand_at.or(self.here()),
         );
-        let deposited = obligation.try_deposit(&mut self.cache);
-        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        let deposited = obligation.try_deposit(&mut self.solver, &mut self.cache);
+        self.cache
+            .report_recorded(&mut self.solver, || EdgeReport::Labeled(at()));
         if let Err(e) = deposited {
             let failure = self.cache.take_failure();
-            return Err(self
-                .raise(map_constrain_err(e, &at()))
-                .with_failure(failure));
+            return Err({
+                let error = map_constrain_err(&mut self.solver, e, &at());
+                self.raise(error)
+            }
+            .with_failure(failure));
         }
         // Operands flow in as ordinary lower bounds, refinements and all. The
         // narrowing hook peels them where the base actually arrives.
@@ -2589,20 +2664,21 @@ impl InferCtx {
     /// else — including existing `Infer` vars, the structural variants the
     /// solver operates on, and `Refinement` wrappers (refinements ride the
     /// lattice as refinements) — is kept, recursing to normalize nested holes.
-    pub(super) fn normalize_annotation(&self, ty: &Type) -> Type {
-        self.normalize_annotation_in(ty, &self.telescope)
+    pub(super) fn normalize_annotation(&mut self, ty: &Type) -> Type {
+        let telescope = self.telescope.clone();
+        self.normalize_annotation_in(ty, &telescope)
     }
 
     /// A function annotation's domain, normalized. A [`Type::SharedHole`] there names one
     /// data domain, so its variable is marked as one ([`InferVar::names_domain`]): a domain
     /// is the one position where the claim that two positions share a type is an equation
     /// rather than a common bound.
-    fn normalize_domain(&self, domain: &Type, telescope: &Telescope) -> Type {
+    fn normalize_domain(&mut self, domain: &Type, telescope: &Telescope) -> Type {
         let normalized = self.normalize_annotation_in(domain, telescope);
         if matches!(domain, Type::SharedHole(_))
             && let Type::Infer(v) = &normalized
         {
-            v.mark_named_domain();
+            v.mark_named_domain(&mut self.solver);
         }
         normalized
     }
@@ -2615,22 +2691,23 @@ impl InferCtx {
     /// holder (`src/ccl/design/type-inference.md`, "Where the conversions
     /// run"). The method takes `&self`, so the extension rides the recursion
     /// rather than the context.
-    fn normalize_annotation_in(&self, ty: &Type, telescope: &Telescope) -> Type {
+    fn normalize_annotation_in(&mut self, ty: &Type, telescope: &Telescope) -> Type {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable, at
             // the current lexical position (it carries the live telescope).
-            Type::Hole => Type::Infer(InferVar::fresh_in(self.level, telescope)),
+            Type::Hole => Type::Infer(InferVar::fresh_in(&mut self.solver, self.level, telescope)),
             // A barrier variable is the same "infer this": each annotation gets its own
             // copy, which gathers the bounds. Its level is the maximum level of those
             // bounds (`BarrierVar::level`), so a generalized `let` quantifies it exactly
             // when a bound reaches above the `let`'s level.
             Type::BarrierVar(barrier) => {
                 debug_assert!(
-                    barrier.lowers.borrow().is_empty() && barrier.uppers.borrow().is_empty(),
+                    barrier.lowers(&self.solver).is_empty()
+                        && barrier.uppers(&self.solver).is_empty(),
                     "an annotation's barrier variable carries no bounds before normalization"
                 );
-                Type::BarrierVar(BarrierVar::fresh(
-                    Rc::clone(&barrier.opaque),
+                Type::BarrierVar(BarrierVar::fresh(&mut self.solver,
+                    Rc::clone(barrier.opaque()),
                     Vec::new(),
                     Vec::new(),
                 ))
@@ -2644,7 +2721,20 @@ impl InferCtx {
                 .shared_holes
                 .borrow_mut()
                 .entry(*id)
-                .or_insert_with(|| Type::Infer(InferVar::fresh_in(self.level, telescope)))
+                .or_insert_with(|| {
+                    Type::Infer(InferVar::fresh_in(&mut self.solver, self.level, telescope))
+                })
+                .clone(),
+            // A type a finished run left undetermined, reaching this run through what it
+            // imports, means "infer this", and is the same one at each occurrence of its id, as
+            // a `SharedHole` is.
+            Type::Undetermined(id) => self
+                .undetermined
+                .borrow_mut()
+                .entry(*id)
+                .or_insert_with(|| {
+                    Type::Infer(InferVar::fresh_in(&mut self.solver, self.level, telescope))
+                })
                 .clone(),
             Type::FamilyApp(app) if app.param.generalized => {
                 unreachable!("a generalized family is born after inference")
@@ -2688,7 +2778,7 @@ impl InferCtx {
                 )
             }
             Type::BoundedHole(bound) => {
-                let v = Type::Infer(InferVar::fresh_in(self.level, telescope));
+                let v = Type::Infer(InferVar::fresh_in(&mut self.solver, self.level, telescope));
                 let bound = self.normalize_annotation_in(bound, telescope);
                 // A **local** cache, not `self.cache`: this method takes `&self`,
                 // and the memo exists only to break recursion on cyclic bounds.
@@ -2705,7 +2795,13 @@ impl InferCtx {
                 // (`smt::Slot::Poisoned`), so every later query returns the same
                 // failure and the first one that reaches `map_constrain_err` aborts
                 // naming a comparison that had nothing to do with it.
-                let _ = constrain_subtype_in(&v, &bound, &mut ConstrainCache::new(), &NoScope);
+                let _ = constrain_subtype_in(
+                    &mut self.solver,
+                    &v,
+                    &bound,
+                    &mut ConstrainCache::new(),
+                    &NoScope,
+                );
                 v
             }
             // Refinements ride the lattice: keep the wrapper, normalize the
@@ -2743,7 +2839,7 @@ impl InferCtx {
                         // A funkind the annotation left to inference is a fresh one per
                         // occurrence, as a `Hole` is a fresh type.
                         crate::ccl::ty::FunKind::Var(v) if v.is_hole() => {
-                            crate::ccl::ty::FunKind::fresh_data_at(self.level)
+                            crate::ccl::ty::FunKind::fresh_data_at(&mut self.solver, self.level)
                         }
                     other => other.clone(),
                 };
@@ -2751,8 +2847,8 @@ impl InferCtx {
                 let codomain = self.normalize_annotation_in(c, &cod_telescope);
                 // The parts are minted for this function, so they sit under the witness
                 // binders its kind may have, as an instantiated scheme's do.
-                InferVar::place_parts_under(&domain, &fun_kind);
-                InferVar::place_parts_under(&codomain, &fun_kind);
+                InferVar::place_parts_under(&mut self.solver, &domain, &fun_kind);
+                InferVar::place_parts_under(&mut self.solver, &codomain, &fun_kind);
                 Type::Fun {
                     binder: binder.clone(),
                     fun_kind,
@@ -2815,7 +2911,7 @@ impl InferCtx {
                         // A constant family's holes stand for one type at every value of its
                         // binders.
                         if binders.iter().all(|(n, _)| n.is_none()) {
-                            mark_constant_family_holes(
+                            mark_constant_family_holes(&mut self.solver,
                                 body,
                                 &decl.params[i].spelling,
                             );
@@ -2890,7 +2986,7 @@ impl InferCtx {
         &mut self,
         inferred: &Type,
         ann: &Type,
-        mismatch: impl Fn() -> InferError,
+        mismatch: impl Fn(&mut Solver) -> InferError,
     ) -> Result<Type, LocatedInferError> {
         // Shared by *binder* annotations (trait call sites in the emit rules)
         // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
@@ -3002,7 +3098,13 @@ impl InferCtx {
             facts: &self.facts,
         };
         self.cache.at(self.here(), self.here());
-        let result = constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope);
+        let result = constrain_subtype_in(
+            &mut self.solver,
+            inferred,
+            &ann_simple,
+            &mut self.cache,
+            &scope,
+        );
         let failed = result.is_err();
         // A value reaching a type chosen outside a binder it reads is refused for that, whatever
         // else the annotation states: the remedy is a family that names the binder. A shape the
@@ -3012,8 +3114,8 @@ impl InferCtx {
             | crate::ccl::infer::solver::ConstrainError::NotCompiledYet(_)),
         ) = result
         {
-            let refused = map_constrain_err(err, "annotation");
-            self.settle_annotation_edge(true, || refused.clone())?;
+            let refused = map_constrain_err(&mut self.solver, err, "annotation");
+            self.settle_annotation_edge(true, |_| refused.clone())?;
         }
         self.settle_annotation_edge(failed, &mismatch)?;
 
@@ -3025,15 +3127,19 @@ impl InferCtx {
     fn settle_annotation_edge(
         &mut self,
         failed: bool,
-        mismatch: impl Fn() -> InferError,
+        mismatch: impl Fn(&mut Solver) -> InferError,
     ) -> Result<(), LocatedInferError> {
         if !failed {
-            self.cache.report_recorded(|| EdgeReport::Fixed(mismatch()));
+            if self.cache.holds_unreported() {
+                let error = mismatch(&mut self.solver);
+                self.cache
+                    .report_recorded(&mut self.solver, || EdgeReport::Fixed(error));
+            }
             return Ok(());
         }
-        let error = mismatch();
+        let error = mismatch(&mut self.solver);
         self.cache
-            .report_recorded(|| EdgeReport::Fixed(error.clone()));
+            .report_recorded(&mut self.solver, || EdgeReport::Fixed(error.clone()));
         let failure = self.cache.take_failure();
         Err(self.raise(error).with_failure(failure))
     }
@@ -3072,10 +3178,10 @@ impl InferCtx {
     }
 
     /// The inferred contract at a place's storage binding, when that binding is known.
-    pub(super) fn feed_contract(&self, target: &Name) -> Option<Type> {
+    pub(super) fn feed_contract(&mut self, target: &Name) -> Option<Type> {
         let binding = self.scopes.lookup(target)?;
         binding.scheme.body.as_feed()?;
-        Some(binding.scheme.instantiate(self.level))
+        Some(binding.scheme.instantiate(&mut self.solver, self.level))
     }
 
     /// A place received through a joined binder contributes to its incoming contract,
@@ -3150,10 +3256,13 @@ impl InferCtx {
         // bound, whose lower edge carries the exits, as a `let`'s lifted type does
         // (`close_let_type`): the contribution is usually a variable whose refinements
         // arrive as bounds, so the exits apply when the solver forces the edge.
-        let crossing = InferVar::fresh_in(self.level, &target_scope);
-        let bound = Bound::with_subst(contribution.clone(), exits);
-        enforce_bound_scope(&crossing, "lower", &bound);
-        crossing.bounds.borrow_mut().lower_mut().push(bound);
+        let crossing = InferVar::fresh_in(&mut self.solver, self.level, &target_scope);
+        let bound = Bound::with_subst(&mut self.solver, contribution.clone(), exits);
+        enforce_bound_scope(&mut self.solver, &crossing, "lower", &bound);
+        crossing
+            .bounds_mut(&mut self.solver)
+            .lower_mut()
+            .push(bound);
         self.require_sub(&Type::Infer(crossing), history, at)
     }
 
@@ -3188,7 +3297,7 @@ impl InferCtx {
         let loops = &self.loop_sources;
         let is_loop =
             |n: &Name| loops.contains_key(n) || loops.values().any(|l| l.position_binder == *n);
-        let exits = self.exits_but(&crossed, &[], &is_loop);
+        let exits = exits_but(&mut self.solver, &self.scope_exits, &crossed, &[], &is_loop);
         if exits.is_id() {
             return value.clone();
         }
@@ -3202,10 +3311,10 @@ impl InferCtx {
             .map(|(n, _)| n)
             .collect();
         let scope = self.telescope.rescoped(|n| left.contains(n), []);
-        let row = InferVar::fresh_in(self.level, &scope);
-        let bound = Bound::with_subst(value.clone(), exits);
-        enforce_bound_scope(&row, "lower", &bound);
-        row.bounds.borrow_mut().lower_mut().push(bound);
+        let row = InferVar::fresh_in(&mut self.solver, self.level, &scope);
+        let bound = Bound::with_subst(&mut self.solver, value.clone(), exits);
+        enforce_bound_scope(&mut self.solver, &row, "lower", &bound);
+        row.bounds_mut(&mut self.solver).lower_mut().push(bound);
         Type::Infer(row)
     }
 
@@ -3296,6 +3405,7 @@ impl InferCtx {
                 (loops.len() > 1).then(|| {
                     let at = Name::fresh("__key");
                     let read_at = InferVar::fresh_in(
+                        &mut self.solver,
                         self.level,
                         &target_scope.extended(key.clone()).extended(at.clone()),
                     );
@@ -3306,7 +3416,8 @@ impl InferCtx {
         // Each loop variable as its source read at its position in a key named `through`, and a
         // dependent source's binder as that position.
         self.note_varying_binders(&crossed);
-        let reads_at = |through: &Name| -> Vec<(Name, Expr)> {
+        let loop_sources = &self.loop_sources;
+        let reads_at = |solver: &mut Solver, through: &Name| -> Vec<(Name, Expr)> {
             let key_var = Expr::var(through).with_ty(key_domain.clone());
             loops
                 .iter()
@@ -3319,12 +3430,13 @@ impl InferCtx {
                         position: position_ty,
                         item,
                         ..
-                    } = &self.loop_sources[x];
+                    } = &loop_sources[x];
                     let position = match projection {
                         None => key_var.clone_preserving_ids(),
                         Some((at, read_at)) => Expr::apply(
                             key_var.clone_preserving_ids(),
-                            Expr::proj_index(i).with_ty(Type::pi(
+                            Expr::proj_index(i).with_ty(Type::pi_in(
+                                solver,
                                 at.clone(),
                                 key_domain.clone(),
                                 Type::Infer(Rc::clone(read_at)),
@@ -3344,8 +3456,12 @@ impl InferCtx {
                 })
                 .collect()
         };
-        let exits_at = |through: &Name| self.exits(&crossed, &reads_at(through));
-        let exits = exits_at(&key);
+        let scope_exits = &self.scope_exits;
+        let exits_at = |solver: &mut Solver, through: &Name| {
+            let reads = reads_at(solver, through);
+            exits_but(solver, scope_exits, &crossed, &reads, &|_| false)
+        };
+        let exits = exits_at(&mut self.solver, &key);
         // A position type names which keys exist, so a crossed binder in it is discharged to its
         // term at the projection's binder ([`Subst::in_data_domain`]).
         for ((at, read_at), x) in projections
@@ -3353,19 +3469,28 @@ impl InferCtx {
             .zip(&loops)
             .filter_map(|(p, x)| Some((p.as_ref()?, x)))
         {
-            let position = self.loop_sources[x].position.clone();
-            let bound = Bound::with_subst(position, exits_at(at).in_data_domain().into_owned());
-            enforce_bound_scope(read_at, "lower", &bound);
-            enforce_bound_scope(read_at, "upper", &bound);
-            let mut bounds = read_at.bounds.borrow_mut();
+            let position = loop_sources[x].position.clone();
+            let exits = exits_at(&mut self.solver, at);
+            let bound = Bound::with_subst(
+                &mut self.solver,
+                position,
+                exits.in_data_domain().into_owned(),
+            );
+            enforce_bound_scope(&mut self.solver, read_at, "lower", &bound);
+            enforce_bound_scope(&mut self.solver, read_at, "upper", &bound);
+            let bounds = read_at.bounds_mut(&mut self.solver);
             bounds.lower_mut().push(bound.clone());
             bounds.upper_mut().push(bound);
         }
         // The row's value stands under the key, where the terms the exits put in it read it.
-        let element = InferVar::fresh_in(self.level, &target_scope.extended(key.clone()));
-        let bound = Bound::with_subst(value.clone(), exits);
-        enforce_bound_scope(&element, "lower", &bound);
-        element.bounds.borrow_mut().lower_mut().push(bound);
+        let element = InferVar::fresh_in(
+            &mut self.solver,
+            self.level,
+            &target_scope.extended(key.clone()),
+        );
+        let bound = Bound::with_subst(&mut self.solver, value.clone(), exits);
+        enforce_bound_scope(&mut self.solver, &element, "lower", &bound);
+        element.bounds_mut(&mut self.solver).lower_mut().push(bound);
         let contribution = Type::Fun {
             binder: crate::ccl::FunBinder::Whole(key),
             fun_kind: crate::ccl::ty::FunKind::Data(None),
@@ -3400,75 +3525,25 @@ impl InferCtx {
     /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
     /// target"). A kept binder inside a joined one of the crossing is joined too: it holds one
     /// value per value of the binder around it ([`Self::joined_in_crossing`]).
-    fn exits(&self, crossed: &[Name], at_key: &[(Name, Expr)]) -> Subst {
-        self.exits_but(crossed, at_key, &|_| false)
-    }
-
-    /// [`Self::exits`] without the exit of each binder `stays` names, which stays in scope.
-    /// Such a binder still joins the kept binders inside it.
-    fn exits_but(
-        &self,
-        crossed: &[Name],
-        at_key: &[(Name, Expr)],
-        stays: &dyn Fn(&Name) -> bool,
-    ) -> Subst {
-        let joined = self.joined_in_crossing(crossed);
-        // Composed from the outermost exit inward: `𝑒₀ ; (𝑒₁ ; (… ; 𝑒ₙ))`, which is the same
-        // substitution as composing innermost first, since composition is associative. This
-        // order applies each exit's term only to the finished exits outside it. Composing
-        // innermost first applies every later exit to every term already composed, and a term
-        // whose type slots hold unresolved variables suspends on each of those partial
-        // composites ([`Subst::then`]), so the variables minted grew with the binders crossed
-        // times the terms crossing them.
-        crossed
-            .iter()
-            .enumerate()
-            .rev()
-            .fold(Subst::id(), |exits, (i, name)| {
-                if stays(name) {
-                    return exits;
-                }
-                let exit = match self.exit_of(name) {
-                    ScopeExit::Discharge(definition) => {
-                        Subst::discharge(name.clone(), Rc::clone(definition))
-                    }
-                    _ if !joined[i] => return exits,
-                    _ => match at_key.iter().find(|(x, _)| x == name) {
-                        Some((_, read)) => {
-                            Subst::join_at_key(name.clone(), read.clone_preserving_ids())
-                        }
-                        None => Subst::join(name.clone()),
-                    },
-                };
-                Subst::then(&exit, &exits)
-            })
+    fn exits(&mut self, crossed: &[Name], at_key: &[(Name, Expr)]) -> Subst {
+        exits_but(
+            &mut self.solver,
+            &self.scope_exits,
+            crossed,
+            at_key,
+            &|_| false,
+        )
     }
 
     /// The exit recorded for the innermost binder `name` in scope.
     fn exit_of(&self, name: &Name) -> &ScopeExit {
-        self.scope_exits
-            .get(name)
-            .and_then(|exits| exits.last())
-            .unwrap_or_else(|| panic!("no scope exit recorded for the binder `{name}`"))
+        exit_of(&self.scope_exits, name)
     }
 
-    /// Whether each binder of `crossed`, innermost first, is joined over in the crossing: a
-    /// joined binder, and a kept one inside a joined one.
+    /// Whether each binder of `crossed`, innermost first, is joined over in the crossing
+    /// ([`joined_in_crossing`]).
     fn joined_in_crossing(&self, crossed: &[Name]) -> Vec<bool> {
-        // `crossed` is innermost first, so a binder is inside the outermost joined one when
-        // that one comes later in it.
-        let outermost_join = crossed
-            .iter()
-            .rposition(|name| matches!(self.exit_of(name), ScopeExit::Join));
-        crossed
-            .iter()
-            .enumerate()
-            .map(|(i, name)| match self.exit_of(name) {
-                ScopeExit::Discharge(_) => false,
-                ScopeExit::Keep => outermost_join.is_some_and(|j| j > i),
-                ScopeExit::Join => true,
-            })
-            .collect()
+        joined_in_crossing(&self.scope_exits, crossed)
     }
 
     /// Record the joined binders each `let` of `crossed`, innermost first, varies with
@@ -3551,6 +3626,75 @@ fn name_function_binders(ty: &mut Type) {
     ty.walk_children_mut(name_function_binders);
 }
 
+/// The substitution for leaving the binders of `crossed`, innermost first, by their recorded
+/// exits, without the exit of each binder `stays` names, which stays in scope. Such a binder
+/// still joins the kept binders inside it.
+fn exits_but(
+    solver: &mut Solver,
+    scope_exits: &HashMap<Name, Vec<ScopeExit>>,
+    crossed: &[Name],
+    at_key: &[(Name, Expr)],
+    stays: &dyn Fn(&Name) -> bool,
+) -> Subst {
+    let joined = joined_in_crossing(scope_exits, crossed);
+    // Composed from the outermost exit inward: `𝑒₀ ; (𝑒₁ ; (… ; 𝑒ₙ))`, which is the same
+    // substitution as composing innermost first, since composition is associative. This
+    // order applies each exit's term only to the finished exits outside it. Composing
+    // innermost first applies every later exit to every term already composed, and a term
+    // whose type slots hold unresolved variables suspends on each of those partial
+    // composites ([`Subst::then`]), so the variables minted grew with the binders crossed
+    // times the terms crossing them.
+    crossed
+        .iter()
+        .enumerate()
+        .rev()
+        .fold(Subst::id(), |exits, (i, name)| {
+            if stays(name) {
+                return exits;
+            }
+            let exit = match exit_of(scope_exits, name) {
+                ScopeExit::Discharge(definition) => {
+                    Subst::discharge(name.clone(), Rc::clone(definition))
+                }
+                _ if !joined[i] => return exits,
+                _ => match at_key.iter().find(|(x, _)| x == name) {
+                    Some((_, read)) => {
+                        Subst::join_at_key(name.clone(), read.clone_preserving_ids())
+                    }
+                    None => Subst::join(name.clone()),
+                },
+            };
+            Subst::then(solver, &exit, &exits)
+        })
+}
+
+/// The exit recorded for the innermost binder `name` in scope.
+fn exit_of<'a>(scope_exits: &'a HashMap<Name, Vec<ScopeExit>>, name: &Name) -> &'a ScopeExit {
+    scope_exits
+        .get(name)
+        .and_then(|exits| exits.last())
+        .unwrap_or_else(|| panic!("no scope exit recorded for the binder `{name}`"))
+}
+
+/// Whether each binder of `crossed`, innermost first, is joined over in the crossing: a
+/// joined binder, and a kept one inside a joined one.
+fn joined_in_crossing(scope_exits: &HashMap<Name, Vec<ScopeExit>>, crossed: &[Name]) -> Vec<bool> {
+    // `crossed` is innermost first, so a binder is inside the outermost joined one when
+    // that one comes later in it.
+    let outermost_join = crossed
+        .iter()
+        .rposition(|name| matches!(exit_of(scope_exits, name), ScopeExit::Join));
+    crossed
+        .iter()
+        .enumerate()
+        .map(|(i, name)| match exit_of(scope_exits, name) {
+            ScopeExit::Discharge(_) => false,
+            ScopeExit::Keep => outermost_join.is_some_and(|j| j > i),
+            ScopeExit::Join => true,
+        })
+        .collect()
+}
+
 impl TelescopeWalk for InferCtx {
     fn telescope_mut(&mut self) -> &mut Telescope {
         &mut self.telescope
@@ -3578,13 +3722,15 @@ impl InferCtx {
             self.demand_at.or(self.here()),
         );
         let result = crate::ccl::infer::solver::constrain::constrain_subtype_discharged_in(
+            &mut self.solver,
             sub,
             sup,
             discharge,
             &mut self.cache,
             &scope,
         );
-        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        self.cache
+            .report_recorded(&mut self.solver, || EdgeReport::Labeled(at()));
         result.map_err(|e| self.located_failure(e, at))
     }
 
@@ -3600,16 +3746,16 @@ impl InferCtx {
         if let crate::ccl::infer::solver::ConstrainError::NoTraitInstance {
             operator, found, ..
         } = &e
-            && let Some(refusal) = self.unordered_loop_error(
-                *operator,
-                self.current_node_id,
-                positions_detail(&coalesce_for_error(found)),
-            )
         {
-            return refusal.with_failure(failure);
+            let current = self.current_node_id;
+            let found = coalesce_for_error(&mut self.solver, found);
+            let detail = positions_detail(&mut self.solver, &found);
+            if let Some(refusal) = self.unordered_loop_error(*operator, current, detail) {
+                return refusal.with_failure(failure);
+            }
         }
-        self.raise(map_constrain_err(e, &at()))
-            .with_failure(failure)
+        let error = map_constrain_err(&mut self.solver, e, &at());
+        self.raise(error).with_failure(failure)
     }
 
     /// Run `f` with each of `names` bound to a part of a function of `kind` minted for it, the
@@ -3677,6 +3823,9 @@ impl Typing for InferCtx {
         Ok(())
     }
 
+    fn solver(&mut self) -> &mut Solver {
+        &mut self.solver
+    }
     fn defer_method(
         &mut self,
         function: &mut Expr,
@@ -3712,7 +3861,7 @@ impl Typing for InferCtx {
         // the enclosing definition's calls. Its method's type then flows into a variable of
         // the enclosing level below the call's function variable, which no use copies, so
         // every use's copy of the definition receives it.
-        let carried: HashSet<_> = scheme_obligations(&ty, self.level)
+        let carried: HashSet<_> = scheme_obligations(&mut self.solver, &ty, self.level)
             .iter()
             .map(|o| o.uid)
             .collect();
@@ -3721,7 +3870,9 @@ impl Typing for InferCtx {
             if !call.obligation.is_waiting() {
                 continue;
             }
-            if carried.contains(&call.obligation.uid) || !call.receiver_reaches_below(self.level) {
+            if carried.contains(&call.obligation.uid)
+                || !call.receiver_reaches_below(&self.solver, self.level)
+            {
                 errors.push(call.unresolved());
                 continue;
             }
@@ -3810,7 +3961,11 @@ impl Typing for InferCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        Type::Infer(InferVar::fresh_in(self.level, &self.telescope))
+        Type::Infer(InferVar::fresh_in(
+            &mut self.solver,
+            self.level,
+            &self.telescope,
+        ))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
@@ -3819,7 +3974,7 @@ impl Typing for InferCtx {
         // telescope. (A let-generalized binding instantiates through
         // `PolyScheme::instantiate_with_params`, at the use site's telescope with the
         // binders inside the definition entered after it.)
-        scheme.instantiate_in(self.level, &self.telescope)
+        scheme.instantiate_in(&mut self.solver, self.level, &self.telescope)
     }
 
     fn normalize(&mut self, ann: &Type) -> Type {
@@ -3927,10 +4082,8 @@ impl Typing for InferCtx {
                         })
                         .collect();
                     let names: Vec<Name> = binders.iter().map(|(n, _)| n.clone()).collect();
-                    Some(Type::family(
-                        binders,
-                        crate::ccl::subst::family_at_names(family, &names),
-                    ))
+                    let body = crate::ccl::subst::family_at_names(&mut self.solver, family, &names);
+                    Some(Type::family(&mut self.solver, binders, body))
                 }
                 None => p.bound().cloned(),
             };
@@ -3971,9 +4124,9 @@ impl Typing for InferCtx {
                 // the variable keeps the bound (`freshen_capability_var`).
                 if !opened.clause_except.is_empty() {
                     let mut set = CapabilitySet::default();
-                    set.add_every(
-                        Every::of_direction(of_causes).less(opened.clause_except.clone()),
-                    );
+                    let every = Every::of_direction(of_causes)
+                        .less(&mut self.solver, opened.clause_except.clone());
+                    set.add_every_in(&mut self.solver, every);
                     var.bound_above(Upper {
                         set,
                         of_requires: !of_causes,
@@ -4054,18 +4207,20 @@ impl Typing for InferCtx {
         let result = if complete {
             self.cache.at(self.here(), self.demand_at.or(self.here()));
             let result = crate::ccl::infer::solver::traits::settle_held_answers(
+                &mut self.solver,
                 Some(&opened),
                 &mut self.cache,
             );
             let at = || "a requirement under `forall`".to_string();
-            self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+            self.cache
+                .report_recorded(&mut self.solver, || EdgeReport::Labeled(at()));
             result.map_err(|e| {
                 let failure = self.cache.take_failure();
-                self.raise(map_constrain_err(e, &at()))
-                    .with_failure(failure)
+                let error = map_constrain_err(&mut self.solver, e, &at());
+                self.raise(error).with_failure(failure)
             })
         } else {
-            crate::ccl::infer::solver::traits::discard_held_answers(&opened);
+            crate::ccl::infer::solver::traits::discard_held_answers(&mut self.solver, &opened);
             Ok(())
         };
         self.opened_params.truncate(depth);
@@ -4088,8 +4243,9 @@ impl Typing for InferCtx {
             self.value_at.or(self.here()),
             self.demand_at.or(self.here()),
         );
-        let result = constrain_subtype_in(sub, sup, &mut self.cache, &scope);
-        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        let result = constrain_subtype_in(&mut self.solver, sub, sup, &mut self.cache, &scope);
+        self.cache
+            .report_recorded(&mut self.solver, || EdgeReport::Labeled(at()));
         result.map_err(|e| self.located_failure(e, at))
     }
 
@@ -4149,7 +4305,7 @@ impl Typing for InferCtx {
             inner: &scope,
             facts: &facts,
         };
-        crate::ccl::infer::solver::smt::refuted(&scope).unwrap_or(false)
+        crate::ccl::infer::solver::smt::refuted(&mut self.solver, &scope).unwrap_or(false)
     }
 
     fn function_body<R>(
@@ -4244,7 +4400,9 @@ impl Typing for InferCtx {
                 match capabilities.repr() {
                     Repr::Var(v) => var.flows_from(v, Filter::default()),
                     Repr::Known(_) => {
-                        for capability in Capabilities::capabilities_of(capabilities) {
+                        for capability in
+                            Capabilities::capabilities_of(&mut self.solver, capabilities)
+                        {
                             var.record(capability);
                         }
                     }
@@ -4481,7 +4639,7 @@ impl Typing for InferCtx {
         });
         let r = f(self);
         self.leave_node_capabilities();
-        let ordered = iterations_interact(&var, declared);
+        let ordered = iterations_interact(&mut self.solver, &var, declared);
         self.effect_loops.push(EffectLoop {
             node,
             var,
@@ -4554,14 +4712,15 @@ impl Typing for InferCtx {
     }
 
     fn unordered_loop(
-        &self,
+        &mut self,
         node: NodeId,
         source: NodeId,
         positions: &Type,
     ) -> Option<LocatedInferError> {
-        let positions = crate::ccl::infer::solve::resolve_var_type(positions)
+        let positions = crate::ccl::infer::solve::resolve_var_type(&mut self.solver, positions)
             .unwrap_or_else(|_| positions.clone());
-        self.unordered_loop_error(node, source, positions_detail(&positions))
+        let detail = positions_detail(&mut self.solver, &positions);
+        self.unordered_loop_error(node, source, detail)
     }
 
     fn raise_type(&mut self, _recorded: &Type) -> Type {
@@ -4686,12 +4845,14 @@ impl Typing for InferCtx {
         r
     }
 
-    fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError> {
+    fn definition_alone_error(&mut self, name: &Name) -> Option<LocatedInferError> {
         let binding = self.scopes.lookup(name)?;
         if !binding.generalized {
             return None;
         }
-        let err = crate::ccl::infer::solve::resolve_var_type(&binding.scheme.body).err()?;
+        let err =
+            crate::ccl::infer::solve::resolve_var_type(&mut self.solver, &binding.scheme.body)
+                .err()?;
         Some(LocatedInferError {
             error: crate::ccl::infer::map_coalesce_err(err, name.base()),
             node_id: binding.defined_at,
@@ -4700,8 +4861,8 @@ impl Typing for InferCtx {
         })
     }
 
-    fn is_generalizable(&self, def: &Expr) -> bool {
-        should_generalize(def, self.level, |name| {
+    fn is_generalizable(&mut self, def: &Expr) -> bool {
+        should_generalize(&mut self.solver, def, self.level, |name| {
             self.scopes.lookup(name).is_some_and(|b| b.generalized)
         })
     }
@@ -4714,17 +4875,19 @@ impl Typing for InferCtx {
         // scheme's own, over the body the binding settled.
         let written = match ty {
             Type::Poly(annotated) => {
-                poly_for_display(&annotated.body, self.level).map(|mut written| {
-                    let mut params = annotated.params.clone();
-                    params.append(&mut written.poly.params);
-                    written.poly.params = params;
-                    let mut requires = annotated.requires.clone();
-                    requires.append(&mut written.poly.requires);
-                    written.poly.requires = requires;
-                    written
-                })
+                poly_for_display(&mut self.solver, &annotated.body, self.level).map(
+                    |mut written| {
+                        let mut params = annotated.params.clone();
+                        params.append(&mut written.poly.params);
+                        written.poly.params = params;
+                        let mut requires = annotated.requires.clone();
+                        requires.append(&mut written.poly.requires);
+                        written.poly.requires = requires;
+                        written
+                    },
+                )
             }
-            ty => poly_for_display(ty, self.level),
+            ty => poly_for_display(&mut self.solver, ty, self.level),
         };
         if let Some(written) = written {
             self.schemes_noted.push((name.clone(), written));
@@ -4828,14 +4991,17 @@ impl Typing for InferCtx {
             let Type::Infer(read_variable) = &read_lifted else {
                 unreachable!()
             };
-            let bound = Bound::with_subst(read_body, discharge.clone());
-            enforce_bound_scope(read_variable, "lower", &bound);
-            read_variable.bounds.borrow_mut().lower_mut().push(bound);
+            let bound = Bound::with_subst(&mut self.solver, read_body, discharge.clone());
+            enforce_bound_scope(&mut self.solver, read_variable, "lower", &bound);
+            read_variable
+                .bounds_mut(&mut self.solver)
+                .lower_mut()
+                .push(bound);
             self.place_reads.insert(v.uid, read_lifted);
         }
-        let bound = Bound::with_subst(body_ty, discharge);
-        enforce_bound_scope(v, "lower", &bound);
-        v.bounds.borrow_mut().lower_mut().push(bound);
+        let bound = Bound::with_subst(&mut self.solver, body_ty, discharge);
+        enforce_bound_scope(&mut self.solver, v, "lower", &bound);
+        v.bounds_mut(&mut self.solver).lower_mut().push(bound);
         lifted
     }
 
@@ -4848,9 +5014,9 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &lifted else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        let bound = Bound::with_subst(body_ty, Subst::join_arm(binder.clone()));
-        enforce_bound_scope(v, "lower", &bound);
-        v.bounds.borrow_mut().lower_mut().push(bound);
+        let bound = Bound::with_subst(&mut self.solver, body_ty, Subst::join_arm(binder.clone()));
+        enforce_bound_scope(&mut self.solver, v, "lower", &bound);
+        v.bounds_mut(&mut self.solver).lower_mut().push(bound);
         lifted
     }
 
@@ -4858,10 +5024,10 @@ impl Typing for InferCtx {
         // The inferred type is read before the edge, which a failure can leave bounding its
         // variables by the annotation too. The types inside its predicates are resolved
         // only on failure, on a copy of each predicate: nearly every ascription holds.
-        let before = super::resolve_var_type(inferred).unwrap_or(Type::Hole);
-        let mismatch = || {
+        let before = super::resolve_var_type(&mut self.solver, inferred).unwrap_or(Type::Hole);
+        let mismatch = |solver: &mut Solver| {
             let mut inferred = before.clone();
-            super::resolve_predicate_types(&mut inferred);
+            super::resolve_predicate_types(solver, &mut inferred);
             InferError::AnnotationMismatch {
                 annotation: Box::new(ann.clone()),
                 inferred: Box::new(inferred),
@@ -4878,22 +5044,22 @@ impl Typing for InferCtx {
     ) -> Result<Type, LocatedInferError> {
         // Called at the right-hand side's level, one above the binding's, which is
         // where every variable the right-hand side minted sits.
-        let mismatch = match poly_for_display(inferred, self.level - 1) {
+        let mismatch = match poly_for_display(&mut self.solver, inferred, self.level - 1) {
             Some(mut shown) => InferError::PolyAnnotationMismatch {
                 inferred: Box::new({
-                    shown.map_types(&mut super::resolve_predicate_types);
+                    shown.map_types(&mut |t| super::resolve_predicate_types(&mut self.solver, t));
                     shown
                 }),
                 annotation: Box::new(annotation.clone()),
             },
             None => InferError::AnnotationMismatch {
                 annotation: Box::new(annotation.clone()),
-                inferred: Box::new(coalesce_for_error(inferred)),
+                inferred: Box::new(coalesce_for_error(&mut self.solver, inferred)),
             },
         };
         // Rendered ahead of the edge: the polymorphic type a mismatch reports is the
         // definition's, before the failed ascription adds its bounds to it.
-        self.reconcile_annotation(inferred, declared, || mismatch.clone())
+        self.reconcile_annotation(inferred, declared, |_| mismatch.clone())
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {
@@ -4909,7 +5075,7 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         // The parts of whatever function `t` is, a sum's included: under the binders of the
         // demand's kind, which the edge relates to `t`'s.
-        let kind = crate::ccl::ty::FunKind::fresh_var();
+        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver);
         let d = self.fresh_part(&kind);
         let c = self.fresh_part(&kind);
         // Destructuring is kind-agnostic: `Data` and `Compute` are incomparable, so the
@@ -4935,10 +5101,11 @@ impl Typing for InferCtx {
     ) -> Result<(Type, Type), LocatedInferError> {
         // A named demand, as `apply`'s: the codomain edge relates `t`'s binder to `binder`,
         // and the codomain is minted where `binder` is in scope.
-        let kind = crate::ccl::ty::FunKind::fresh_var();
+        let kind = crate::ccl::ty::FunKind::fresh_var(&mut self.solver);
         let d = self.fresh_part(&kind);
         let c = self.scoped(binder, &d, |ctx| ctx.fresh_part(&kind));
-        let shape = Type::pi_kinded(binder.clone(), d.clone(), c.clone(), kind);
+        let shape =
+            Type::pi_kinded_in(&mut self.solver, binder.clone(), d.clone(), c.clone(), kind);
         self.require_sub(t, &shape, at)?;
         Ok((d, c))
     }
@@ -4962,7 +5129,7 @@ impl Typing for InferCtx {
             Type::Fun {
                 binder: crate::ccl::FunBinder::Whole(b),
                 ..
-            } => Type::pi(b.clone(), d.clone(), c.clone()),
+            } => Type::pi_in(&mut self.solver, b.clone(), d.clone(), c.clone()),
             _ => fun(d.clone(), c.clone()),
         };
         self.require_sub(&shape, t, at)?;
@@ -5037,7 +5204,7 @@ impl Typing for InferCtx {
         // second variable describes one consumption twice; see [`Typing::apply`].
         let demand_kind = match kind {
             Some(k @ crate::ccl::ty::FunKind::Var(_)) => k.clone(),
-            _ => crate::ccl::ty::FunKind::fresh_var(),
+            _ => crate::ccl::ty::FunKind::fresh_var(&mut self.solver),
         };
         // A call of one argument expects a function of one parameter, its binder the whole
         // input; an argument list expects a parameter list as long, each parameter named
@@ -5046,19 +5213,20 @@ impl Typing for InferCtx {
             None => {
                 // The argument goes into the result's predicates in the spelling predicates are
                 // compared in (`ccl_utils::predicate_term`).
-                let passed = crate::ccl::ccl_utils::predicate_term(argument);
+                let passed = crate::ccl::ccl_utils::predicate_term(&mut self.solver, argument);
                 let x = Name::solver_arg(passed_variable(&passed));
                 // Parts of the function applied, a sum's included.
                 let d = self.fresh_part(&demand_kind);
                 // The codomain stands under the binder, so it is minted where the binder is in
                 // scope.
                 let result = self.scoped(&x, &d, |ctx| ctx.fresh_part(&demand_kind));
-                let expected = Type::pi_kinded(x.clone(), d, result.clone(), demand_kind);
+                let expected =
+                    Type::pi_kinded_in(&mut self.solver, x.clone(), d, result.clone(), demand_kind);
                 let discharge = Subst::discharge(&x, passed);
                 (expected, result, discharge, None)
             }
             Some(n) => {
-                let passed = crate::ccl::ccl_utils::predicate_term(argument);
+                let passed = crate::ccl::ccl_utils::predicate_term(&mut self.solver, argument);
                 let arguments: Vec<Expr> = (0..n).map(|j| list_component(&passed, j)).collect();
                 let names: Vec<Name> = arguments
                     .iter()
@@ -5108,8 +5276,10 @@ impl Typing for InferCtx {
         if let Type::Infer(_) = fn_ty.peel_refinements()
             && let Repr::Var(call) = capabilities.repr()
         {
-            call.open_input
-                .set(!receives_a_value(fn_ty) && !kind.is_some_and(|k| k.resolved().is_data()));
+            call.open_input.set(
+                !receives_a_value(&mut self.solver, fn_ty)
+                    && !kind.is_some_and(|k| k.resolved_in(&self.solver).is_data()),
+            );
             self.capability_calls_of_variables
                 .push((Rc::clone(call), fn_ty.clone()));
         }
@@ -5152,9 +5322,9 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        let bound = Bound::with_subst(result, discharge);
-        enforce_bound_scope(v, "lower", &bound);
-        v.bounds.borrow_mut().lower_mut().push(bound);
+        let bound = Bound::with_subst(&mut self.solver, result, discharge);
+        enforce_bound_scope(&mut self.solver, v, "lower", &bound);
+        v.bounds_mut(&mut self.solver).lower_mut().push(bound);
         Ok(applied)
     }
 
@@ -5168,7 +5338,9 @@ impl Typing for InferCtx {
         _stamped: &Type,
     ) -> Type {
         match key_binder {
-            Some(binder) => crate::ccl::subst::discharge_codomain(binder, key, codomain),
+            Some(binder) => {
+                crate::ccl::subst::discharge_codomain_in(&mut self.solver, binder, key, codomain)
+            }
             None => codomain.clone(),
         }
     }
@@ -5235,13 +5407,14 @@ pub(super) fn list_component(passed: &Expr, j: usize) -> Expr {
 
 /// Mark each variable in a constant family's normalized body as standing for a hole of the
 /// family given for `param` ([`crate::ccl::infer_var::StandsFor::ConstantFamily`]).
-fn mark_constant_family_holes(body: &Type, param: &smol_str::SmolStr) {
+fn mark_constant_family_holes(solver: &mut Solver, body: &Type, param: &smol_str::SmolStr) {
     if let Type::Infer(v) = body {
-        v.mark_stands_for(crate::ccl::infer_var::StandsFor::ConstantFamily(
-            param.clone(),
-        ));
+        v.mark_stands_for(
+            solver,
+            crate::ccl::infer_var::StandsFor::ConstantFamily(param.clone()),
+        );
     }
-    body.walk_children(|c| mark_constant_family_holes(c, param));
+    body.walk_children(|c| mark_constant_family_holes(solver, c, param));
 }
 
 #[cfg(test)]
@@ -5255,7 +5428,7 @@ mod tests {
     /// through the emission context.
     #[test]
     fn fresh_variables_carry_the_live_telescope() {
-        let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        let mut ctx = InferCtx::new(Solver::new(), HashMap::new(), NodeId::fresh());
         ctx.instances = InstanceTable::std();
         let k = Name::raw("k");
         let n = Name::raw("n");
@@ -5282,13 +5455,15 @@ mod tests {
     /// `λ __gb_k → …` is the exercising case.
     #[test]
     fn an_unnamed_annotation_adopts_the_inferred_pi_binder() {
-        let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        let mut ctx = InferCtx::new(Solver::new(), HashMap::new(), NodeId::fresh());
         ctx.instances = InstanceTable::std();
         let k = Name::raw("__gb_k");
-        let inferred = Type::pi_kinded(
+        let codomain = Type::infer(&mut ctx.solver);
+        let inferred = Type::pi_kinded_in(
+            &mut ctx.solver,
             k.clone(),
             Type::Base(crate::ccl::BaseType::Int),
-            Type::infer(),
+            codomain,
             crate::ccl::FunKind::Data(None),
         );
         let ann = Type::data_fun(Type::Base(crate::ccl::BaseType::Int), Type::Hole);

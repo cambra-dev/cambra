@@ -51,7 +51,9 @@ pub mod scheme;
 pub mod simplify_type;
 pub mod smt;
 pub mod spec_key;
+pub mod state;
 pub mod traits;
+pub mod var;
 
 // Re-export every symbol that external modules reach through the
 // `crate::ccl::infer::solver::…` path (chiefly the inference engine), so the
@@ -70,20 +72,21 @@ pub use scheme::{
 };
 pub use simplify_type::simplify_type;
 pub use spec_key::{SpecKey, spec_key};
+pub use state::Solver;
 
 /// The level of `ty` — the maximum scope level of any inference variable
 /// occurring inside it. Leaves and `Hole` are level 0; `Refinement` defers
 /// to its inner type (refinements are lattice-blind). Used by `extrude` and by
 /// let-generalization (`infer::context::should_generalize`, which generalizes
 /// a binding when its type's level exceeds the binding level).
-pub fn type_level(ty: &Type) -> Level {
+pub fn type_level(solver: &Solver, ty: &Type) -> Level {
     match ty {
-        Type::Infer(v) => v.level(),
-        Type::BarrierVar(barrier) => barrier.level(),
+        Type::Infer(v) => v.level(solver),
+        Type::BarrierVar(barrier) => barrier.level(solver),
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.
-        Type::BoundedHole(t) => type_level(t),
+        Type::BoundedHole(t) => type_level(solver, t),
         Type::Fun {
             fun_kind,
             domain: d,
@@ -93,30 +96,42 @@ pub fn type_level(ty: &Type) -> Level {
             .witnesses()
             .iter()
             .flat_map(|w| w.types())
-            .map(type_level)
+            .map(|t| type_level(solver, t))
             .max()
             .unwrap_or(0)
-            .max(type_level(d))
-            .max(type_level(c)),
+            .max(type_level(solver, d))
+            .max(type_level(solver, c)),
         Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => {
-            ts.iter().map(type_level).max().unwrap_or(0)
+            ts.iter().map(|t| type_level(solver, t)).max().unwrap_or(0)
         }
-        Type::Split { input, output } => type_level(input).max(type_level(output)),
-        Type::DepTuple(cs) => cs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
+        Type::Split { input, output } => type_level(solver, input).max(type_level(solver, output)),
+        Type::DepTuple(cs) => cs
+            .iter()
+            .map(|(_, t)| type_level(solver, t))
+            .max()
+            .unwrap_or(0),
         Type::Family { binders, body } => binders
             .iter()
-            .map(|(_, t)| type_level(t))
+            .map(|(_, t)| type_level(solver, t))
             .max()
             .unwrap_or(0)
-            .max(type_level(body)),
-        Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
-        Type::Variant(tags, _) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
-        Type::Refinement(inner, _) => type_level(inner),
+            .max(type_level(solver, body)),
+        Type::Record(fs) => fs
+            .iter()
+            .map(|(_, t)| type_level(solver, t))
+            .max()
+            .unwrap_or(0),
+        Type::Variant(tags, _) => tags
+            .iter()
+            .map(|(_, t)| type_level(solver, t))
+            .max()
+            .unwrap_or(0),
+        Type::Refinement(inner, _) => type_level(solver, inner),
         // Combine both children like `Fun` (domain + codomain): a later
         // increment's per-call-site domain generalization depends on the
         // `domain`'s level surfacing here, so a fresh domain var pins the
         // level of the enclosing `Mut`.
-        Type::History { function, .. } => type_level(function),
+        Type::History { function, .. } => type_level(solver, function),
         // A channel domain stores its introduction level, but deliberately
         // reports 0 here: `type_level` drives extrusion and bound-recording
         // level scoping, and a rigid atom must flow through bounds to
@@ -138,10 +153,15 @@ pub fn type_level(ty: &Type) -> Level {
         // what routes such an edge to the escape check
         // (`src/ccl/design/type-parameters.md`, "Levels").
         Type::Param(param) => param.level(),
-        Type::Poly(poly) => poly.types().map(type_level).max().unwrap_or(0),
+        Type::Poly(poly) => poly
+            .types()
+            .map(|t| type_level(solver, t))
+            .max()
+            .unwrap_or(0),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
+        | Type::Undetermined(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => 0,
@@ -150,8 +170,8 @@ pub fn type_level(ty: &Type) -> Level {
 
 /// Construct a fresh inference variable at the given level, as a [`Type`]
 /// for direct use in constraint emission.
-pub fn fresh_var(level: Level) -> Type {
-    Type::Infer(InferVar::fresh(level))
+pub fn fresh_var(solver: &mut Solver, level: Level) -> Type {
+    Type::Infer(InferVar::fresh(solver, level))
 }
 
 /// Wrap a [`BaseType`] as a primitive [`Type`].
@@ -175,41 +195,41 @@ pub fn fun(d: Type, c: Type) -> Type {
 pub(crate) mod test_helpers {
     use std::rc::Rc;
 
+    use super::Solver;
+
     use crate::ccl::{FieldKey, Refinement, Type};
 
     /// `depth` diamonds sharing one scalar leaf, with `edge` on each side's path to the next.
     pub(crate) fn diamond_bound_graph(
+        solver: &mut Solver,
         depth: usize,
         leaf: Type,
         edge: &crate::ccl::subst::Subst,
     ) -> (Type, usize) {
         use crate::ccl::Bound;
-        let mut root = super::fresh_var(0);
+        let mut root = super::fresh_var(solver, 0);
         let Type::Infer(bottom) = &root else {
             unreachable!()
         };
         bottom
-            .bounds
-            .borrow_mut()
+            .bounds_mut(solver)
             .lower_mut()
             .push(Bound::conc(leaf));
         for _ in 0..depth {
-            let top = super::fresh_var(0);
+            let top = super::fresh_var(solver, 0);
             let Type::Infer(parent) = &top else {
                 unreachable!()
             };
             for _ in 0..2 {
-                let side = super::fresh_var(0);
+                let side = super::fresh_var(solver, 0);
                 let (Type::Infer(v), Type::Infer(below)) = (&side, &root) else {
                     unreachable!()
                 };
-                v.bounds
-                    .borrow_mut()
+                v.bounds_mut(solver)
                     .lower_mut()
                     .push(Bound::suspended_on(below, edge.clone()));
                 parent
-                    .bounds
-                    .borrow_mut()
+                    .bounds_mut(solver)
                     .lower_mut()
                     .push(Bound::conc(side));
             }
@@ -299,35 +319,29 @@ mod tests {
 
     #[test]
     fn fresh_var_has_no_bounds() {
-        let v = InferVar::fresh(0);
-        let s = v.bounds.borrow();
+        let solver = &mut Solver::new();
+        let v = InferVar::fresh(solver, 0);
+        let s = v.bounds(solver);
         assert!(s.lower().is_empty());
         assert!(s.upper().is_empty());
-        assert_eq!(v.level(), 0);
+        assert_eq!(v.level(solver), 0);
     }
 
-    /// Regression: mutually-constrained inference variables form an `Rc`
-    /// cycle through their bounds (`?a <: ?b` stores `?b` in `?a`'s upper
-    /// bounds and vice versa). Reference counting alone never reclaims it;
-    /// the owning [`InferArena`](crate::ccl::infer::InferArena)'s `Drop` is
-    /// what clears the bounds and breaks the cycle.
-    /// If this fails, the cycle is leaking again.
+    /// Mutually constrained variables (`?a <: ?b` and `?b <: ?a`) hold each other only
+    /// through the solver's tables, so dropping the solver releases both.
     #[test]
-    fn mutually_constrained_vars_leak_via_rc_cycle() {
-        use crate::ccl::infer::InferArena;
+    fn mutually_constrained_vars_are_released_with_the_solver() {
+        let mut owned = Solver::new();
+        let solver = &mut owned;
         use std::rc::Weak;
 
-        // Activate an arena so the two `fresh_var` mints below are owned by
-        // it; its `Drop` is what clears the bounds and breaks the cycle.
-        let arena = InferArena::new();
-
-        let a = fresh_var(0);
-        let b = fresh_var(0);
+        let a = fresh_var(solver, 0);
+        let b = fresh_var(solver, 0);
         let mut cache = ConstrainCache::new();
         // ?a <: ?b and ?b <: ?a — the ordinary "spurious cycle" the solver
         // tolerates; nothing recursive or exotic is required.
-        constrain_subtype(&a, &b, &mut cache).unwrap();
-        constrain_subtype(&b, &a, &mut cache).unwrap();
+        constrain_subtype(solver, &a, &b, &mut cache).unwrap();
+        constrain_subtype(solver, &b, &a, &mut cache).unwrap();
 
         let (wa, wb): (Weak<InferVar>, Weak<InferVar>) = match (&a, &b) {
             (Type::Infer(va), Type::Infer(vb)) => (Rc::downgrade(va), Rc::downgrade(vb)),
@@ -341,9 +355,7 @@ mod tests {
         drop(a);
         drop(b);
 
-        // Tearing down the arena clears both cells' bounds, severing the
-        // mutual `Rc` edges. Only after this can the refcounts reach zero.
-        drop(arena);
+        drop(owned);
 
         assert!(
             wa.upgrade().is_none() && wb.upgrade().is_none(),
@@ -353,15 +365,17 @@ mod tests {
 
     #[test]
     fn level_of_compound_is_max_of_components() {
-        let v0 = fresh_var(0);
-        let v1 = fresh_var(1);
+        let solver = &mut Solver::new();
+        let v0 = fresh_var(solver, 0);
+        let v1 = fresh_var(solver, 1);
         let f = fun(v0, v1);
-        assert_eq!(type_level(&f), 1);
+        assert_eq!(type_level(solver, &f), 1);
     }
 
     #[test]
     fn primitives_have_level_zero() {
+        let solver = &mut Solver::new();
         let p = prim(BaseType::Int);
-        assert_eq!(type_level(&p), 0);
+        assert_eq!(type_level(solver, &p), 0);
     }
 }

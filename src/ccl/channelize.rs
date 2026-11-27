@@ -148,10 +148,10 @@ fn is_channel_type(ty: &Type) -> bool {
 }
 
 /// A type node that must not survive channelization: a channel type, or a `Hole` /
-/// `Infer` stamped on a node this pass constructed or invalidated.
+/// undetermined type stamped on a node this pass constructed or invalidated.
 #[cfg(debug_assertions)]
 fn is_type_residue(ty: &Type) -> bool {
-    matches!(ty, Type::Hole | Type::Infer(_)) || is_channel_type(ty)
+    matches!(ty, Type::Hole | Type::Infer(_) | Type::Undetermined(_)) || is_channel_type(ty)
 }
 
 /// `true` when `ty` carries channelization-erasable residue anywhere in it.
@@ -1694,7 +1694,12 @@ fn gated_contribution(
         .iter()
         .rev()
         .fold(value.row, |row, (binding, definition)| {
-            crate::ccl::ccl_utils::closed_let_type(binding, definition, row)
+            crate::ccl::ccl_utils::closed_let_type(
+                &mut crate::ccl::infer::solver::Solver::none(),
+                binding,
+                definition,
+                row,
+            )
         });
     let value = crate::ccl::ccl_utils::gate_values(
         Some(source),
