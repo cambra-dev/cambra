@@ -35,46 +35,64 @@ pub enum TileGuard {
 }
 
 impl TileGuard {
-    /// The part of this guard naming a record's scalar field at some of the rows of a level:
-    /// cells a producer stops returning once released, though their row stays open
-    /// (`src/interpreter/design-operators.md`, "The release contract"). Everything else
-    /// becomes empty, so `None` where there is no such part.
-    pub(crate) fn released_cells(&self) -> Option<TileGuard> {
-        fn walk(guard: &TileGuard, under_a_level: bool) -> TileGuard {
-            match guard {
-                TileGuard::Function(FunctionGuard::Codomain(inner)) => {
-                    TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(inner, true))))
+    /// Enclosing rows whose entire field this guard names. A partial commit-time
+    /// region describes versions inside a store rather than the store field itself.
+    pub(crate) fn field_rows(&self) -> Option<&Predicate> {
+        match self {
+            Self::Scalar(p) | Self::Aggregation(p) => Some(Self::leaf_rows(p)),
+            Self::Function(FunctionGuard::Domain(p)) => {
+                let (rows, here) = p.split_qualification();
+                if p.is_false() {
+                    Some(&Predicate::False)
+                } else {
+                    here.is_true().then_some(rows)
                 }
-                TileGuard::Record(fields) => TileGuard::Record(
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract released row fields that a kernel recomputing an enclosing row must omit.
+    /// Commit-time releases inside a store still use the store's version reclamation.
+    pub(crate) fn released_fields(&self, tiling: &Tiling) -> Option<TileGuard> {
+        fn walk(g: &TileGuard, t: &Tiling, under_rows: bool) -> TileGuard {
+            match (g, t) {
+                (TileGuard::Or(arms), _) => {
+                    TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, t, under_rows)).collect())
+                }
+                (
+                    TileGuard::Function(FunctionGuard::Codomain(inner)),
+                    Tiling::DataFunction { codomain, .. },
+                ) => TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(
+                    inner, codomain, true,
+                )))),
+                (TileGuard::Record(fields), Tiling::Record(types)) => TileGuard::Record(
                     fields
                         .iter()
-                        .map(|(name, field)| {
-                            let part = match field {
-                                TileGuard::Scalar(_) if under_a_level => field.clone(),
-                                TileGuard::Scalar(_) => TileGuard::Scalar(Predicate::False),
-                                other => walk(other, under_a_level),
-                            };
-                            (name.clone(), part)
-                        })
+                        .map(|(name, field)| (name.clone(), walk(field, &types[name], under_rows)))
                         .collect(),
                 ),
-                // A row of a union carries one tag, so an arm's cell is the whole row's value
-                // and goes with the row's key rather than on its own.
-                TileGuard::Union(arms) => TileGuard::Union(arms.map(|_, arm| match arm {
-                    TileGuard::Scalar(_) => TileGuard::Scalar(Predicate::False),
-                    other => walk(other, under_a_level),
-                })),
-                TileGuard::Or(arms) => {
-                    TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, under_a_level)).collect())
+                (TileGuard::Union(arms), Tiling::Union(types)) => {
+                    TileGuard::Union(arms.map(|tag, arm| {
+                        walk(
+                            arm,
+                            types.get(tag).expect("guard fits its union tiling"),
+                            under_rows,
+                        )
+                    }))
                 }
-                TileGuard::Function(FunctionGuard::Domain(_)) => {
-                    TileGuard::Function(FunctionGuard::Domain(Predicate::False))
+                // A keyless field under rows, a scalar, an accumulator or a store, is released at
+                // the rows its guard names whole, whether the guard is the field's or one arm of an
+                // `Or` of them.
+                (leaf, Tiling::Scalar(_) | Tiling::Aggregation { .. } | Tiling::Store { .. })
+                    if under_rows && leaf.field_rows().is_some() =>
+                {
+                    leaf.clone()
                 }
-                TileGuard::Scalar(_) => TileGuard::Scalar(Predicate::False),
-                TileGuard::Aggregation(_) => TileGuard::Aggregation(Predicate::False),
+                _ => t.empty_guard(),
             }
         }
-        let part = walk(self, false);
+        let part = walk(self, tiling, false);
         (!part.is_empty()).then_some(part)
     }
 
@@ -247,7 +265,14 @@ impl TileGuard {
                         true => Predicate::False,
                         false => Predicate::True,
                     },
-                    depth => outermost(rows, depth - 1),
+                    depth => {
+                        let rows = if rows.qualifies() {
+                            TileGuard::leaf_rows(rows)
+                        } else {
+                            rows
+                        };
+                        outermost(rows, depth - 1)
+                    }
                 },
             }
         }
@@ -395,7 +420,7 @@ fn lift_union(arms: &TagMap<TileGuard>, depth: usize) -> Vec<TileGuard> {
 
 /// The paths reaching `guard` under which it names everything: for a guard standing under
 /// a level, the keys of that level whose whole value it names.
-fn whole_rows(guard: &TileGuard) -> Predicate {
+pub(super) fn whole_rows(guard: &TileGuard) -> Predicate {
     match guard {
         g if g.is_universal() => Predicate::True,
         g if g.is_empty() => Predicate::False,
@@ -1369,17 +1394,17 @@ fn subsumes_at(guard: Option<&TileGuard>, other: &TileGuard, above: &[Predicate]
 /// The arms of a guard at one position, by what they name: keys, what lies one level in, a
 /// record's fields, a variant's tags, or a keyless leaf. A guard of one tiling names only kinds
 /// its shape has.
-struct Parts {
-    domain: Predicate,
-    codomain: Option<TileGuard>,
-    record: Option<HashMap<SmolStr, TileGuard>>,
-    union: Option<TagMap<TileGuard>>,
-    scalar: Predicate,
+pub(super) struct Parts {
+    pub(super) domain: Predicate,
+    pub(super) codomain: Option<TileGuard>,
+    pub(super) record: Option<HashMap<SmolStr, TileGuard>>,
+    pub(super) union: Option<TagMap<TileGuard>>,
+    pub(super) scalar: Predicate,
     aggregation: Predicate,
 }
 
 impl Parts {
-    fn of(guard: Option<&TileGuard>) -> Parts {
+    pub(super) fn of(guard: Option<&TileGuard>) -> Parts {
         let mut parts = Parts {
             domain: Predicate::False,
             codomain: None,
@@ -1461,6 +1486,75 @@ mod tests {
     use crate::ccl::{AggregateKind, FieldKey, TagMap};
     use crate::interpreter::tiling::tests::*;
     use crate::interpreter::{BaseType, ColumnValue};
+
+    /// A store field released at some rows through an `Or` of its whole-row guards keeps every
+    /// arm, as a store field released through one such guard does.
+    #[test]
+    fn released_fields_keep_every_arm_of_a_store_fields_or() {
+        let store = Tiling::Store {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Record(HashMap::new())),
+        };
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Record(HashMap::from([
+                ("s".into(), store),
+                ("b".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ])),
+        );
+        let rows = |k| {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
+                Predicate::point(Value::UInt(k)),
+                Predicate::True,
+            )))
+        };
+        let either = TileGuard::Or(vec![rows(0), rows(2)]);
+        let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+            HashMap::from([
+                ("s".into(), either.clone()),
+                ("b".into(), TileGuard::Scalar(Predicate::False)),
+            ]),
+        ))));
+        let Some(TileGuard::Function(FunctionGuard::Codomain(inner))) =
+            released.released_fields(&tiling)
+        else {
+            panic!("the release names cells beneath the rows")
+        };
+        let TileGuard::Record(fields) = *inner else {
+            panic!("the cells are a record's")
+        };
+        assert_eq!(fields["s"], TileGuard::flatten_or(vec![either]));
+        assert!(!fields["s"].is_empty());
+    }
+
+    /// A keyless field's release that is an `Or` of leaves keeps every leaf: each names the rows
+    /// whose cell the consumer released, and a recomputed row omits those cells.
+    #[test]
+    fn released_fields_keep_every_leaf_of_an_or() {
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Record(HashMap::from([("a".into(), int()), ("b".into(), int())])),
+        );
+        let row = |k| Predicate::qualified(Predicate::point(Value::UInt(k)), Predicate::True);
+        let either = TileGuard::Or(vec![TileGuard::Scalar(row(0)), TileGuard::Scalar(row(2))]);
+        let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+            HashMap::from([
+                ("a".into(), either.clone()),
+                ("b".into(), TileGuard::Scalar(Predicate::False)),
+            ]),
+        ))));
+        let Some(TileGuard::Function(FunctionGuard::Codomain(inner))) =
+            released.released_fields(&tiling)
+        else {
+            panic!("the release names cells beneath the rows")
+        };
+        let TileGuard::Record(fields) = *inner else {
+            panic!("the cells are a record's")
+        };
+        assert_eq!(fields["a"], TileGuard::flatten_or(vec![either]));
+        assert!(!fields["a"].is_empty());
+    }
 
     fn keyed_by(arms: TagMap<Extent>) -> Tiling {
         Tiling::data_function(

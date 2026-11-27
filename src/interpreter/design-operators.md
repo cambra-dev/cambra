@@ -625,9 +625,14 @@ that producer with an intent guard, a consumer notification handle and a `Subscr
 | `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
 
 `get` and `release` are provided `TileProducer` methods around required producer-specific
-`get_impl` and `release_impl` methods. The `get` wrapper removes released scalar record cells,
-checks the returned tile, records a probe observation and returns the result. It does not
-implement projection for the producer.
+`get_impl` and `release_impl` methods. The provided `get` reads through `checked_get`. A pull of
+part of some rows' values reads those rows whole from `get_impl` (`TileGuard::enclosing_rows`) and
+cuts the answer to the projection. A pull of keys at a level the producer does not restate reads
+the nearest level it does, and is cut the same way. The wrapper then removes released record
+fields, checks the returned tile, records a probe observation and returns the result. `Memo`
+answers a part of its rows from its cache, and `Zip` reads only the arm of a field whose pair it
+has matched; both override `get` and still read through `checked_get`. `BreakerReader` overrides
+`get` to forward to the breaker it reads, whose own `get` applies the checks.
 
 | Check | Build configuration |
 | --- | --- |
@@ -657,8 +662,10 @@ A projection guard names the part of a producer's tile that a `get` asks for. Th
 returns that part and nothing outside it, and states completeness only for that part.
 
 A projection (`Projection`) is everything, nothing, the keys of one collection level that a
-predicate 𝑝 admits (`Projection::Keys`), or a projection per field of a record of values
-(`Projection::Fields`). At the outermost level its guard is `Domain(𝑝)`. At level 𝑛 beneath it, 𝑝
+predicate 𝑝 admits (`Projection::Keys`), or a region of a structured value. Records name each
+field's region (`Projection::Fields`). A tagged value names a region of each constructor's payload
+(`Projection::Arms`), so a group key inside one constructor can be delivered independently.
+At the outermost collection level the key projection's guard is `Domain(𝑝)`. At level 𝑛 beneath it, 𝑝
 admits whole paths ([Qualified predicates](#qualified-predicates)), and its guard wraps the domain
 guard in 𝑛 codomain guards (`CurryLevel::wrap_guard`). Two projections meet at the deeper of their
 levels, where a key above is every path beneath it, and a region of every path beneath some keys is
@@ -789,8 +796,9 @@ calling the implementation, so ignoring it does not cancel the promise. Operator
 support whole-value release use `TileGuard::expect_universal_or_empty` to reject partial guards
 at release time, even if no subsequent pull would exercise the `get` postcondition.
 
-A scalar record field can be released at its enclosing row before a sibling collection is
-complete. `Tile::to_guard` names that cell, and `Tile::Record::absent` records its absence
+A scalar, finished accumulator, or closed store field can be released at its enclosing row
+while sibling fields are still live. `Tile::to_guard` names each ready field, and
+`Tile::Record::absent` records its absence
 without removing the row. A producer may reconstruct the row from inputs released only by
 whole key; the `get` wrapper removes those previously released field cells before returning
 it. `Zip` also preserves a row with an absent field when that field's input has already
@@ -830,10 +838,12 @@ For the caching case, see
 ### A `Memo` releases everything it takes
 
 `Memo` releases everything it merges, with `to_guard`
-([The release contract](#the-release-contract)). It obtains that guard before compaction,
-then releases the region upstream. Open collection groups and join-combined
-aggregate or store state can remain unreleased. A debug check uses `holds_a_plain_value` to
-reject an input whose release would leave ordinary values available for duplicate delivery.
+([The release contract](#the-release-contract)). It obtains that guard before compaction, then
+releases the region upstream. An open collection group can grow after the memo releases its
+completed fields. An unfinished accumulator or live store in a keyed record stays with its producer
+until that field finishes. The memo then copies the finished snapshot once. Each store row retains
+its own closure and seed. A debug check uses `holds_a_plain_value` to reject an input whose release
+would leave ordinary values available for duplicate delivery.
 
 `to_guard` includes complete keys by full path and scalar cells at their enclosing rows, including
 cells whose enclosing key is still open. A nested tile whose held keys form a prefix is released as
@@ -1050,9 +1060,11 @@ its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 ### Memo
 
 A memo answers every pull from its cache. `consume_impl` reads its input at the package's guard,
-merges the answer, and releases the region the answer states complete. A consume entirely within
-an already released region reads nothing. The dispatcher publishes the cached region after each
-consume. There is no notification gate or deferred wakeup queue.
+inserts each new keyed value once, and releases the region the answer states complete. An open
+parent can gain new children. Debug builds check that each completed key receives a payload only
+once, even across deliveries. A close can extend the completion statement without adding a value. A
+consume entirely within an already released region reads nothing. The dispatcher publishes the
+cached region after each consume. There is no notification gate or deferred wakeup queue.
 
 ### Aggregate
 

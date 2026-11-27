@@ -2971,6 +2971,41 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     );
 }
 
+// The aggregate becomes final only when the source closes. Until then a sku and
+// its collection of lines can already be computed for every delivered source row.
+#[test]
+fn a_live_record_with_a_late_scalar_field_reaches_the_sink_whole() {
+    let (items, _) = dispatched_live(
+        indoc! {"
+        out = test_sink()
+        items = [(sku = x + 100, qty = sum(source1()), lines = [x * j for j in [1, 2]]) for x in source1()]
+        out << items
+    "},
+        1,
+        with_an_empty_last_delivery(),
+    );
+    let mut actual: Vec<_> = items
+        .as_function()
+        .iter()
+        .map(|binding| {
+            let Value::UInt(key) = binding.input else {
+                panic!("expected a source index")
+            };
+            let Value::Record(fields) = &binding.output else {
+                panic!("expected an item")
+            };
+            (key, fields["sku"].clone(), fields["qty"].clone())
+        })
+        .collect();
+    actual.sort_by_key(|(key, ..)| *key);
+    assert_eq!(
+        actual,
+        (0..5)
+            .map(|key| (key, Value::Int(key as i64 + 101), Value::Int(15)))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A feed of a map over a live source is keyed by the sink's one row, which holds the whole map, so
 /// a delivery's keys reach the pipeline above the source widened. The pipeline reads its input
 /// again after each delivery, so the sink holds each delivery's rows before the next, and once more
