@@ -705,6 +705,7 @@ impl Tile {
                 !absent.is_empty() || fields.values().any(Tile::has_absent_fields)
             }
             Tile::DataFunction { codomain, .. } => codomain.has_absent_fields(),
+            Tile::Union(arms) => arms.values().any(|arm| arm.tile.has_absent_fields()),
             _ => false,
         }
     }
@@ -724,6 +725,7 @@ impl Tile {
                     || field.has_record_state()
             }),
             Tile::DataFunction { codomain, .. } => codomain.has_record_state(),
+            Tile::Union(arms) => arms.values().any(|arm| arm.tile.has_record_state()),
             _ => false,
         }
     }
@@ -740,6 +742,16 @@ impl Tile {
                         unreachable!()
                     };
                     walk(codomain, &children, &complete, true);
+                }
+                Tile::Union(arms) => {
+                    for (_, arm) in arms.iter_mut() {
+                        let arm_paths = arm
+                            .rows
+                            .iter()
+                            .map(|&r| paths[r].clone())
+                            .collect::<Vec<_>>();
+                        walk(&mut arm.tile, &arm_paths, closed, keyed);
+                    }
                 }
                 Tile::Record { fields, absent } => {
                     for (name, field) in fields {
@@ -767,7 +779,17 @@ impl Tile {
                                 absent.remove(name);
                             }
                         } else if field.has_record_state() {
-                            walk(field, paths, closed, keyed);
+                            if let Some(missing) = absent.get(name) {
+                                let present = paths
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(r, _)| !missing.contains(*r))
+                                    .map(|(_, path)| path.clone())
+                                    .collect::<Vec<_>>();
+                                walk(field, &present, closed, keyed);
+                            } else {
+                                walk(field, paths, closed, keyed);
+                            }
                         }
                     }
                 }
@@ -1516,6 +1538,30 @@ impl Tile {
                             }
                         }
                         continue;
+                    }
+                    if under_a_level && matches!(t, Tile::Union(_)) {
+                        // An entire tagged field can be given back while its sibling still
+                        // holds this row. Preserve the physical-to-logical mapping for
+                        // any narrower arm releases that follow.
+                        let named = super::guard::whole_rows(&g);
+                        if !named.is_false() && t.rows() != 0 {
+                            let keep = (0..total)
+                                .map(|r| !named.is_true() && !named.contains_path(&row_paths[r]))
+                                .collect::<Vec<_>>();
+                            if keep.contains(&false) {
+                                t.retain_field_rows(absent.entry(k.clone()).or_default(), &keep);
+                            }
+                        }
+                        if let Some(missing) = absent.get(k) {
+                            let paths = row_paths
+                                .iter()
+                                .enumerate()
+                                .filter(|(r, _)| !missing.contains(*r))
+                                .map(|(_, path)| path.clone())
+                                .collect::<Vec<_>>();
+                            t.remove_guarded_under(g, &paths, under_a_level);
+                            continue;
+                        }
                     }
                     t.remove_guarded_under(g, row_paths, under_a_level);
                 }
@@ -2690,6 +2736,19 @@ impl Tile {
                     .iter()
                     .map(|(name, field)| {
                         let held = match field {
+                            Tile::Union(_) => {
+                                if let Some(missing) = absent.get(name) {
+                                    let paths = row_paths
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(r, _)| !missing.contains(*r))
+                                        .map(|(_, path)| path.clone())
+                                        .collect::<Vec<_>>();
+                                    field.held_guard(&paths)
+                                } else {
+                                    field.held_guard(row_paths)
+                                }
+                            }
                             _ if field.holds_a_level() => field.held_guard(row_paths),
                             Tile::Record { .. } => field.held_guard(row_paths),
                             _ if field.is_row_field() && field.rows() != 0 => {

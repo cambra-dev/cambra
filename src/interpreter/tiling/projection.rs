@@ -1472,6 +1472,7 @@ impl Tile {
                     let extent = || Extent::Base(crate::interpreter::BaseType::Int);
                     match tile {
                         Tile::Scalar(_) => Tiling::Scalar(extent()),
+                        Tile::Union(arms) => Tiling::Union(arms.map(|_, arm| layout(&arm.tile))),
                         Tile::Record { fields, .. } => Tiling::Record(
                             fields.iter().map(|(n, f)| (n.clone(), layout(f))).collect(),
                         ),
@@ -1703,11 +1704,20 @@ impl Tile {
                 let mut held = vec![false; rows.len()];
                 for (name, field) in fields {
                     let part = parts.record.as_ref().and_then(|fields| fields.get(name));
-                    if field.is_row_field() {
-                        let named = part
-                            .and_then(TileGuard::field_rows)
-                            .unwrap_or(&Predicate::False);
-                        let selected = whole.union(named);
+                    if field.is_row_field() || matches!(field, Tile::Union(_)) {
+                        // Field projections name a tagged value as a whole. Keep its tag
+                        // and payload together, including when a sibling keeps the row.
+                        let selected = if matches!(field, Tile::Union(_)) {
+                            part.map_or_else(
+                                || whole.clone(),
+                                |g| whole.union(&super::guard::whole_rows(g)),
+                            )
+                        } else {
+                            whole.union(
+                                part.and_then(TileGuard::field_rows)
+                                    .unwrap_or(&Predicate::False),
+                            )
+                        };
                         let mask: Vec<_> = rows.iter().map(|p| selected.contains_path(p)).collect();
                         let missing = absent.entry(name.clone()).or_default();
                         if let Tile::Store { closures, .. } = field
@@ -1733,6 +1743,26 @@ impl Tile {
                         for (held, present) in held.iter_mut().zip(present) {
                             *held |= present;
                         }
+                    }
+                }
+                held
+            }
+            (Tile::Union(arms), Tiling::Union(types)) => {
+                let mut held = vec![false; rows.len()];
+                for (tag, arm) in arms.iter_mut() {
+                    let paths = arm
+                        .rows
+                        .iter()
+                        .map(|&r| rows[r].clone())
+                        .collect::<Vec<_>>();
+                    let part = parts.union.as_ref().and_then(|arms| arms.get(tag));
+                    let payload = types.get(tag).expect("tile arm belongs to its tiling");
+                    for (&r, keep) in arm
+                        .rows
+                        .iter()
+                        .zip(arm.tile.cut_guard(part, payload, &paths, whole, closed))
+                    {
+                        held[r] = keep || whole.contains_path(&rows[r]);
                     }
                 }
                 held
@@ -2130,6 +2160,71 @@ mod tests {
         rest.remove_guarded(id.to_guard());
         id.merge(rest);
         assert_eq!(id, row);
+    }
+
+    #[test]
+    fn a_partial_record_read_preserves_only_its_requested_tagged_fields() {
+        use crate::interpreter::UnionArmTile;
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let variant = Tiling::Union(TagMap::from_positional(vec![int.clone(), int.clone()]));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record([("id".into(), int), ("variant".into(), variant)].into()),
+        );
+        let column = |values| Tile::Scalar(ColumnValue::Ints(values));
+        let arms = TagMap::from_positional(vec![
+            UnionArmTile {
+                rows: vec![0],
+                tile: column(vec![11]),
+            },
+            UnionArmTile {
+                rows: vec![1],
+                tile: column(vec![22]),
+            },
+        ]);
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![7, 8]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), column(vec![7, 8])),
+                    ("variant".into(), Tile::Union(arms)),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let field = |row, name| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                key(row),
+                Projection::of_field(name, Projection::Everything),
+            )
+        };
+        let projection = field(7, "id").union(&field(8, "variant"));
+        let mut remainder = tile.clone();
+        tile.restrict_to(&projection, &tiling);
+        assert_eq!(tile.to_guard(), projection.guard(&tiling));
+        remainder.remove_guarded(tile.to_guard());
+        assert_eq!(
+            remainder.to_guard(),
+            field(8, "id").union(&field(7, "variant")).guard(&tiling)
+        );
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            unreachable!()
+        };
+        let Tile::Record { fields, absent } = &**codomain else {
+            unreachable!()
+        };
+        assert_eq!(fields["id"], column(vec![7]));
+        assert!(absent["variant"].contains(0));
+        let Tile::Union(arms) = &fields["variant"] else {
+            unreachable!()
+        };
+        assert_eq!(arms.values().next().unwrap().rows, Vec::<usize>::new());
+        let second = arms.values().nth(1).unwrap();
+        assert_eq!(second.rows, [0]);
+        assert_eq!(second.tile, column(vec![22]));
     }
 
     #[test]

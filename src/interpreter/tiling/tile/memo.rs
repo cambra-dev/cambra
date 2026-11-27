@@ -109,6 +109,25 @@ impl Tile {
                     }
                 }
             }
+            (Self::Union(arms), Self::Union(added)) => {
+                for (tag, arm) in added.iter() {
+                    if let Ok(at) = arm.rows.binary_search(&row) {
+                        let old = arms.get(tag).expect("memo and input share a tiling");
+                        let cached = cached_row.and_then(|r| old.rows.binary_search(&r).ok());
+                        if let Some(r) = cached_row {
+                            assert!(
+                                cached.is_some()
+                                    || arms
+                                        .values()
+                                        .all(|other| other.rows.binary_search(&r).is_err()),
+                                "memo received a different tag for a previously delivered key at {path:?}"
+                            );
+                        }
+                        old.tile.check_memo_row(&arm.tile, cached, at, path, closed);
+                        break;
+                    }
+                }
+            }
             _ if !path.is_empty() && row < incoming.rows() => {
                 let already_final =
                     cached_row.is_some_and(|i| i < self.rows() && self.finished_field_at(i));

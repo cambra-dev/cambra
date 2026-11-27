@@ -88,9 +88,15 @@ impl TileGuard {
                         })
                         .collect(),
                 ),
-                (TileGuard::Union(arms), Tiling::Union(types)) => TileGuard::Union(arms.map(|tag, arm| {
-                    walk(arm, types.get(tag).expect("guard fits its union tiling"), under_rows)
-                })),
+                (TileGuard::Union(arms), Tiling::Union(types)) => {
+                    TileGuard::Union(arms.map(|tag, arm| {
+                        walk(
+                            arm,
+                            types.get(tag).expect("guard fits its union tiling"),
+                            under_rows,
+                        )
+                    }))
+                }
                 _ => t.empty_guard(),
             }
         }
@@ -422,7 +428,7 @@ fn lift_union(arms: &TagMap<TileGuard>, depth: usize) -> Vec<TileGuard> {
 
 /// The paths reaching `guard` under which it names everything: for a guard standing under
 /// a level, the keys of that level whose whole value it names.
-fn whole_rows(guard: &TileGuard) -> Predicate {
+pub(super) fn whole_rows(guard: &TileGuard) -> Predicate {
     match guard {
         g if g.is_universal() => Predicate::True,
         g if g.is_empty() => Predicate::False,
