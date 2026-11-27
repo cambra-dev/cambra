@@ -3377,14 +3377,11 @@ fn run_to_idle(live: &mut LiveProgram, morsel_rows: usize) {
 /// subtracts its reply from the pool. `listed` are items the source lists beside `source1()`,
 /// which commit with the first batch. At each cut the replies are those items, the pools are one
 /// per reply, each the one before less a reply, and a reload commits nothing and loses nothing.
-/// With `at_closure`, every item commits only once the source closes, so each earlier cut holds
-/// nothing.
 fn assert_each_cut_holds(
     cuts: &[Held],
     pool: i64,
     deliveries: &[Vec<(usize, i64)>],
     listed: &[i64],
-    at_closure: bool,
     identities: impl Fn(i64) -> Vec<i64>,
 ) {
     let mut expected = Vec::new();
@@ -3395,9 +3392,6 @@ fn assert_each_cut_holds(
         }
         committed.extend(batch.iter().flat_map(|&(_, item)| identities(item)));
         expected.push(committed.clone());
-    }
-    if at_closure {
-        expected.iter_mut().for_each(Vec::clear);
     }
     expected.push(committed.clone());
     assert_eq!(
@@ -3439,11 +3433,9 @@ fn assert_each_cut_holds(
 /// A reload carries the exact items a transaction writer finished, holes included. At every cut,
 /// with the source still open, the replies to `out` are the items delivered so far and the pools
 /// are one per reply, so a reload commits nothing again and loses nothing
-/// ([`assert_each_cut_holds`]). Over a concatenation the items are tagged positions, and the store
-/// waits for the source to close before it takes them (`src/interpreter/design-dispatcher.md`,
-/// "Running a compiled program"), so those cases commit everything at closure and pin each item
-/// once there. The rebuilt drive starts at the release of the drive it replaces, `{0, 2}` in the
-/// first case, not at the prefix through 2, which would drop item 1.
+/// ([`assert_each_cut_holds`]). Over a concatenation the items are tagged positions, and the list
+/// arm's item commits with the first batch. The rebuilt drive starts at the release of the drive
+/// it replaces, `{0, 2}` in the first case, not at the prefix through 2, which would drop item 1.
 #[rstest::rstest]
 #[case::the_hole_after_the_reload(vec![vec![(0, 1), (2, 4)], vec![(1, 2)]])]
 #[case::the_hole_and_items_above_it(vec![vec![(0, 1), (2, 4)], vec![(1, 2), (3, 8)]])]
@@ -3462,10 +3454,7 @@ fn a_reload_carries_the_items_a_transaction_writer_finished_exactly(
 ) {
     let (source, listed) = source;
     let (cuts, pool) = transactions_across_reloads(source, "x", &deliveries, morsel_rows);
-    let at_closure = !listed.is_empty();
-    assert_each_cut_holds(&cuts, pool, &deliveries, listed, at_closure, |item| {
-        vec![item]
-    });
+    assert_each_cut_holds(&cuts, pool, &deliveries, listed, |item| vec![item]);
 }
 
 /// A writer inside a loop nested under the live source names its items by path, an item and
@@ -3484,7 +3473,7 @@ fn a_reload_carries_a_nested_writers_items_exactly(
         &deliveries,
         morsel_rows,
     );
-    assert_each_cut_holds(&cuts, pool, &deliveries, &[], false, |item| {
+    assert_each_cut_holds(&cuts, pool, &deliveries, &[], |item| {
         vec![10 * item, 10 * item + 1]
     });
 }
