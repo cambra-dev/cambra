@@ -11,7 +11,7 @@ use bit_set::BitSet;
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::interpreter::{
-    Consumer, Projection, RowIndex, SubscribeContext, Value, shared_consumer, tuple_field,
+    Consumer, Projection, SubscribeContext, Value, shared_consumer, tuple_field,
 };
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
@@ -287,7 +287,7 @@ impl TileOperator for Zip {
         cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // Beneath rows each arm is one field of the pair, so a region of an arm names that field
-        // of the rows it reaches and nothing of another arm's (`field_beneath_rows`). At the
+        // of the rows it reaches and nothing of another arm's. At the
         // outermost level the pair is one record, whose regions widen.
         let beneath_rows = self.level != CurryLevel::OUTERMOST;
         let shared = shared_consumer(match beneath_rows {
@@ -311,19 +311,14 @@ impl TileOperator for Zip {
             // Every arm is pulled at the projection: the arms share the pair's keys.
             .map(|(arm, (input, name))| {
                 let forward = forwarding_consumer_keeping_keys(&shared);
-                let forward = match beneath_rows {
-                    true => crate::interpreter::notifications::field_beneath_rows(
-                        name.clone(),
-                        self.level,
-                        forward,
-                    ),
-                    false => forward,
+                let notifications = if beneath_rows {
+                    aligned.zip_field(arm, name.clone(), forward)
+                } else {
+                    aligned.consumer(arm, keys, forward)
                 };
-                input.clone().subscribe(
-                    input.tiling().universal_guard(),
-                    aligned.consumer(arm, keys, forward),
-                    cx,
-                )
+                input
+                    .clone()
+                    .subscribe(input.tiling().universal_guard(), notifications, cx)
             })
             .collect();
         Box::new(ZipProducer {
@@ -389,6 +384,89 @@ impl ZipState {
             dropped_rows: HashMap::new(),
         }
     }
+
+    fn remember_dropped(&mut self, arm: usize, dropped: TileGuard) {
+        self.held[arm].retain(|path| !dropped.covers_path(path));
+        // A pair an arm no longer holds is no matched pair: a one-field read of it consults every
+        // arm again ([`ZipProducer::matched_field`]). Every key the drop touches leaves, which
+        // can only send a read to every arm.
+        self.emitted = self.emitted.minus(&dropped.touched_keys());
+        let released = match self.dropped_rows.remove(&arm) {
+            Some(before) => before.union(&dropped),
+            None => dropped,
+        };
+        self.dropped_rows.insert(arm, released);
+    }
+}
+
+impl ZipProducer {
+    /// Only a pair seen on a previous read can answer without consulting the other arms.
+    fn matched_field(&self, projection: &Projection) -> Option<(usize, &SmolStr)> {
+        let Projection::Within {
+            level,
+            keys,
+            values,
+        } = projection
+        else {
+            return None;
+        };
+        let Projection::Fields { fields, rest } = values.as_ref() else {
+            return None;
+        };
+        if self.level.index() != 1
+            || *level != CurryLevel::OUTERMOST
+            || **rest != Projection::Nothing
+            || fields.len() != 1
+        {
+            return None;
+        }
+        let matched = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .emitted
+            .subsumes(keys);
+        if !matched {
+            return None;
+        }
+        self.names
+            .iter()
+            .enumerate()
+            .find(|(_, name)| fields.contains_key(*name))
+    }
+
+    fn read_field(&self, guard: TileGuard, arm: usize, name: &SmolStr) -> Tile {
+        let input = &self.inputs[arm];
+        let part = crate::interpreter::tiling::onto_record_field(
+            guard,
+            self.level.index(),
+            name,
+            input.tiling(),
+        );
+        let mut answer = input.get(TileGuard::flatten_or(vec![part]));
+        if let Some(dropped) = answer.deleted_keys_guard() {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remember_dropped(arm, dropped);
+        }
+        answer.compact();
+        answer.unfollow_values_at(self.level);
+        let Tile::DataFunction { domain, .. } = &answer else {
+            unreachable!("zip arm is keyed")
+        };
+        let record = self
+            .tiling()
+            .values_at(self.level)
+            .empty_at_rows(domain.len());
+        let slot = answer.values_at_mut(self.level);
+        let field = std::mem::replace(slot, record);
+        let Tile::Record { fields, .. } = slot else {
+            unreachable!("zip values are records")
+        };
+        fields.insert(name.clone(), field);
+        answer
+    }
 }
 
 impl TileProducer for ZipProducer {
@@ -409,6 +487,33 @@ impl TileProducer for ZipProducer {
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
         Restates::Above(self.level)
+    }
+
+    fn input_level(&self, role: &str, level: CurryLevel) -> Option<CurryLevel> {
+        // An exact field read can descend through the collection levels of its input.
+        let arm: usize = role.strip_prefix('_')?.parse().ok()?;
+        Some(if self.level.index() == 1 {
+            level.max(CurryLevel::new(
+                self.inputs[arm].tiling().levels().saturating_sub(1),
+            ))
+        } else {
+            level
+        })
+    }
+
+    fn get(&self, guard: TileGuard) -> Tile {
+        self.checked_get(guard, &|guard| {
+            let Some(rows) = guard.enclosing_rows() else {
+                return self.get_impl(guard);
+            };
+            let projection = guard.projection_for(self);
+            let mut answer = match self.matched_field(&projection) {
+                Some((arm, name)) => self.read_field(guard, arm, name),
+                None => self.get_impl(rows),
+            };
+            answer.restrict_to(&projection, self.tiling());
+            answer
+        })
     }
 
     /// The arms share the pair's keys, so each arm is pulled at the projection.
@@ -630,11 +735,6 @@ impl TileProducer for ZipProducer {
                          two arms gave back separately have no skeleton to stand on"
                     );
                 }
-                let skeleton_levels: Vec<(Vec<RowIndex>, ColumnValue)> =
-                    filtered_tiles[skeleton_at].key_levels()[..self.level.index()]
-                        .iter()
-                        .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
-                        .collect();
                 let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
                 let mut absent: HashMap<SmolStr, BitSet> = HashMap::new();
                 // What a level inside a value states is the pair's to say only beneath the rows it
@@ -663,18 +763,8 @@ impl TileProducer for ZipProducer {
                         );
                     }
                     if held == rows {
-                        // Presence is intersected over the outermost keys only, so arms that
-                        // disagree beneath them would pair one arm's values under another's
-                        // keys.
-                        assert!(
-                            filtered.key_levels()[..self.level.index()]
-                                .iter()
-                                .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
-                                .eq(skeleton_levels.iter().cloned()),
-                            "Zip: inputs disagree on the {} levels above the pair, after \
-                             aligning them: {skeleton_levels:?} against {filtered:?}",
-                            self.level.index(),
-                        );
+                        // Equal item paths put the values in the same order. Empty groups
+                        // can occupy different positions without contributing any values.
                         codomains.push(values);
                         continue;
                     }
@@ -716,12 +806,7 @@ impl TileProducer for ZipProducer {
                 // gives it back here and stops tracking it.
                 for (arm, dropped) in dropped.into_iter().enumerate() {
                     if let Some(dropped) = dropped {
-                        state.held[arm].retain(|path| !dropped.covers_path(path));
-                        let released = match state.dropped_rows.remove(&arm) {
-                            Some(before) => before.union(&dropped),
-                            None => dropped,
-                        };
-                        state.dropped_rows.insert(arm, released);
+                        state.remember_dropped(arm, dropped);
                     }
                 }
                 let mut out = skeleton;
@@ -1473,6 +1558,157 @@ mod tests {
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value, validate_tile};
     use bit_set::BitSet;
 
+    /// A row an arm deletes leaves the matched pairs, so a later one-field read of it consults
+    /// every arm rather than the one whose field it reads.
+    #[test]
+    fn a_row_an_arm_drops_is_no_matched_pair() {
+        let row = |k| Predicate::point(Value::UInt(k));
+        let mut state = ZipState::new(2);
+        state.emitted = row(7).union(&row(8));
+        state.remember_dropped(0, TileGuard::Function(FunctionGuard::Domain(row(7))));
+        assert!(!state.emitted.contains_path(&[Value::UInt(7)]));
+        assert!(state.emitted.contains_path(&[Value::UInt(8)]));
+    }
+
+    #[rstest::rstest]
+    #[case::row_close(true)]
+    #[case::remaining_history_keys(false)]
+    fn zip_announces_the_first_match_then_reads_only_the_new_history_item(
+        #[case] closes_row: bool,
+        #[values(true, false)] orders_first: bool,
+    ) {
+        use crate::interpreter::tile_operators::test_helpers::{
+            ConsumeInPipeline, NotifyingOp, RegionLog, notify_input,
+        };
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let keyed = |value| Tiling::data_function(Extent::uint_range(16), value);
+        let by_customer = |values, closed| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![7]),
+                Box::new(values),
+                if closed {
+                    Predicate::point(Value::UInt(7))
+                } else {
+                    Predicate::False
+                },
+                BitSet::new(),
+            )
+        };
+        let orders = |items: &[u64], closed| {
+            by_customer(
+                Tile::grouped(
+                    vec![0],
+                    ColumnValue::UInts(items.to_vec()),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(
+                        items.iter().map(|x| *x as i64 * 10).collect(),
+                    ))),
+                    Predicate::False,
+                    BitSet::new(),
+                ),
+                closed,
+            )
+        };
+        let name_ty = keyed(int.clone());
+        let orders_ty = keyed(keyed(int));
+        let (mut name, name_push, name_value, name_reads) =
+            NotifyingOp::scripted(name_ty.empty_tile(), name_ty.clone());
+        let (mut history, history_push, history_value, history_reads) =
+            NotifyingOp::scripted(orders_ty.empty_tile(), orders_ty.clone());
+        name.pushed_keys = true;
+        history.pushed_keys = true;
+        let zip = Arc::new(Zip::new_at(
+            vec!["name".into(), "history".into()],
+            vec![Arc::new(name), Arc::new(history)],
+            CurryLevel::new(1),
+        ));
+        let ty = zip.tiling().clone();
+        let (log, notifications) = RegionLog::new();
+        let input = zip.subscribe(
+            ty.universal_guard(),
+            Box::new(log),
+            &mut SubscribeContext::new(),
+        );
+        let mut memo = MemoProducer::over(input, &ty);
+        let point = |k| Predicate::point(Value::UInt(k));
+        let row = Projection::admitting(point(7));
+        let order = |i| Projection::of_path(&[Value::UInt(7), Value::UInt(i)]);
+        let pop = || std::mem::take(&mut *notifications.write().unwrap());
+        let consume = |memo: &mut MemoProducer, p: &Projection| {
+            memo.consume_in_pipeline(InputId::ONLY, p.guard(&ty))
+        };
+        let deliver_orders = || {
+            *history_value.write().unwrap() = orders(&[1, 2], false);
+            notify_input(&history_push, &order(1).union(&order(2)));
+        };
+        let deliver_name = || {
+            *name_value.write().unwrap() =
+                by_customer(Tile::Scalar(ColumnValue::Ints(vec![42])), true);
+            notify_input(&name_push, &row);
+        };
+        if orders_first {
+            deliver_orders();
+            assert!(pop().is_empty());
+            deliver_name();
+        } else {
+            deliver_name();
+            assert!(pop().is_empty());
+            deliver_orders();
+        }
+        assert_eq!(pop(), vec![row.clone()]);
+        consume(&mut memo, &row);
+        let first = memo.read_in_pipeline(row.guard(&ty));
+        let Tile::Record { fields, .. } = first.deepest_values() else {
+            unreachable!()
+        };
+        assert_eq!(fields["name"], Tile::Scalar(ColumnValue::Ints(vec![42])));
+        assert_eq!(
+            fields["history"].deepest_values(),
+            &Tile::Scalar(ColumnValue::Ints(vec![10, 20]))
+        );
+        name_reads.write().unwrap().clear();
+        history_reads.write().unwrap().clear();
+        *history_value.write().unwrap() = orders(&[1, 2, 3], false);
+        notify_input(&history_push, &order(3));
+        let item = Projection::within(
+            CurryLevel::OUTERMOST,
+            point(7),
+            Projection::of_field("history", Projection::admitting(point(3))),
+        );
+        assert_eq!(pop(), vec![item.clone()]);
+        consume(&mut memo, &item);
+        assert!(name_reads.read().unwrap().is_empty());
+        assert_eq!(*history_reads.read().unwrap(), [order(3).guard(&orders_ty)]);
+        let answer = memo.read_in_pipeline(item.guard(&ty));
+        assert_eq!(answer.to_guard(), item.guard(&ty));
+        let Tile::Record { fields, .. } = answer.deepest_values() else {
+            unreachable!()
+        };
+        assert_eq!(
+            fields["history"].deepest_values(),
+            &Tile::Scalar(ColumnValue::Ints(vec![30]))
+        );
+        // Either form of closure arrives without an order. The memo still learns that
+        // customer 7 is complete, including the orders that arrived before the name.
+        *history_value.write().unwrap() = orders(&[1, 2, 3], true);
+        let closing = if closes_row {
+            row.clone()
+        } else {
+            row.minus(&order(1).union(&order(2)).union(&order(3)))
+        };
+        notify_input(&history_push, &closing);
+        assert_eq!(pop(), vec![row.clone()]);
+        consume(&mut memo, &row);
+        let closed = memo.read_in_pipeline(row.guard(&ty));
+        assert!(closed.to_guard().subsumes(&row.guard(&ty)));
+        let Tile::Record { fields, .. } = closed.deepest_values() else {
+            unreachable!()
+        };
+        assert_eq!(
+            fields["history"].deepest_values(),
+            &Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))
+        );
+    }
+
     fn record_wrap_over(
         input_tile: Tile,
         input_tiling: Tiling,
@@ -2098,6 +2334,73 @@ mod tests {
     }
 
     // ── ZipProducer: asymmetric per-branch presence ────────────────────────
+
+    #[test]
+    fn zip_pairs_items_when_its_arms_store_an_empty_group_in_different_positions() {
+        let grouped = |parents, starts, values| {
+            Tile::data_function(
+                ColumnValue::UInts(parents),
+                Box::new(Tile::grouped(
+                    starts,
+                    ColumnValue::UInts(vec![3, 4]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let levels = |values| {
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::data_function(Extent::Base(BaseType::UInt), values),
+            )
+        };
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let inputs = [
+            (vec![7, 8], vec![0, 2], vec![13, 14]),
+            (vec![8, 7], vec![0, 0], vec![23, 24]),
+        ]
+        .into_iter()
+        .map(|(parents, starts, values)| {
+            Box::new(TestTileProducer::new(
+                grouped(parents, starts, values),
+                levels(int.clone()),
+            )) as Box<dyn TileProducer>
+        })
+        .collect();
+        let output = levels(Tiling::tuple(&[int.clone(), int]));
+        let mut zip = ZipProducer {
+            level: CurryLevel::new(2),
+            state: Mutex::new(ZipState::new(2)),
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &output),
+            names: (0..2).map(tuple_field).collect(),
+            inputs,
+        };
+        let result = zip.read_in_pipeline(output.universal_guard());
+        assert!(
+            result
+                .paths_at(CurryLevel::OUTERMOST)
+                .contains(&vec![Value::UInt(8)])
+        );
+        assert_eq!(
+            result.paths_at(CurryLevel::new(1)),
+            [
+                vec![Value::UInt(7), Value::UInt(3)],
+                vec![Value::UInt(7), Value::UInt(4)]
+            ]
+        );
+        let Tile::Record { fields, .. } = result.values_at(CurryLevel::new(2)) else {
+            panic!("zip pairs its inputs");
+        };
+        for (index, expected) in [(0, vec![13, 14]), (1, vec![23, 24])] {
+            assert_eq!(
+                scalar_tile_to_column_value(fields[&tuple_field(index)].clone()),
+                ColumnValue::Ints(expected)
+            );
+        }
+    }
 
     /// Two `DataFunction` inputs with different sets of present positions.
     /// The output should restrict to the intersection of those positions.

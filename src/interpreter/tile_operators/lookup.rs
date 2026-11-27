@@ -839,6 +839,9 @@ impl TileProducer for LookupProducer {
             return self.tiling().empty_tile();
         }
         let mut tile = self.input.get(projection.guard(self.input.tiling()));
+        // A released row can still carry its collection after its scalar key is gone.
+        // Drop deleted rows before indexing the packed key column.
+        tile.compact();
         let Tiling::Scalar(out_extent) = self.tiling().values_at(self.level) else {
             unreachable!("`Lookup::new_at` puts one value at the level")
         };
@@ -1200,6 +1203,25 @@ mod tests {
             input: Box::new(TestTileProducer::new(tile, tiling)),
             level: CurryLevel::new(1),
         }
+    }
+
+    #[test]
+    fn lookup_skips_a_deleted_pair_whose_key_cell_was_released() {
+        let mut lookup = keyed_rows(1, true);
+        let ty = lookup.input.tiling().clone();
+        let mut input = lookup.input.get(ty.universal_guard());
+        let row = Predicate::point(Value::UInt(0));
+        let key_field = Projection::within(
+            CurryLevel::OUTERMOST,
+            row.clone(),
+            Projection::of_field(&tuple_field(0), Projection::Everything),
+        );
+        input.remove_guarded(key_field.guard(&ty));
+        input.remove_guarded(Projection::admitting(row).guard(&ty));
+        lookup.input = Box::new(TestTileProducer::new(input, ty));
+        let answer = lookup.read_in_pipeline(lookup.tiling().universal_guard());
+        assert_eq!(test_helpers::int_entries(&answer), [(1, 30)]);
+        assert!(answer.level_statement().contains(&Value::UInt(0)));
     }
 
     #[test]
