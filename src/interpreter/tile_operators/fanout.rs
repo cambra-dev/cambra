@@ -1901,40 +1901,6 @@ impl MemoProducer {
 }
 
 impl MemoProducer {
-    /// An exact field pull carries its own publication delta. The input cache can serve
-    /// independent fields concurrently. Append the delivered values under the same lock as local
-    /// reclamation. It takes no input-read hold (`reading_input`): a field read runs beside
-    /// another worker's read or release of the input.
-    fn consume_fields(
-        &self,
-        guard: TileGuard,
-        projection: &Projection,
-        pushes: Option<&mut Pushes<'_>>,
-    ) {
-        let mut answer = self.input.get(guard);
-        answer.retain_finished_state_fields();
-        let released = answer.to_guard();
-        answer.compact();
-        let delta = {
-            let mut cache = self
-                .cached_tile
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            let obsolete = self.obsolete_guard();
-            if !obsolete.is_empty() {
-                answer.remove_guarded(obsolete.clone());
-                answer.compact();
-                answer.restrict_to(projection, self.tiling());
-            }
-            cache.append(answer, projection, self.tiling(), &obsolete)
-        };
-        self.input.release(released);
-        if let Some(pushes) = pushes.filter(|p| p.has_readers()) {
-            let remaining = guard_minus(&delta, &self.obsolete_guard());
-            pushes.push_region(self, &remaining, |part, _| vec![part.clone()]);
-        }
-    }
-
     /// Append the input answer and release it before the dispatcher can land this claim's pushes.
     fn consume_input(&self, guard: TileGuard, pushes: Option<&mut Pushes<'_>>) {
         assert!(guard.check_from(self.input.tiling()));
@@ -1943,14 +1909,14 @@ impl MemoProducer {
         if projection == Projection::Nothing || guard_covers(&self.input.obsolete_guard(), &guard) {
             return;
         }
-        if projection.names_part_of_values() {
-            self.consume_fields(guard, &projection, pushes);
-            return;
-        }
-        let _reading = self
-            .reading_input
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        // Disjoint field reads can run beside reclamation. A whole-value read
+        // holds its input until its consume has finished releasing it.
+        let partial = projection.names_part_of_values();
+        let _reading = (!partial).then(|| {
+            self.reading_input
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
         let mut input = self.input.get(guard.clone());
         input.retain_finished_state_fields();
         let mut released = input.to_guard();
@@ -1963,7 +1929,7 @@ impl MemoProducer {
         });
         input.compact();
         #[cfg(debug_assertions)]
-        {
+        if !partial {
             let mut unreleased = input.clone();
             unreleased.remove_guarded(released.clone());
             unreleased.compact();
@@ -1973,12 +1939,23 @@ impl MemoProducer {
             );
         }
 
-        input.remove_guarded(self.obsolete_guard());
-        input.compact();
-        let mut cache = self
-            .cached_tile
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+        let write_cache = || {
+            self.cached_tile
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        // A field reader must trim under the same lock as reclamation. A whole-value
+        // reader holds reading_input and can trim before taking the cache write lock.
+        let locked = partial.then(write_cache);
+        let obsolete = self.obsolete_guard();
+        if !obsolete.is_empty() {
+            input.remove_guarded(obsolete);
+            input.compact();
+            if partial {
+                input.restrict_to(&projection, self.tiling());
+            }
+        }
+        let mut cache = locked.unwrap_or_else(write_cache);
         let delta = cache.append(input, &projection, self.tiling(), &self.obsolete_guard());
 
         if let Projection::Keys { level, keys } = &projection {
@@ -1989,7 +1966,13 @@ impl MemoProducer {
         drop(cache);
         self.input.release(released);
         let Some(pushes) = pushes else { return };
-        let remaining = held_after_release(delta, &self.obsolete_guard(), self.tiling());
+        let obsolete = self.obsolete_guard();
+        if partial {
+            let remaining = guard_minus(&delta, &obsolete);
+            pushes.push_region(self, &remaining, |part, _| vec![part.clone()]);
+            return;
+        }
+        let remaining = held_after_release(delta, &obsolete, self.tiling());
         pushes.push_region(self, &remaining, |new, rows| match flat {
             Some(None) => vec![new.clone()],
             Some(Some(keys)) => cut_at_keys(
