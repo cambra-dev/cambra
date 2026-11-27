@@ -645,6 +645,7 @@ mod tests {
         NestedMemo,
         NestedMemoReleasing,
         NestedMemoClosingEmpty,
+        NestedMemoClosingAncestors,
         RecordMemoReleasing,
         RecordMemoDiscarded,
     }
@@ -656,6 +657,9 @@ mod tests {
     #[case::nested_memo(TestBreaker::NestedMemo)]
     #[case::nested_memo_releasing(TestBreaker::NestedMemoReleasing)]
     #[case::close_without_payload_while_peer_releases(TestBreaker::NestedMemoClosingEmpty)]
+    #[case::absent_leaf_closes_two_ancestors_before_peer_releases(
+        TestBreaker::NestedMemoClosingAncestors
+    )]
     #[case::record_memo_releasing(TestBreaker::RecordMemoReleasing)]
     #[case::release_output_while_input_release_is_paused(TestBreaker::RecordMemoDiscarded)]
     fn acknowledges_while_a_peer_is_still_consuming(#[case] target: TestBreaker) {
@@ -733,7 +737,8 @@ mod tests {
             ]
             .into(),
         );
-        let empty_close = matches!(target, TestBreaker::NestedMemoClosingEmpty);
+        let ancestors = matches!(target, TestBreaker::NestedMemoClosingAncestors);
+        let empty_close = matches!(target, TestBreaker::NestedMemoClosingEmpty) || ancestors;
         let releasing = matches!(target, TestBreaker::NestedMemoReleasing) || empty_close;
         let nested = matches!(target, TestBreaker::NestedMemo) || releasing;
         let point = |key| Predicate::point(Value::UInt(key));
@@ -754,7 +759,16 @@ mod tests {
                 } else {
                     point(2)
                 };
-                paths_guard(Predicate::qualified(point(0), inner))
+                if ancestors {
+                    crate::interpreter::CurryLevel::new(2).wrap_guard(TileGuard::Function(
+                        FunctionGuard::Domain(Predicate::qualified(
+                            Predicate::exactly(&[Value::UInt(0), Value::UInt(0)]),
+                            inner,
+                        )),
+                    ))
+                } else {
+                    paths_guard(Predicate::qualified(point(0), inner))
+                }
             } else {
                 keys_between(key, key)
             }
@@ -775,6 +789,31 @@ mod tests {
                         .into(),
                     );
                     Box::new(ProjectionSpy::new(tile, record_tiling.clone()).0)
+                }
+                TestBreaker::NestedMemoClosingAncestors => {
+                    // Row 0 has one group and row 1 is still open in the memo. The
+                    // second worker learns only that the group's third item is absent.
+                    let (mut tile, ty) = two_levels_of_ints();
+                    let Tile::DataFunction { codomain, .. } = &mut tile else {
+                        unreachable!()
+                    };
+                    **codomain = Tile::grouped(
+                        vec![0, 1],
+                        crate::interpreter::ColumnValue::UInts(vec![0, 0]),
+                        codomain.clone(),
+                        Predicate::True,
+                        Default::default(),
+                    );
+                    let ty = Tiling::data_function(
+                        Extent::uint_range(2),
+                        Tiling::data_function(
+                            Extent::uint_range(1),
+                            ty.values_at(crate::interpreter::CurryLevel::new(1)).clone(),
+                        ),
+                    );
+                    tile.remove_guarded(claim(1));
+                    tile.compact();
+                    Box::new(ProjectionSpy::new(tile, ty).0)
                 }
                 TestBreaker::FlatMemo => Box::new(Input::over(&source(0..2))),
                 TestBreaker::NestedMemo
@@ -802,6 +841,7 @@ mod tests {
             | TestBreaker::NestedMemo
             | TestBreaker::NestedMemoReleasing
             | TestBreaker::NestedMemoClosingEmpty
+            | TestBreaker::NestedMemoClosingAncestors
             | TestBreaker::RecordMemoReleasing
             | TestBreaker::RecordMemoDiscarded => {
                 let tiling = input.tiling().clone();

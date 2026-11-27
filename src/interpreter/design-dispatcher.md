@@ -661,9 +661,10 @@ A worker consumes, publishes and acknowledges its own claim, in that order:
    completes a row, its push includes the row's end. Each peer still publishes its own
    payload after releasing its input, even if the closing worker has seen it in the cache.
    Memo append returns the exact change in completeness while it holds the cache lock.
-   For a scalar collection or a dense history field this includes the newly stated keys
-   and any newly closed region, even when the delivery contains no item. For other
-   shapes it compares the cache across the append. The worker releases its input and
+   Nested collections of scalar items, including a selected record field, record settled
+   paths in the collection statements. Append carries newly closed rows up to their
+   parents, and excludes prior paths from the worker's delta. A closure-only delivery
+   can settle several ancestors this way. Other irregular shapes use a cache comparison. The worker releases its input and
    then pushes its own delta. A peer can publish first without taking that delta.
 2. When another breaker needs a snapshot, the worker takes the breaker handle exclusively to run
    `Pushes::push_final`. An ordered pipeline holds the handle exclusively through consume and

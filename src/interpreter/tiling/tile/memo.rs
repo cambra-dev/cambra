@@ -52,17 +52,52 @@ impl Tile {
             // A field release can leave only its enclosing key in an input answer.
             return tiling.empty_guard();
         }
+
+        if let Some(nested) = NestedAppend::prepare(self, &incoming, projection, tiling) {
+            self.merge(incoming);
+            // merge already compacts earlier statements. Readers projecting below a
+            // newly closed ancestor still need the child statement recorded by settle.
+            return nested.settle(self, tiling);
+        }
+
         // A partial record may complete a field supplied by a peer, and a statement
         // can close a row with no physical items. Compare the cache across this
         // append, while its caller still has exclusive access to it.
         let before = self.to_guard();
         let nested = nested_answer(&incoming, projection);
+        // A broader record delivery can precede an exact nested field delivery.
+        // Remember its scalar leaves in the same field statements the latter consults.
+        incoming.state_nested_memo_items();
         self.merge(incoming);
         if let Some(nested) = nested {
             nested.merge_into(self, tiling);
         }
         self.close_memo_positions(tiling);
         guard_minus(&self.to_guard(), &before)
+    }
+
+    fn state_nested_memo_items(&mut self) {
+        let nested_scalars = |tile: &Tile| {
+            tile.innermost_depth().is_some_and(|d| d > 0)
+                && matches!(tile.deepest_values(), Tile::Scalar(_))
+        };
+        if let Tile::DataFunction {
+            codomain, domain, ..
+        } = self
+            && let Tile::Record { fields, .. } = &mut **codomain
+        {
+            let mut paths = None;
+            for field in fields.values_mut().filter(|v| nested_scalars(v)) {
+                let rows = paths.get_or_insert_with(|| {
+                    (0..domain.len())
+                        .map(|i| vec![domain.index_at(i)])
+                        .collect::<Vec<_>>()
+                });
+                field.state_held_values_under(rows);
+            }
+        } else if nested_scalars(self) {
+            self.state_held_values_complete();
+        }
     }
 
     fn close_memo_positions(&mut self, tiling: &Tiling) {
@@ -193,21 +228,7 @@ impl Tile {
         projection: &Projection,
         tiling: &Tiling,
     ) -> Option<TileGuard> {
-        let Projection::Within {
-            level: CurryLevel::OUTERMOST,
-            values,
-            ..
-        } = projection
-        else {
-            return None;
-        };
-        let Projection::Fields { fields, rest } = values.as_ref() else {
-            return None;
-        };
-        if fields.len() != 1 || **rest != Projection::Nothing {
-            return None;
-        }
-        let (name, _) = fields.first_key_value()?;
+        let name = projected_field(projection)?;
         let Tile::DataFunction {
             domain: parents,
             domain_predicate: closed_parents,
@@ -403,6 +424,276 @@ impl Tile {
             _ => unreachable!("a plain value is a scalar or a record of plain values"),
         }
     }
+}
+
+/// The single field of existing or arriving outer rows named by an exact pull.
+fn projected_field(projection: &Projection) -> Option<&SmolStr> {
+    let Projection::Within {
+        level: CurryLevel::OUTERMOST,
+        values,
+        ..
+    } = projection
+    else {
+        return None;
+    };
+    let Projection::Fields { fields, rest } = values.as_ref() else {
+        return None;
+    };
+    if fields.len() != 1 || **rest != Projection::Nothing {
+        return None;
+    }
+    fields.first_key_value().map(|(name, _)| name)
+}
+
+/// One chain of nested collections, optionally rooted in a projected customer field.
+/// Its statements use full key paths even inside a record.
+struct NestedAppend<'a> {
+    field: Option<&'a SmolStr>,
+    tiling: &'a Tiling,
+    previous: Predicate,
+    facts: Vec<Predicate>,
+    /// Physical parent paths in this delivery at each level. An absence can also
+    /// concern a parent held only in the cache.
+    rows: Vec<Vec<Vec<Value>>>,
+}
+
+impl<'a> NestedAppend<'a> {
+    fn prepare(
+        cache: &Tile,
+        input: &Tile,
+        projection: &'a Projection,
+        tiling: &'a Tiling,
+    ) -> Option<Self> {
+        let field = projected_field(projection);
+        let (chain, old, ty, rows, outer_closed) = if let Some(name) = field {
+            let Tile::DataFunction {
+                domain,
+                codomain,
+                domain_predicate,
+                ..
+            } = input
+            else {
+                return None;
+            };
+            let Tile::Record { fields, .. } = &**codomain else {
+                return None;
+            };
+            let Tile::Record {
+                fields: previous, ..
+            } = cache.values_at(CurryLevel::new(1))
+            else {
+                return None;
+            };
+            let Tiling::Record(types) = tiling.values_at(CurryLevel::new(1)) else {
+                return None;
+            };
+            if !domain_predicate.is_false() {
+                return None;
+            }
+            (
+                fields.get(name)?,
+                previous.get(name)?,
+                types.get(name)?,
+                (0..domain.len())
+                    .map(|i| vec![domain.index_at(i)])
+                    .collect(),
+                cache.level_statement(),
+            )
+        } else {
+            (input, cache, tiling, vec![Vec::new()], Predicate::False)
+        };
+        let levels = ty.levels();
+        if levels < 2 || !matches!(ty.deepest_values(), Tiling::Scalar(_)) {
+            return None;
+        }
+        let leaf = CurryLevel::new(levels - 1);
+        let mut facts = Vec::with_capacity(levels);
+        let mut parents = rows;
+        let mut rows = Vec::with_capacity(levels);
+        for depth in 0..levels {
+            let node = chain.values_at(CurryLevel::new(depth));
+            let mut stated = node.level_statement();
+            if depth == leaf.index() {
+                // A bare key awaiting a value cannot be recorded as a final scalar.
+                let Tile::DataFunction {
+                    domain, codomain, ..
+                } = node
+                else {
+                    unreachable!()
+                };
+                let Tile::DataFunction {
+                    domain: held,
+                    codomain: values,
+                    ..
+                } = old.values_at(leaf)
+                else {
+                    unreachable!()
+                };
+                if !codomain.holds_plain_values(domain.len())
+                    || !values.holds_plain_values(held.len())
+                {
+                    return None;
+                }
+                stated = stated.union(&node.unstated_held_keys(&parents));
+            }
+            let children = if depth < leaf.index() {
+                node.key_paths(&parents)
+            } else {
+                Vec::new()
+            };
+            rows.push(parents);
+            parents = children;
+            facts.push(stated);
+        }
+        Some(Self {
+            field,
+            tiling: ty,
+            previous: old.completion_at(leaf).union(&outer_closed.descend(levels)),
+            rows,
+            facts,
+        })
+    }
+
+    fn settle(self, cache: &mut Tile, root_tiling: &Tiling) -> TileGuard {
+        let Self {
+            field,
+            tiling,
+            previous,
+            rows,
+            facts,
+        } = self;
+        let (chain, parents) = if let Some(name) = field {
+            let Tile::DataFunction {
+                domain, codomain, ..
+            } = cache
+            else {
+                unreachable!()
+            };
+            let Tile::Record { fields, .. } = &mut **codomain else {
+                unreachable!()
+            };
+            (fields.get_mut(name).unwrap(), Some(&*domain))
+        } else {
+            (cache, None)
+        };
+        let leaf = CurryLevel::new(facts.len() - 1);
+        let mut from_children = Predicate::False;
+        let mut delta = Predicate::False;
+        for (depth, (arrived, rows)) in facts.into_iter().zip(rows).enumerate().rev() {
+            let level = CurryLevel::new(depth);
+            let mut changed = arrived.union(&from_children);
+            let ext = tiling.values_at(level).domain_extent();
+            let mut stated = chain.values_at(level).level_statement().union(&changed);
+            // A statement covering the entire finite extent at a root-chain level
+            // also covers future groups. An exact field delivery is scoped to its rows.
+            if field.is_none() && covers_domain(&stated, ext.as_ref()) {
+                stated = Predicate::True;
+            }
+            if stated.is_true() {
+                // Merging a following child can also make the level universal.
+                changed = Predicate::True;
+            }
+            let mut closed = if depth == 0 && field.is_none() {
+                Predicate::False
+            } else {
+                closed_memo_rows(chain, parents, depth, &changed, &stated, ext.as_ref(), rows)
+            };
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = chain.values_at_mut(level)
+            else {
+                unreachable!()
+            };
+            *domain_predicate = stated;
+            if depth == 0 {
+                if field.is_some() {
+                    closed = closed.descend(1);
+                }
+                *domain_predicate = domain_predicate.union(&closed);
+                changed = changed.union(&closed);
+            }
+            delta = delta.union(&changed.descend(leaf.index() - depth));
+            from_children = closed;
+        }
+        let new = delta.minus(&previous);
+        let guard = leaf.wrap_guard(TileGuard::Function(FunctionGuard::Domain(new)));
+        if let Some(name) = field {
+            let TileGuard::Record(mut fields) =
+                root_tiling.values_at(CurryLevel::new(1)).empty_guard()
+            else {
+                unreachable!()
+            };
+            fields.insert(name.clone(), guard);
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(fields))))
+        } else {
+            // Keep whole rows in their canonical, shallow representation.
+            Projection::of(&guard)
+                .expect("a chain of collection keys")
+                .guard(tiling)
+        }
+    }
+}
+
+/// Rows whose children now cover their extent. Usually the input identifies all
+/// candidates. A statement of absence may carry no physical rows: look those up
+/// in the cache, following only branches reached by the statement.
+fn closed_memo_rows(
+    chain: &Tile,
+    parents: Option<&ColumnValue>,
+    depth: usize,
+    changed: &Predicate,
+    stated: &Predicate,
+    extent: Option<&Extent>,
+    supplied: Vec<Vec<Value>>,
+) -> Predicate {
+    if changed.is_false() {
+        return Predicate::False;
+    }
+    let level = CurryLevel::new(depth + usize::from(parents.is_some()));
+    let affected = Projection::keys_at(level, changed.clone()).above(level);
+    let present = Predicate::union_all(supplied.iter().map(|p| Predicate::exactly(p)).collect());
+    let rows = if affected.minus(&Projection::keys_at(level.enclosing().unwrap(), present))
+        == Projection::Nothing
+    {
+        supplied
+    } else {
+        let mut selected: Vec<_> = match parents {
+            Some(keys) => (0..keys.len())
+                .filter_map(|r| {
+                    let path = vec![keys.index_at(r)];
+                    (!changed.within(&path, depth).is_false()).then_some((r, path))
+                })
+                .collect(),
+            None => vec![(0, Vec::new())],
+        };
+        for d in 0..depth {
+            let node = chain.values_at(CurryLevel::new(d));
+            let Tile::DataFunction { domain, .. } = node else {
+                unreachable!()
+            };
+            let mut next = Vec::new();
+            for (row, path) in selected {
+                let (start, end) = node.row_run(row);
+                for i in start..end {
+                    let mut child = path.clone();
+                    child.push(domain.index_at(i));
+                    if !changed.within(&child, depth - d - 1).is_false() {
+                        next.push((i, child));
+                    }
+                }
+            }
+            selected = next;
+        }
+        selected.into_iter().map(|(_, path)| path).collect()
+    };
+    Predicate::union_all(
+        rows.iter()
+            .filter(|p| {
+                !changed.within(p, 0).is_false() && covers_domain(&stated.within(p, 0), extent)
+            })
+            .map(|p| Predicate::exactly(p))
+            .collect(),
+    )
 }
 
 /// The keys a nested answer settled, and their enclosing rows if the answer holds
@@ -798,6 +1089,102 @@ mod tests {
                 .is_some()
         );
         assert_eq!(cache, reference);
+    }
+
+    #[test]
+    fn an_unqualified_finite_child_statement_also_closes_future_groups_once() {
+        let ty = keyed(Tiling::data_function(Extent::uint_range(2), integer()));
+        let mut cache = ty.empty_tile();
+        let mut absent = ty.empty_tile();
+        let leaf = CurryLevel::new(1);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = absent.values_at_mut(leaf)
+        else {
+            unreachable!()
+        };
+        *domain_predicate = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1]));
+        let delta = cache.append(absent.clone(), &Projection::Everything, &ty);
+        assert!(cache.values_at(leaf).level_statement().is_true());
+        assert_eq!(Projection::of(&delta).unwrap(), Projection::Everything);
+        assert!(
+            cache
+                .append(absent, &Projection::Everything, &ty)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_absence_closes_only_its_customers_history_after_a_mixed_record_delivery() {
+        let history = Tiling::data_function(
+            Extent::uint_range(1),
+            Tiling::data_function(Extent::uint_range(3), integer()),
+        );
+        let ty = keyed(Tiling::Record(
+            [("id".into(), integer()), ("history".into(), history)].into(),
+        ));
+        let column = |starts, keys, values| {
+            Tile::grouped(
+                starts,
+                ColumnValue::UInts(keys),
+                Box::new(values),
+                Predicate::False,
+                Default::default(),
+            )
+        };
+        // Both customers have day 0. Only customer 7 has its first two items.
+        let days = column(
+            vec![0, 1],
+            vec![0, 0],
+            column(
+                vec![0, 2],
+                vec![0, 1, 0],
+                Tile::Scalar(ColumnValue::Ints(vec![70, 71, 90])),
+            ),
+        );
+        let batch = column(
+            vec![0],
+            vec![7, 9],
+            Tile::record(
+                [
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7, 9]))),
+                    ("history".into(), days),
+                ]
+                .into(),
+            ),
+        );
+        let mut cache = ty.empty_tile();
+        let payload = cache.append(batch, &Projection::Everything, &ty);
+        let history_of = |key| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(key)),
+                Projection::of_field("history", Projection::Everything),
+            )
+        };
+        // No physical customer, day or item accompanies this statement.
+        let mut absent = ty.empty_tile();
+        let Tile::Record { fields, .. } = absent.deepest_values_mut() else {
+            unreachable!()
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = fields
+            .get_mut("history")
+            .unwrap()
+            .values_at_mut(CurryLevel::new(1))
+        else {
+            unreachable!()
+        };
+        *domain_predicate = Predicate::exactly(&[Value::UInt(7), Value::UInt(0), Value::UInt(2)]);
+        let region = history_of(7);
+        let end = cache.append(absent.clone(), &region, &ty);
+        let expected = region.minus(&Projection::of(&payload).unwrap());
+        let actual = Projection::of(&end).unwrap();
+        assert_eq!(expected.minus(&actual), Projection::Nothing);
+        assert_eq!(actual.minus(&expected), Projection::Nothing);
+        assert_eq!(actual.intersect(&history_of(9)), Projection::Nothing);
+        assert!(cache.append(absent, &region, &ty).is_empty());
     }
 
     #[test]

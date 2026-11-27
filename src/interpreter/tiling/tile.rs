@@ -2967,38 +2967,40 @@ impl Tile {
     ///
     /// A tile valid before the call is valid after it ([`validate_tile`]).
     pub(crate) fn state_held_values_complete(&mut self) {
-        fn walk(tile: &mut Tile, row_paths: &[Vec<Value>]) {
-            let Tile::DataFunction {
-                domain, codomain, ..
-            } = &*tile
-            else {
-                return;
-            };
-            if matches!(**codomain, Tile::DataFunction { .. }) {
-                let paths = tile.key_paths(row_paths);
-                if let Tile::DataFunction { codomain, .. } = tile {
-                    walk(codomain, &paths);
-                }
-                return;
-            }
-            if !codomain.holds_plain_values(domain.len()) {
-                return;
-            }
-            let held = tile.unstated_held_keys(row_paths);
-            if let Tile::DataFunction {
-                domain_predicate, ..
-            } = tile
-            {
-                *domain_predicate = domain_predicate.union(&held);
-            }
-        }
         let was_valid = cfg!(debug_assertions) && validate_tile(self);
-        walk(self, &[Vec::new()]);
+        self.state_held_values_under(&[Vec::new()]);
         debug_assert!(
             !was_valid || validate_tile(self),
             "stating held plain values complete keeps a valid tile valid: every key it states \
              holds its cells, {self:?}"
         );
+    }
+
+    /// As above, retaining the enclosing paths of a collection in a record field.
+    fn state_held_values_under(&mut self, row_paths: &[Vec<Value>]) {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &*self
+        else {
+            return;
+        };
+        if matches!(**codomain, Tile::DataFunction { .. }) {
+            let paths = self.key_paths(row_paths);
+            if let Tile::DataFunction { codomain, .. } = self {
+                codomain.state_held_values_under(&paths);
+            }
+            return;
+        }
+        if !codomain.holds_plain_values(domain.len()) {
+            return;
+        }
+        let held = self.unstated_held_keys(row_paths);
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = self
+        {
+            *domain_predicate = domain_predicate.union(&held);
+        }
     }
 
     /// The held keys outside this collection's completion statement, qualified by their rows.
