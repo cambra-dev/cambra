@@ -788,6 +788,7 @@ impl MapResultProducer {
                     });
                 }
             }
+            input_tile.unfollow_values_at(self.level);
             *input_tile.values_at_mut(self.level) = gathered;
             return input_tile;
         }
@@ -802,6 +803,7 @@ impl MapResultProducer {
             .index()
             .checked_sub(1)
             .map(|innermost| input_tile.completion_at(CurryLevel::new(innermost)));
+        input_tile.unfollow_values_at(level);
         let arguments = std::mem::replace(
             input_tile.values_at_mut(level),
             Tile::Scalar(ColumnValue::Units(0)),
@@ -1152,14 +1154,8 @@ impl MapResultToConstProducer {
     /// names them.
     fn open_live_rows(&self, live: &[Predicate], out: &mut Tile) {
         for (depth, held) in live.iter().enumerate() {
-            let Tile::DataFunction {
-                domain_predicate, ..
-            } = out.values_at_mut(CurryLevel::new(depth))
-            else {
-                unreachable!("MapResultToConst keeps its input's collection levels")
-            };
             if *held != Predicate::False {
-                *domain_predicate = domain_predicate.minus(held);
+                out.unstate_at(CurryLevel::new(depth), held);
             }
         }
     }
@@ -1307,6 +1303,7 @@ impl MapResultToConstProducer {
         // two `Zip` modes pair with them whatever they carry — a level included, which a
         // column has nowhere to put.
         let mut output = input_tile;
+        output.unfollow_values_at(self.level);
         let slot = output.values_at_mut(self.level);
         let values = std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0)));
         let mut const_tile = repeat_tile(constant_tile, values.rows());
@@ -2610,11 +2607,16 @@ mod tests {
         let out = producer.read_in_pipeline(producer.tiling().universal_guard());
         assert_eq!(
             out,
+            // Replacing the groups leaves the outer keys following nothing they hold.
             Tile::data_function(
                 ColumnValue::UInts(vec![0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 7]))),
                 Predicate::True,
                 BitSet::new(),
+            )
+            .with_keys_follow(
+                CurryLevel::new(0),
+                crate::interpreter::tiling::KeysFollow::DoesNot
             )
         );
     }

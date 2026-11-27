@@ -418,6 +418,9 @@ impl TileProducer for VariantWrapProducer {
             released.map_level_predicates(&mut |_, _| Predicate::True);
             return released;
         }
+        // The wrap makes the payload its arm's value at each row, so the keys above it follow no
+        // level beneath.
+        tile.unfollow_values_at(self.level);
         let slot = tile.values_at_mut(self.level);
         // A record payload is a value only once every field has arrived: an operand with no
         // answer yet, as a breaker before its first consume, leaves its field empty.
