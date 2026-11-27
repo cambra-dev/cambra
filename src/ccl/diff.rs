@@ -1249,6 +1249,7 @@ fn collect_deleted_roots<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Duplicate;
     use crate::ccl::Occurrence;
     use crate::ccl::RecordEntry;
     use crate::ccl::content_hash::content_hash;
@@ -1291,7 +1292,7 @@ mod tests {
     #[test]
     fn identical_programs_are_entirely_shared() {
         let a = let_in("x", int(1), add(var("x"), var("y")));
-        let b = a.clone();
+        let b = a.duplicate();
         let r = diff(&a, &b);
         assert!(r.is_identical());
         // The root, and every node under it, is shared.
@@ -1424,9 +1425,9 @@ mod tests {
         // to a new parent is recognized (shared content) rather than reported
         // as a delete + insert — and the placement axis says it moved.
         let moved = add(var("a"), var("b"));
-        let v1 = TypedExpr::tuple(vec![moved.clone(), int(9)]);
+        let v1 = TypedExpr::tuple(vec![moved.duplicate(), int(9)]);
         // `a + b` is now nested inside `(a + b) * 2`, in the other tuple slot.
-        let v2 = TypedExpr::tuple(vec![int(9), mul(moved.clone(), int(2))]);
+        let v2 = TypedExpr::tuple(vec![int(9), mul(moved.duplicate(), int(2))]);
         let r = diff(&v1, &v2);
 
         let relocated: Vec<_> = r

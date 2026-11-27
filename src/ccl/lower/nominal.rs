@@ -24,6 +24,7 @@ use super::constants::Refused;
 use super::functions::refuse_misannotated_type_binder;
 use super::stmts::{is_kind, is_mut_annotation, lower_type_expr, reserved_name};
 use super::{LoweringContext, LoweringError};
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::nominal::{NominalCtor, NominalDecl, WrittenOrder};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam, TypeParamId};

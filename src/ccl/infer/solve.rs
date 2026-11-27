@@ -32,6 +32,7 @@ use crate::ccl::{
 
 use super::context::should_generalize;
 use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
+use crate::ccl::Duplicate;
 
 /// Push `new_err` onto `errors`, blamed on `blame`, dropping a repeat of an
 /// [`InferError::OpaqueEscape`] or an [`InferError::NoJoinOverBinder`].
@@ -768,10 +769,10 @@ struct ActiveSpecialization {
 }
 
 /// Each node of `clone` paired with the node of `def` it copies, for a `clone` of
-/// `def` that nothing has rewritten yet: [`Clone`] re-mints every id and keeps the
-/// shape, so a walk of the two in step pairs them.
+/// `def` that nothing has rewritten yet: a duplicate re-mints every id and keeps the
+/// shape ([`Duplicate::duplicate`]), so a walk of the two in step pairs them.
 fn copied_nodes(def: &Expr, clone: &Expr, out: &mut HashMap<NodeId, NodeId>) {
-    // The node's own id and each occurrence it holds, which `Clone` re-mints alike.
+    // The node's own id and each occurrence it holds, which a duplicate re-mints alike.
     let mut own = Vec::new();
     def.for_each_own_id(|id| own.push(id));
     let mut own_copies = Vec::new();
@@ -1720,13 +1721,9 @@ pub(super) fn coalesce_pass(
     // With the whole graph in its final state, re-check every read the walk
     // performed (skipped on the error path — a failed program's reads are
     // not expected to be stable).
-    // Under `run_debug_check` because the re-resolution rebuilds predicate terms
-    // it then drops: `NodeId` is a process-global counter, so minting for them
-    // would advance it in debug builds alone and one program would take two id
-    // sets.
     #[cfg(debug_assertions)]
     if ctx.errors.is_empty() {
-        crate::ccl::provenance::run_debug_check(|| assert_reads_stable(&ctx.reads));
+        assert_reads_stable(&ctx.reads);
     }
     // Every node's capabilities are known once inference ends, those of a node the walk
     // resolves no type at included.
@@ -2605,7 +2602,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // which ones did not (`src/ccl/design/type-inference.md`, "Arm facts").
             let case_facts = match scrutinee.as_deref() {
                 Some(s) => crate::ccl::nominal::typed_case_facts(s, branches),
-                None => vec![Vec::new(); branches.len()],
+                None => std::iter::repeat_with(Vec::new)
+                    .take(branches.len())
+                    .collect(),
             };
             for (b, facts) in branches.iter_mut().zip(case_facts) {
                 // A pattern's payload binding scopes the branch's guard and
@@ -3478,7 +3477,7 @@ fn coalesce_type_predicates_go(
             (0..n).for_each(|_| scope.exit());
             // A component's determined projection is its one candidate (the arm below), which
             // can leave no component reading another.
-            let rebuilt = Type::closed_dep_tuple(cs.clone());
+            let rebuilt = Type::closed_dep_tuple(cs.clone(), crate::ccl::Ids::Fresh);
             if !matches!(rebuilt, Type::DepTuple(_)) {
                 *ty = rebuilt;
             }
@@ -3894,7 +3893,7 @@ pub(super) fn specialize_use(
         "mono.specialize",
         crate::ccl::provenance::Nature::Expansion,
     );
-    // The clone must come *after* the recording opens. `Clone` re-mints every
+    // The clone must come *after* the recording opens. `duplicate` re-mints every
     // `NodeId` in the copy, so N specializations cannot collide on one id, and
     // each re-mint fires `on_copy(origin, fresh)` — complete parentage on its
     // own, but only an open recording captures it. Cloning first leaves every pair
@@ -3906,7 +3905,7 @@ pub(super) fn specialize_use(
     // `freshen_expr_type_slots` below re-mints those interiors separately,
     // through `freshen_refinement_predicate`, and its copies are captured by this
     // same recording.
-    let mut clone = frame.def.clone();
+    let mut clone = frame.def.duplicate();
     let mut origins = HashMap::new();
     copied_nodes(&frame.def, &clone, &mut origins);
     let entered_binders = placement
@@ -4692,16 +4691,13 @@ fn typecheck_discarded_definition(
     // A message names the binder an A-normalization temp or a mutable variable's read was
     // given rather than the term or the variable it stands for, and the caller respells it
     // against the tree inference leaves, which this definition is dropped from. Respelled
-    // here, against the definition, while it holds those bindings. The respelling's terms
-    // only reach messages, so they keep the identities they copy.
+    // here, against the definition, while it holds those bindings.
     if ctx.errors.len() > before {
-        let respelling = {
-            let _preserving = crate::ccl::provenance::preserve_ids();
-            crate::ccl::subst::Subst::then(
-                &crate::ccl::anf::temp_respelling(def),
-                &crate::ccl::mut_read::read_respelling(def),
-            )
-        };
+        // The respelling's terms only reach messages, so its copies keep the ids they copy.
+        let respelling = crate::ccl::subst::Subst::then(
+            &crate::ccl::anf::temp_respelling(def, crate::ccl::Ids::Kept),
+            &crate::ccl::mut_read::read_respelling(def, crate::ccl::Ids::Kept),
+        );
         for error in &mut ctx.errors[before..] {
             error.error.respell(&respelling);
         }
@@ -4826,9 +4822,11 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
             let components: Vec<Type> = match dom.peel_refinements() {
                 Type::Tuple(ts) if ts.len() == params.len() => ts.clone(),
                 Type::DepTuple(cs) if cs.len() == params.len() => {
-                    crate::ccl::subst::open_tuple_components(cs, |j, _| {
-                        crate::ccl::subst::Mapping::Rename(params[j].name.clone())
-                    })
+                    crate::ccl::subst::open_tuple_components(
+                        cs,
+                        |j, _| crate::ccl::subst::Mapping::Rename(params[j].name.clone()),
+                        crate::ccl::Ids::Fresh,
+                    )
                 }
                 other => panic!(
                     "a lambda of {} parameters has a product domain, got {other}",

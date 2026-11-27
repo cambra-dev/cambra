@@ -34,6 +34,7 @@ use super::schemes::OperatorSchemes;
 use super::solve::value_type;
 use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{coalesce_for_error, map_constrain_err};
+use crate::ccl::Duplicate;
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceTable, MethodCall, MethodRow, StdTrait, Trait, TraitObligation,
 };
@@ -2499,7 +2500,7 @@ impl InferCtx {
             obligation.refine_output(crate::ccl::infer::solver::traits::OutputRefinement {
                 assoc,
                 template,
-                operands: operands.iter().map(|e| (*e).clone()).collect(),
+                operands: operands.iter().map(|e| (*e).duplicate()).collect(),
             });
         }
         obligation.assume(&self.assumptions);
@@ -5095,7 +5096,12 @@ impl Typing for InferCtx {
                     "infer.argument_list_discharge",
                     crate::ccl::provenance::Nature::Machinery,
                 );
-                (expected, result, Subst::discharging(&env), Some(parts))
+                (
+                    expected,
+                    result,
+                    Subst::discharging(&env, crate::ccl::Ids::Fresh),
+                    Some(parts),
+                )
             }
         };
         let capabilities = self.call_capabilities();
@@ -5208,7 +5214,7 @@ pub(super) fn list_component(passed: &Expr, j: usize) -> Expr {
     match &passed.node {
         // A borrow's place is what a later parameter's type reads, as one argument's is.
         TypedExprNode::Tuple(parts) => match &parts[j].node {
-            TypedExprNode::Borrow(place) => place.clone_preserving_ids(),
+            TypedExprNode::Borrow(place) => place.as_ref().clone_preserving_ids(),
             _ => parts[j].clone_preserving_ids(),
         },
         TypedExprNode::Let { body, .. } => {

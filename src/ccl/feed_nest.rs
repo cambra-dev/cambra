@@ -19,6 +19,7 @@ use crate::ccl::Occurrence;
 use crate::ccl::subst::Subst;
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
 };
@@ -29,7 +30,6 @@ use crate::ccl::{
 
 /// A fed value together with the row its contribution is stored at. Every operation
 /// applies the same binders, scopes and substitutions to both.
-#[derive(Clone)]
 pub(crate) struct FeedValue {
     /// The fed value, typed as inference typed it. Inside a recurrence its type can read the
     /// writer's snapshot of a mutable variable. Channel assembly consumes it.
@@ -40,6 +40,15 @@ pub(crate) struct FeedValue {
     /// writer's snapshot replaces such a read with the previous value the history holds, so a
     /// tap type reading it would read the history that holds the row.
     pub row: Type,
+}
+
+impl Duplicate for FeedValue {
+    fn copied(&self, ids: crate::ccl::Ids) -> Self {
+        FeedValue {
+            value: self.value.copied(ids),
+            row: self.row.clone(),
+        }
+    }
 }
 
 impl FeedValue {
@@ -67,7 +76,7 @@ impl FeedValue {
 
     pub(crate) fn discharge_env(self, env: &std::collections::HashMap<Name, Expr>) -> Self {
         Self::new(
-            Subst::discharge_env_in_place(self.value, env),
+            Subst::discharge_env_in_place(self.value, env, crate::ccl::Ids::Fresh),
             Subst::discharge_env_in_type(&self.row, env),
         )
     }
@@ -227,7 +236,7 @@ pub(crate) fn contribution_lambda(
     let ty = contribution_type(param, body.ty.clone(), exemplar);
     Expr::lambda(
         &param.name,
-        param.occurrence.clone(),
+        param.occurrence.duplicate(),
         param.ty.clone(),
         body,
     )
@@ -428,7 +437,7 @@ fn nest_as_product(contribution: Expr, generators: Vec<Generator>) -> Expr {
             .with_ty(domains[depth].clone());
             read_level(
                 position,
-                generators[depth].source().clone(),
+                generators[depth].source().duplicate(),
                 param,
                 inner,
                 was.as_ref(),
@@ -580,10 +589,10 @@ fn generator_nest(
         TypedExprNode::Lambda { .. } => {
             let parts = crate::ccl::ccl_utils::loop_parts(nest)?;
             let (param, body) = (parts.element, parts.body);
-            let iterated = parts.source.clone();
+            let iterated = parts.source.duplicate();
             let generator = Generator {
                 iterated,
-                param: param.clone(),
+                param: param.duplicate(),
             };
             let reads = |names: &[Name], e: &Expr| names.iter().any(|n| count_free(n, e) > 0);
             let independent = !reads(&scope.binders, &generator.iterated)
@@ -602,12 +611,12 @@ fn generator_nest(
             let param = crate::ccl::one_param(params);
             let iterated = match prefix {
                 [] => return None,
-                [one] => one.clone(),
-                _ => compose_typed_or_hole(prefix.to_vec()),
+                [one] => one.duplicate(),
+                _ => compose_typed_or_hole(prefix.iter().map(Duplicate::duplicate).collect()),
             };
             let generator = Generator {
                 iterated,
-                param: param.clone(),
+                param: param.duplicate(),
             };
             // Neither the source nor its filter may read an enclosing binder or a name bound
             // between the loops: the loop's keys would then depend on the enclosing position,

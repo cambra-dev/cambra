@@ -1043,8 +1043,10 @@ fn materialize_record(
         for v in rec.values() {
             out.push(coalesce_compact_go(v, polarity, scope)?);
         }
-        let out =
-            crate::ccl::subst::tuple_of_components(out.into_iter().map(|t| (None, t)).collect());
+        let out = crate::ccl::subst::tuple_of_components(
+            out.into_iter().map(|t| (None, t)).collect(),
+            crate::ccl::Ids::Fresh,
+        );
         match width {
             Some(TupleWidth::Exactly(n)) => {
                 debug_assert_eq!(*n, out.len(), "a closed tuple lists all its positions");

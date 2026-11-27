@@ -25,6 +25,7 @@ use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{product, variant_type};
+use crate::ccl::Duplicate;
 use crate::ccl::infer::solver::traits::{
     Assoc, MethodRow, MethodTarget, Signature, StdTrait, Trait, function_over, replace_params,
 };
@@ -706,13 +707,14 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             // The codomain is typed opened, with the binder's names in scope at their types,
             // and closed again.
             let b = crate::ccl::subst::named_binder(binder);
-            let mut opened = crate::ccl::subst::open_at_binder(&b, d, c);
-            let scope: Vec<(Name, Type)> = crate::ccl::subst::binder_scope(&b, d)
-                .into_iter()
-                .map(|(n, t)| (n, ctx.normalize(&ctx.refinement_domain(&t))))
-                .collect();
+            let mut opened = crate::ccl::subst::open_at_binder(&b, d, c, crate::ccl::Ids::Fresh);
+            let scope: Vec<(Name, Type)> =
+                crate::ccl::subst::binder_scope(&b, d, crate::ccl::Ids::Fresh)
+                    .into_iter()
+                    .map(|(n, t)| (n, ctx.normalize(&ctx.refinement_domain(&t))))
+                    .collect();
             under_scope(&scope, &mut opened, ctx)?;
-            **c = crate::ccl::subst::close_at_binder(&b, &opened);
+            **c = crate::ccl::subst::close_at_binder(&b, &opened, crate::ccl::Ids::Fresh);
             Ok(())
         }
         // The body is typed opened, with each binder in scope at its domain, and closed again.
@@ -735,12 +737,14 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
                 .iter()
                 .map(|(_, t)| ctx.normalize(&ctx.refinement_domain(t)))
                 .collect();
-            let mut opened = crate::ccl::subst::opened_family_body(binders, body)
-                .unwrap_or_else(|| (**body).clone());
+            let mut opened =
+                crate::ccl::subst::opened_family_body(binders, body, crate::ccl::Ids::Fresh)
+                    .unwrap_or_else(|| (**body).clone());
             let scope: Vec<(Name, Type)> = names.iter().cloned().zip(bounds).collect();
             under_scope(&scope, &mut opened, ctx)?;
             let enclosing: Vec<Option<Name>> = names.into_iter().map(Some).collect();
-            **body = crate::ccl::subst::close_pi_binders(&enclosing, &opened);
+            **body =
+                crate::ccl::subst::close_pi_binders(&enclosing, &opened, crate::ccl::Ids::Fresh);
             Ok(())
         }
         // A family's arguments are terms the declaration writes, typed where they stand.
@@ -770,9 +774,11 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         // types, and closed again, as a family's body is.
         Type::DepTuple(cs) => {
             let names = crate::ccl::subst::tuple_component_names(cs);
-            let mut opened = crate::ccl::subst::open_tuple_components(cs, |j, _| {
-                crate::ccl::subst::Mapping::Rename(names[j].clone())
-            });
+            let mut opened = crate::ccl::subst::open_tuple_components(
+                cs,
+                |j, _| crate::ccl::subst::Mapping::Rename(names[j].clone()),
+                crate::ccl::Ids::Fresh,
+            );
             let mut scope: Vec<(Name, Type)> = Vec::with_capacity(cs.len());
             for (name, component) in names.iter().zip(opened.iter_mut()) {
                 under_scope(&scope, component, ctx)?;
@@ -783,7 +789,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             }
             let mut closed: Vec<(Option<Name>, Type)> =
                 names.into_iter().map(Some).zip(opened).collect();
-            crate::ccl::subst::close_tuple_components(&mut closed);
+            crate::ccl::subst::close_tuple_components(&mut closed, crate::ccl::Ids::Fresh);
             *cs = closed;
             Ok(())
         }
@@ -993,7 +999,7 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             let domain = complete_annotation(ad, id);
             let annotated = crate::ccl::subst::named_binder(if an.is_none() { inn } else { an });
             let alignment = crate::ccl::subst::Subst::id().aligned_binders(inn, &annotated);
-            let inferred = crate::ccl::subst::open_at_binder(inn, id, ic);
+            let inferred = crate::ccl::subst::open_at_binder(inn, id, ic, crate::ccl::Ids::Fresh);
             // Preserve the annotation's binder when the initializer's variables can be
             // transported by an invertible correspondence. A product reindexing maps names
             // to terms, so completion stays in the initializer's scope there.
@@ -1002,11 +1008,20 @@ fn complete_annotation(ann: &Type, inferred: &Type) -> Type {
             } else {
                 (crate::ccl::subst::named_binder(inn), inferred)
             };
-            let declared = crate::ccl::subst::close_at_binder(an, ac);
-            let declared = crate::ccl::subst::open_at_binder(&target, &domain, &declared);
+            let declared = crate::ccl::subst::close_at_binder(an, ac, crate::ccl::Ids::Fresh);
+            let declared = crate::ccl::subst::open_at_binder(
+                &target,
+                &domain,
+                &declared,
+                crate::ccl::Ids::Fresh,
+            );
             let cod = complete_annotation(&declared, &inferred);
             Type::Fun {
-                codomain: Box::new(crate::ccl::subst::close_at_binder(&target, &cod)),
+                codomain: Box::new(crate::ccl::subst::close_at_binder(
+                    &target,
+                    &cod,
+                    crate::ccl::Ids::Fresh,
+                )),
                 binder: target,
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(domain),
@@ -1111,7 +1126,7 @@ pub(super) fn emit_lambda<C: Typing>(
                 .collect();
             // Closed as `Type::dep_tuple` closes it, a later component's written read of an
             // earlier one an index, without collapsing to the plain tuple.
-            crate::ccl::subst::close_tuple_components(&mut components);
+            crate::ccl::subst::close_tuple_components(&mut components, crate::ccl::Ids::Fresh);
             let domain = Type::DepTuple(components);
             (
                 FunBinder::Parameters(names.into_iter().map(Some).collect()),
@@ -1312,7 +1327,7 @@ pub(super) fn emit_cast<C: Typing>(
     // target rebuilds a function around the value's codomain, so references to
     // the preserved binder close here. Idempotent when `v` came out of a
     // closed function (its references are already indices).
-    let v = crate::ccl::subst::close_at_binder(&binder, &v);
+    let v = crate::ccl::subst::close_at_binder(&binder, &v, crate::ccl::Ids::Fresh);
     // The re-viewed value does what the value does, settled by the target's kind: a
     // function re-viewed as a collection runs where the cast stands.
     let capabilities = ctx.composed_capabilities(target, std::slice::from_ref(&value_ty));
@@ -1991,7 +2006,8 @@ fn refine_result(
         "infer.refine_result",
         crate::ccl::provenance::Nature::Machinery,
     );
-    let operands: Vec<crate::ccl::TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+    let operands: Vec<crate::ccl::TypedExpr> =
+        operand_exprs.iter().map(|e| (*e).duplicate()).collect();
     refinement.refine(result, &operands)
 }
 
@@ -2499,6 +2515,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
                     &crate::ccl::subst::Mapping::Rename(b.clone()),
                     &dom,
                     &cod,
+                    crate::ccl::Ids::Fresh,
                 )
             }
             _ => cod,
@@ -5036,14 +5053,14 @@ pub(super) fn writer_tap_histories(
             let position = Name::fresh("__pos");
             let at = var(&position, domain);
             let item = match enclosing {
-                None => applied(at.clone(), source.clone_preserving_ids(), item_ty),
+                None => applied(at.duplicate(), source.clone_preserving_ids(), item_ty),
                 Some((e, e_ty)) => {
                     let family = source
                         .ty
                         .codomain()
                         .expect("a nested writer's source is a family of collections");
                     let row = applied(var(e, e_ty), source.clone_preserving_ids(), family);
-                    applied(at.clone(), row, item_ty)
+                    applied(at.duplicate(), row, item_ty)
                 }
             };
             // Each slot before the item is the value a variable held entering the position.
@@ -5127,10 +5144,13 @@ fn emit_transact_writer<C: Typing>(
         let ty = match (i, p.peel_refinements()) {
             (0, _) => enclosing_component(p),
             (_, Type::DepTuple(parts)) => {
-                let first = std::rc::Rc::new(projected(whole.clone(), 0, enclosing_component(p)));
-                crate::ccl::subst::open_tuple_components(parts, |_, _| {
-                    crate::ccl::subst::Mapping::Discharge(std::rc::Rc::clone(&first))
-                })
+                let first =
+                    std::rc::Rc::new(projected(whole.duplicate(), 0, enclosing_component(p)));
+                crate::ccl::subst::open_tuple_components(
+                    parts,
+                    |_, _| crate::ccl::subst::Mapping::Discharge(std::rc::Rc::clone(&first)),
+                    crate::ccl::Ids::Fresh,
+                )
                 .pop()
                 .unwrap_or_else(|| unreachable!("the pair has two components"))
             }
@@ -5345,9 +5365,11 @@ fn nested_parameter_parts(parameter: &Type) -> (Option<Name>, Type) {
                 .0
                 .clone()
                 .unwrap_or_else(|| Name::fresh("__enclosing"));
-            let position = crate::ccl::subst::open_tuple_components(parts, |_, _| {
-                crate::ccl::subst::Mapping::Rename(enclosing.clone())
-            })
+            let position = crate::ccl::subst::open_tuple_components(
+                parts,
+                |_, _| crate::ccl::subst::Mapping::Rename(enclosing.clone()),
+                crate::ccl::Ids::Fresh,
+            )
             .pop()
             .unwrap_or_else(|| unreachable!("the pair has two components"));
             (Some(enclosing), position)

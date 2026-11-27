@@ -4112,6 +4112,7 @@ fn exclusive_borrows(
 mod tests {
     use super::*;
     use crate::ccl::Annotation;
+    use crate::ccl::Duplicate;
 
     use crate::ccl::BaseType;
     use crate::ccl::Occurrence;
@@ -7009,7 +7010,8 @@ mod tests {
         let body = Expr::lit(Lit::Int(1)).with_ty(equals(Expr::var("y").with_ty(int.clone())));
         let bound = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
         let let_bound = |recorded: Type| {
-            Expr::let_bind("y", Occurrence::mint(), bound.clone(), body.clone()).with_ty(recorded)
+            Expr::let_bind("y", Occurrence::mint(), bound.duplicate(), body.duplicate())
+                .with_ty(recorded)
         };
         let check = |tree: &Expr| {
             typecheck_planned(

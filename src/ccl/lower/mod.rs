@@ -367,7 +367,7 @@ impl LoweringError {
 /// every error has a recovery placeholder ([`LoweringError::has_stand_in`]); other errors
 /// can leave the tree inconsistent outside a placeholder. No later pass reads a tree with
 /// lowering errors.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct LoweringResult {
     /// The lowered expression. `Some` even on error if recovery produced
     /// anything usable; `None` only when there is nothing structural to

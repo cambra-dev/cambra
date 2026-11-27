@@ -68,7 +68,7 @@ fn erase_in_type(ty: &mut Type) {
             for (_, component) in &mut components {
                 erase_in_type(component);
             }
-            *ty = Type::closed_dep_tuple(components);
+            *ty = Type::closed_dep_tuple(components, crate::ccl::Ids::Fresh);
         }
         other => other.walk_children_mut(erase_in_type),
     }

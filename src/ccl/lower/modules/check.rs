@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ccl::Annotation;
+use crate::ccl::Duplicate;
 use crate::ccl::Occurrence;
 
 /// A type argument, or a type member of a module argument, that a module's check
@@ -244,7 +245,7 @@ impl<'a> ProgramLowering<'a> {
         self.holding_predicates.extend(shared_modules);
         let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
-            lowered.chain.clone()
+            lowered.chain.duplicate()
         };
         let mut params = Vec::new();
         let mut modules: HashMap<SmolStr, Rc<HashMap<QualifiedName, Name>>> = HashMap::new();
@@ -348,7 +349,7 @@ impl<'a> ProgramLowering<'a> {
             let _copy = crate::ccl::provenance::copy_frame("check.module");
             for (shared, chain) in self.shared_chains.iter().rev() {
                 if reached.contains(shared) {
-                    let copy = chain.clone();
+                    let copy = chain.duplicate();
                     self.check_sites.note_clone(chain, &copy, &ctx.run_sites);
                     tree = fill_module_body(copy, tree);
                 }
@@ -619,7 +620,7 @@ fn read_through_atom(
     let atom = Name::fresh_like(&binding.name);
     let value = ctx.tag_machinery(Expr::new(TypedExprNode::Abstract), declared, LABEL);
     let parameter_binder = binding.name.clone();
-    let annotation = binding.user_annotation.clone();
+    let annotation = binding.user_annotation.duplicate();
     let inner = Expr::preserve(
         id,
         TypedExprNode::Let {

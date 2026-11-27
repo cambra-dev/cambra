@@ -19,6 +19,7 @@
 
 use std::rc::Rc;
 
+use crate::ccl::Duplicate;
 use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, flatten_trailing_value_case, make_cast, refine_with,
     synthesize_arm_predicate, walk_refined_predicates, walk_refined_predicates_mut,
@@ -269,14 +270,14 @@ fn instantiate_witness_in_types(
 /// two halves ask one question between them: this sum's kind says the function is a
 /// conditional collection, and the argument naming `witness` says it is *this* one.
 fn read_the_arm_instead(predicate: &Expr, witness: &crate::ccl::ty::Witness, arm: &Expr) -> Expr {
-    let mut out = predicate.clone();
+    let mut out = predicate.duplicate();
     if let TypedExprNode::Apply { argument, function } = &mut out.node
         && crate::ccl::ty::free_witness_refs(&argument.ty, &[]) == [*witness.id()]
         && indexed_by_this_sum(function, &witness.type_kind())
     {
         // The argument is the index this source is read at, so nothing below either side is
         // another source: the arm replaces the whole collection.
-        **function = arm.clone();
+        **function = arm.duplicate();
         return out;
     }
     out.walk_children_mut(|child| *child = read_the_arm_instead(child, witness, arm));
@@ -396,7 +397,7 @@ fn realize(
         let TypedExprNode::Case { branches, .. } = &expr.node else {
             unreachable!("is_value_case matched a Case")
         };
-        match arm_choices(branches.clone(), None) {
+        match arm_choices(branches.duplicate(), None) {
             Some(arms) => vec![arms],
             None => return false,
         }
@@ -421,9 +422,13 @@ fn realize(
         // **The gate is the conjunction**, built while still pointful and eliminated once:
         // the leg is the one where *every* witness took the arm this combination names, and
         // each path condition is constant in the element, so their conjunction is too.
-        let Some(gate) = combination.iter().map(|c| c.gate.clone()).reduce(|acc, g| {
-            Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), g).with_ty(bool_ty.clone())
-        }) else {
+        let Some(gate) = combination
+            .iter()
+            .map(|c| c.gate.duplicate())
+            .reduce(|acc, g| {
+                Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), g).with_ty(bool_ty.clone())
+            })
+        else {
             unreachable!("a combination names one arm per witness, so it has a gate")
         };
         // **A decline, not a defect.** A guard is a user expression and elimination reports
@@ -437,11 +442,11 @@ fn realize(
         let Ok(gate_pf) = super::predicates::eliminate_lifted(gate) else {
             return false;
         };
-        let mut leg = expr.clone();
+        let mut leg = expr.duplicate();
         for choice in &combination {
             let Some(wanted) = &choice.witness else {
                 // No witness: the site is the `Case` itself, so the substitution is the arm.
-                leg = choice.arm.clone();
+                leg = choice.arm.duplicate();
                 continue;
             };
             // Skip 0, not this witness's ordinal: choices apply in witness order,
@@ -613,7 +618,7 @@ fn unboxed_arm(arm: Expr) -> Option<(Expr, Type)> {
         provenance::Nature::Machinery,
     );
     let stamp = crate::ccl::ty::unbox_type(&arm.ty)?;
-    let ty = crate::ccl::ty::unboxed_type(&arm.ty, &Rc::new(arm.clone()))?;
+    let ty = crate::ccl::ty::unboxed_type(&arm.ty, &Rc::new(arm.duplicate()))?;
     let dom = ty.domain()?;
     let unboxed = Expr::apply(arm, Expr::builtin(Builtin::Unbox).with_ty(stamp)).with_ty(ty);
     Some((unboxed, dom))
@@ -794,7 +799,7 @@ fn conditional_below(
             && let TypedExprNode::Case { branches, .. } = &expr.node
         {
             if *skip == 0 {
-                return Some(branches.clone());
+                return Some(branches.duplicate());
             }
             *skip -= 1;
         }
@@ -831,7 +836,7 @@ fn replace_the_conditional(
         }
         if is_the_conditional(expr, wanted) {
             if *skip == 0 {
-                *expr = replacement.clone();
+                *expr = replacement.duplicate();
                 *done = true;
                 return true;
             }
@@ -926,7 +931,7 @@ fn erase_determined_boxes(
         )
     );
     if argument.ty.peel_refinements().sum().is_some() && !preserves_result_kind {
-        return ((**argument).clone(), true);
+        return ((**argument).duplicate(), true);
     }
     // Only a determined witness — one candidate — is erasable.
     match stated.witness_kind() {
@@ -938,7 +943,7 @@ fn erase_determined_boxes(
             }
             // Reported rather than inferred from the recorded set: the *same* binder can be
             // erased at two occurrences, and a set that already holds it does not grow.
-            ((**argument).clone(), true)
+            ((**argument).duplicate(), true)
         }
         _ => (e, false),
     }

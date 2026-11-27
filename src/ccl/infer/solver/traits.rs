@@ -88,6 +88,7 @@ use crate::ccl::{
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
+use crate::ccl::Duplicate;
 
 /// A trait: a named requirement on types, together with any types it associates
 /// with them and the functions it declares.
@@ -1748,7 +1749,6 @@ impl StructuralRule {
 
 /// A refinement an operator states of the associated type it asks for, which no instance
 /// states: `^-`'s result is the difference of its operands on whichever numeric row answers.
-#[derive(Clone)]
 pub struct OutputRefinement {
     /// The associated type it refines.
     pub assoc: Assoc,
@@ -1756,6 +1756,16 @@ pub struct OutputRefinement {
     pub template: crate::ccl::RefinementTemplate,
     /// The operator's operand expressions, in argument order.
     pub operands: Vec<TypedExpr>,
+}
+
+impl Duplicate for OutputRefinement {
+    fn copied(&self, ids: crate::ccl::Ids) -> Self {
+        OutputRefinement {
+            assoc: self.assoc.clone(),
+            template: self.template,
+            operands: self.operands.copied(ids),
+        }
+    }
 }
 
 /// One associated position of an obligation: the name, the type standing in for it,
@@ -1949,7 +1959,7 @@ impl TraitObligation {
                     deposited: Cell::new(p.deposited.get()),
                 })
                 .collect(),
-            output_refinement: RefCell::new(original.output_refinement.borrow().clone()),
+            output_refinement: RefCell::new(original.output_refinement.borrow().duplicate()),
             operator_node_id: original.operator_node_id,
             required_at: original.required_at,
             method: original.method.clone(),
@@ -2037,7 +2047,7 @@ impl TraitObligation {
         self.output_refinement
             .borrow()
             .as_ref()
-            .map(|r| r.operands.clone())
+            .map(|r| r.operands.duplicate())
     }
 
     /// Rewrite the output refinement's operands. Freshening's second phase.
@@ -2273,7 +2283,7 @@ impl TraitObligation {
                         app @ Type::FamilyApp(_) => {
                             let into =
                                 crate::ccl::subst::Subst::then(&bound.render_subst(), &frame);
-                            let at = provenance::preserving_ids(|| into.apply_type(app));
+                            let at = into.copying(crate::ccl::Ids::Kept).apply_type(app);
                             contributions.push((at, bound.origin));
                         }
                         other => contributions.push((other.clone(), bound.origin)),
@@ -4708,7 +4718,9 @@ pub(super) fn link_watches(
             // obligation in its operand's frame ([`deliver_in_frame`]).
             .map(|b| match &b.ty {
                 Type::FamilyApp(_) => (
-                    provenance::preserving_ids(|| b.render_subst().apply_type(&b.ty)),
+                    b.render_subst()
+                        .copying(crate::ccl::Ids::Kept)
+                        .apply_type(&b.ty),
                     b.origin,
                 ),
                 _ => (b.ty.clone(), b.origin),
@@ -4898,7 +4910,9 @@ fn deliver_in_frame(
     if let Type::FamilyApp(_) = contribution.peel_refinements() {
         let frame = obligation.frame_of(pos, var);
         if !frame.is_id() {
-            let at = provenance::preserving_ids(|| frame.apply_type(contribution));
+            let at = frame
+                .copying(crate::ccl::Ids::Kept)
+                .apply_type(contribution);
             return deliver(obligation, pos, &at, value, cache);
         }
     }

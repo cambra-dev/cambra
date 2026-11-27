@@ -139,6 +139,7 @@
 use crate::ccl::Occurrence;
 use std::collections::{HashMap, HashSet};
 
+use crate::ccl::Duplicate;
 use crate::ccl::{
     BindingTransparency, Branch, Expr, Name, Type, TypedBinding, TypedExprNode,
     ccl_utils::{free_names_in_value, spelled_in_a_type},
@@ -612,8 +613,8 @@ fn rebuilder(e: &Expr) -> impl Fn(TypedExprNode) -> Expr + use<> {
 /// and respelling it `x` reports a name the program does not use at that point,
 /// so the rename covers the binders [`run`] and [`crate::ccl::anf`] mint — those
 /// with no source spelling.
-pub fn read_respelling(expr: &Expr) -> Subst {
-    let mut out = Subst::id();
+pub fn read_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
+    let mut out = Subst::id().copying(ids);
     respell(expr, &Muts::new(), &mut out);
     out
 }
@@ -803,7 +804,7 @@ fn number(e: &mut Expr, loops: &HashSet<Name>, definiens: &mut Definiens, last: 
         } if !loops.contains(&binding.name) => Some((
             binding.name.clone(),
             e.node_id(),
-            bound_expr.clone_preserving_ids(),
+            bound_expr.as_ref().clone_preserving_ids(),
         )),
         _ => None,
     };
@@ -1269,7 +1270,7 @@ mod tests {
     fn unbinding_restores_the_input() {
         let x = Name::fresh("x");
         let input = accumulator(&x, two_segments(&x));
-        let named = run(input.clone());
+        let named = run(input.duplicate());
         assert_ne!(symbolic(&named), symbolic(&input));
         assert_eq!(symbolic(&unbind(named)), symbolic(&input));
     }

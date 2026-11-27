@@ -1361,126 +1361,9 @@ fn rows_would_reach_the_table() -> bool {
         && ACTIVE_PHASE.with(|p| p.borrow().is_some())
 }
 
-/// A thread-local scope that nests, entered through a guard.
-///
-/// A depth rather than a flag because both scopes re-enter: a preserving copy of
-/// a tree recurses through `Clone` for every child, and a sealed check clones as
-/// it resolves. A guard rather than a decrement after the call because the depth
-/// has to fall on an unwind. Both scopes wrap assertions, an assertion that fires
-/// panics, and a depth left raised turns every later
-/// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) on that thread into a
-/// throwaway.
-trait ScopeDepth {
-    /// Enter the scope; it stays open until the returned guard drops.
-    fn enter(&'static self) -> DepthGuard;
-    /// Whether any scope is open on this thread.
-    fn is_open(&'static self) -> bool;
-}
-
-impl ScopeDepth for std::thread::LocalKey<std::cell::Cell<usize>> {
-    fn enter(&'static self) -> DepthGuard {
-        self.with(|c| c.set(c.get() + 1));
-        DepthGuard(self)
-    }
-
-    fn is_open(&'static self) -> bool {
-        self.with(std::cell::Cell::get) > 0
-    }
-}
-
-/// Guard returned by [`ScopeDepth::enter`]. Dropping it leaves the scope.
-#[must_use]
-pub(crate) struct DepthGuard(&'static std::thread::LocalKey<std::cell::Cell<usize>>);
-
-impl Drop for DepthGuard {
-    fn drop(&mut self) {
-        self.0.with(|c| c.set(c.get() - 1));
-    }
-}
-
-thread_local! {
-    /// Depth of the enclosing [`preserve_ids`] scopes: non-zero means a clone in
-    /// progress is a **re-allocation of the same node**, not a duplication, so it
-    /// must carry the origin's id rather than mint one.
-    static PRESERVING_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Enter a thread-local scope where expression clones preserve their source IDs.
-///
-/// Callers use `TypedExpr::clone_preserving_ids` for one copy or [`run_debug_check`]
-/// for diagnostic work. A genuine duplication inside this scope would reuse IDs;
-/// the scope must not enclose unrelated cloning.
-pub(crate) fn preserve_ids() -> DepthGuard {
-    PRESERVING_IDS.enter()
-}
-
-/// Run a replacement rewrite with id-preserving expression clones.
-///
-/// `PredMemo` uses this only in replacing mode, currently selected by `uniquify`.
-/// The traversal must replace every occurrence of each predicate; otherwise the
-/// original and rebuilt terms may both survive with the same IDs. This scope covers
-/// every clone on the thread while `f` runs, including clones made by its callees.
-///
-/// A single preserving copy uses `TypedExpr::clone_preserving_ids` instead.
-/// See `src/ccl/design/provenance.md`, "Walking the ids".
-pub(crate) fn preserving_ids<R>(f: impl FnOnce() -> R) -> R {
-    let _guard = preserve_ids();
-    f()
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    /// Depth of the enclosing [`run_debug_check`] scopes.
-    static SEALED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Whether a [`run_debug_check`] scope is open on this thread, so
-/// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) builds a throwaway
-/// rather than minting.
-#[cfg(debug_assertions)]
-pub(crate) fn record_sealed() -> bool {
-    SEALED.is_open()
-}
-
-/// Never sealed in a build with assertions off: `run_debug_check` is the only
-/// thing that seals, and it does not exist there. `const` so that
-/// [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new) folds its throwaway
-/// branch away rather than reading a thread-local for every node it builds.
-#[cfg(not(debug_assertions))]
-pub(crate) const fn record_sealed() -> bool {
-    false
-}
-
-/// Run a diagnostic check without allocating expression identities.
-///
-/// Clones preserve their source IDs, and `TypedExpr::new` builds
-/// [`NodeId::PLACEHOLDER`] throwaways. Nothing constructed by `f` may enter a live
-/// tree. Both nested scopes unwind through guards if the check panics.
-///
-/// Type resolution can rebuild refinement predicates even during a check. Suppressing
-/// those allocations keeps diagnostic work from renumbering later serialized IDs
-/// between debug and release builds. Read-only checks need no such scope.
-#[cfg(debug_assertions)]
-pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
-    let _preserving = preserve_ids();
-    let _sealed = SEALED.enter();
-    f()
-}
-
-/// Whether a [`preserve_ids`] scope is open on this thread, so a clone keeps its origin's id
-/// and a term built here may not outlive the scope in a live tree.
-pub(crate) fn ids_preserved() -> bool {
-    PRESERVING_IDS.is_open()
-}
-
-/// Select a clone's identity and report a fresh copy to [`on_copy`].
-///
-/// An open [`preserve_ids`] scope returns `origin` unchanged and records nothing.
-/// Otherwise the returned ID is freshly allocated.
+/// A duplicate's identity: a fresh ID, reported as a copy of `origin` to [`on_copy`]
+/// ([`crate::ccl::Ids::Fresh`]).
 pub(crate) fn copy_id(origin: NodeId) -> NodeId {
-    if PRESERVING_IDS.is_open() {
-        return origin;
-    }
     let fresh = NodeId::fresh();
     on_copy(origin, fresh);
     fresh
@@ -1731,6 +1614,7 @@ fn open_recording_depth() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Duplicate;
     use crate::ccl::load::LoadedProgram;
 
     /// A span in the one file these tests' attributions name.
@@ -2658,7 +2542,7 @@ mod tests {
     // ---- the recorder ------------------------------------------------------
     //
     // These exercise the hooks through *real* `Expr` construction (`Expr::lit`,
-    // `Expr::tuple`) and the freshening `Clone`, not hand-built rows, so the hook
+    // `Expr::tuple`) and the freshening `duplicate`, not hand-built rows, so the hook
     // wiring in `expr.rs` is under test too.
 
     use crate::ccl::expr::Expr;
@@ -2840,7 +2724,7 @@ mod tests {
         // Build a 3-node tree (tuple + two lits) with nothing recording, then
         // clone it inside a copy-only recording — one that consumes nothing and
         // mints nothing of its own, so its whole output is the freshen pairs
-        // `Clone` reports through the `on_copy` hook.
+        // `duplicate` reports through the `on_copy` hook.
         let source = Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]);
         // The source's node ids are the origins each per-node row should name.
         let old_ids: HashSet<NodeId> = std::iter::once(source.node_id())
@@ -2850,7 +2734,7 @@ mod tests {
         let mut clone = Expr::lit(Lit::Int(0));
         let table = recorded(|| {
             let _g = copy_frame("dup");
-            clone = source.clone();
+            clone = source.duplicate();
         });
 
         let fresh_ids: HashSet<NodeId> = std::iter::once(clone.node_id())
@@ -2886,7 +2770,7 @@ mod tests {
         let mut clone = Expr::lit(Lit::Int(0));
         let table = recorded(|| {
             let _g = enter(named, "wrap.freshen", Nature::Machinery);
-            clone = source.clone();
+            clone = source.duplicate();
         });
         assert_eq!(table.len(), 3, "only the three cloned nodes");
         for id in
@@ -2911,7 +2795,7 @@ mod tests {
         let mut copy_root = NodeId::PLACEHOLDER;
         let table = recorded(|| {
             let _g = enter(named, "rw.duplicate", Nature::Machinery);
-            copy_root = tree.clone().node_id();
+            copy_root = tree.duplicate().node_id();
         });
         assert_eq!(table.parents(copy_root), &[tree.node_id()]);
         assert!(
@@ -2931,7 +2815,7 @@ mod tests {
             // Construction and cloning with an empty stack capture nowhere.
             let _e = Expr::lit(Lit::Int(1));
             let x = Expr::lit(Lit::Int(2));
-            let _copy = x.clone();
+            let _copy = x.duplicate();
         }
         assert_eq!(
             table_session.into_table().len(),
@@ -3000,38 +2884,6 @@ mod tests {
             a = Expr::lit(Lit::Int(7)).node_id();
         });
         assert_eq!(table.parents(a), &[named]);
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn panic_inside_a_debug_check_unwinds_without_leaving_the_record_sealed() {
-        // The scope wraps an assertion, so a panic out of it is the assertion
-        // doing its job. A seal left standing would make every later node on this
-        // thread a throwaway, and throwaways share one id, so the damage surfaces
-        // far from here.
-        assert!(!record_sealed(), "clean precondition");
-        let inside = std::cell::Cell::new(None);
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_debug_check(|| {
-                inside.set(Some(Expr::lit(Lit::Int(1)).node_id()));
-                panic!("deliberate panic inside a debug check");
-            })
-        }));
-        assert!(caught.is_err(), "the panic propagated");
-        assert_eq!(
-            inside.get(),
-            Some(NodeId::PLACEHOLDER),
-            "the record was sealed while `f` ran"
-        );
-        assert!(
-            !record_sealed(),
-            "the guard's Drop unsealed the record on unwind"
-        );
-        assert_ne!(
-            Expr::lit(Lit::Int(2)).node_id(),
-            NodeId::PLACEHOLDER,
-            "a later mint takes a real id"
-        );
     }
 
     #[test]
@@ -3177,9 +3029,9 @@ mod tests {
             let template = Expr::lit(Lit::Int(0));
             t = template.node_id();
             // Copy it twice — one freshened clone per read site.
-            let r1 = template.clone();
+            let r1 = template.duplicate();
             c1 = r1.node_id();
-            let r2 = template.clone();
+            let r2 = template.duplicate();
             c2 = r2.node_id();
         });
         assert_eq!(table.parents(t), &[origin]);

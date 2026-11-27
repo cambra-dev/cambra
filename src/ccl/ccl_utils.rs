@@ -13,6 +13,7 @@ use crate::ccl::{
     Lit, LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedBinding,
     TypedExprNode, UnaryOpKind, V_FIRED, V_IDLE,
 };
+use crate::ccl::{Duplicate, Ids};
 
 /// Disjoin control-flow `paths` into one boolean gate: where a write or a feed fires, true
 /// exactly where some path reaches it. Short-circuits a literal `true` path and skips a
@@ -114,7 +115,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
         let guard = tag_test(&scrut, pat.tag());
         let payload_ty = pat.binding.ty.clone();
         let mut payload = Expr::apply(
-            scrut.clone(),
+            scrut.duplicate(),
             Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag())))
                 .with_ty(Type::fun(scrut.ty.clone(), payload_ty.clone())),
         );
@@ -169,7 +170,7 @@ pub(crate) fn value_tag_case_to_guard_case(case: Expr) -> Expr {
 pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
     let bool_ty = Type::Base(BaseType::Bool);
     let mut test = Expr::apply(
-        scrut.clone(),
+        scrut.duplicate(),
         Expr::builtin(Builtin::VariantIs(FieldKey::Name(tag)))
             .with_ty(Type::fun(scrut.ty.clone(), bool_ty.clone())),
     );
@@ -204,7 +205,7 @@ pub(crate) fn writer_decision(
         .map(|(key, value, fire, declared)| {
             (
                 key.clone(),
-                tap_gated(fire.clone(), value.clone(), declared.clone()),
+                tap_gated(fire.duplicate(), value.duplicate(), declared.clone()),
             )
         })
         .collect();
@@ -213,7 +214,7 @@ pub(crate) fn writer_decision(
         .map(|(field, value, fire)| {
             (
                 field.clone(),
-                tap_gated(fire.clone(), value.value.clone(), value.row.clone()),
+                tap_gated(fire.duplicate(), value.value.duplicate(), value.row.clone()),
             )
         })
         .collect();
@@ -368,7 +369,7 @@ pub(crate) fn gate_values(
     );
     let step = Expr::lambda(
         &binder.name,
-        binder.occurrence.clone(),
+        binder.occurrence.duplicate(),
         binder.ty.clone(),
         body,
     )
@@ -475,9 +476,12 @@ pub(crate) fn is_iterate_marker(e: &Expr) -> bool {
 /// a real filter and part of the denotation; a filtered source reaching a
 /// predicate is an unsupported case caught loudly by
 /// [`debug_assert_no_iteration_markers_in_type`] rather than silently mis-stripped.
-pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
-    let mut out = e.clone();
-    out.map_children(|c| strip_iterate_markers(&c));
+///
+/// The copies it makes keep or freshen ids as `ids` says: it runs on a predicate a substitution
+/// just rewrote, and copies as that substitution does.
+pub(crate) fn strip_iterate_markers(e: &Expr, ids: Ids) -> Expr {
+    let mut out = e.copied(ids);
+    out.map_children(|c| strip_iterate_markers(&c, ids));
     if let TypedExprNode::Compose(elts) = &out.node {
         let mut flat: Vec<Expr> = Vec::new();
         for elt in elts {
@@ -487,8 +491,8 @@ pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
             match &elt.node {
                 // Splice a nested compose the substitution created (e.g.
                 // `(a ≫ f)[a ↦ iterate ≫ xs]` = `(iterate ≫ xs) ≫ f`).
-                TypedExprNode::Compose(inner) => flat.extend(inner.iter().cloned()),
-                _ => flat.push(elt.clone()),
+                TypedExprNode::Compose(inner) => flat.extend(inner.iter().map(|e| e.copied(ids))),
+                _ => flat.push(elt.copied(ids)),
             }
         }
         return match flat.len() {
@@ -652,7 +656,11 @@ fn reduce_head(e: Expr, fuel: &mut usize) -> Expr {
             bound_expr,
             body,
         } if binding.transparency == BindingTransparency::Transparent => normalize(
-            substitute_term(body.clone_preserving_ids(), &binding.name, bound_expr),
+            substitute_term(
+                body.as_ref().clone_preserving_ids(),
+                &binding.name,
+                bound_expr,
+            ),
             fuel,
         ),
         TypedExprNode::Apply { argument, function } => {
@@ -770,17 +778,18 @@ fn reduce_application(
                 }
                 _ => return None,
             };
-            let body = params
-                .iter()
-                .zip(parts)
-                .fold(body.clone_preserving_ids(), |body, (param, part)| {
-                    substitute_term(body, &param.name, part)
-                });
+            let body = params.iter().zip(parts).fold(
+                body.as_ref().clone_preserving_ids(),
+                |body, (param, part)| substitute_term(body, &param.name, part),
+            );
             Some(normalize(body, fuel))
         }
-        TypedExprNode::Cast { value, .. } => {
-            Some(applied(a(), value.clone_preserving_ids(), ty.clone(), fuel))
-        }
+        TypedExprNode::Cast { value, .. } => Some(applied(
+            a(),
+            value.as_ref().clone_preserving_ids(),
+            ty.clone(),
+            fuel,
+        )),
         // `unbox` is the identity on the map: it re-types a sum's keys by its projected domain
         // and changes no key or value.
         TypedExprNode::Builtin(Builtin::Id | Builtin::Unbox) => Some(a()),
@@ -791,18 +800,16 @@ fn reduce_application(
             argument: inner,
             function: combinator,
         } => match &combinator.node {
-            TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
+            TypedExprNode::Builtin(Builtin::Const) => Some(inner.as_ref().clone_preserving_ids()),
             TypedExprNode::Builtin(Builtin::Converse) => {
                 let position = Name::fresh("__fiber_position");
                 let read =
                     Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
                 let element = Expr::throwaway(TypedExprNode::Var(Name::elem())).with_ty(Type::Hole);
-                let (key_function, at_key) = crate::ccl::provenance::preserving_ids(|| {
-                    (
-                        crate::ccl::subst::shift_elems(inner, 1),
-                        crate::ccl::subst::shift_elems(argument, 1),
-                    )
-                });
+                let (key_function, at_key) = (
+                    crate::ccl::subst::shift_elems(inner, 1, Ids::Kept),
+                    crate::ccl::subst::shift_elems(argument, 1, Ids::Kept),
+                );
                 let key = applied(element, key_function, Type::Hole, fuel);
                 let predicate = Expr::throwaway(TypedExprNode::BinOp {
                     left: Box::new(key),
@@ -822,7 +829,12 @@ fn reduce_application(
                 let read =
                     Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
                 let value = applied(read, a(), Type::Hole, fuel);
-                let body = applied(value, inner.clone_preserving_ids(), Type::Hole, fuel);
+                let body = applied(
+                    value,
+                    inner.as_ref().clone_preserving_ids(),
+                    Type::Hole,
+                    fuel,
+                );
                 let mapped = normal_function_value(function, argument, ty, position, body);
                 Some(if let TypedExprNode::Cast { target, .. } = &argument.node {
                     let lambda = match mapped.node {
@@ -881,7 +893,8 @@ fn reduce_application(
             TypedExprNode::Builtin(Builtin::StrengthOver) => {
                 let k = Name::fresh("__strength_key");
                 let k_var = Expr::throwaway(TypedExprNode::Var(k.clone())).with_ty(Type::Hole);
-                let collection = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+                let collection =
+                    applied(a(), inner.as_ref().clone_preserving_ids(), Type::Hole, fuel);
                 let element = applied(k_var, collection, Type::Hole, fuel);
                 let body =
                     Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
@@ -907,13 +920,18 @@ fn reduce_application(
                 argument: g,
                 function: map,
             } if matches!(map.node, TypedExprNode::Builtin(Builtin::Map)) => {
-                let at = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
-                Some(applied(at, g.clone_preserving_ids(), ty.clone(), fuel))
+                let at = applied(a(), inner.as_ref().clone_preserving_ids(), Type::Hole, fuel);
+                Some(applied(
+                    at,
+                    g.as_ref().clone_preserving_ids(),
+                    ty.clone(),
+                    fuel,
+                ))
             }
             TypedExprNode::Builtin(Builtin::Curry | Builtin::CurryOver) => {
                 let inner = match &combinator.node {
                     TypedExprNode::Builtin(Builtin::CurryOver) => pair(inner)?.1,
-                    _ => inner.clone_preserving_ids(),
+                    _ => inner.as_ref().clone_preserving_ids(),
                 };
                 let y = Name::fresh("__curried");
                 let y_var = Expr::throwaway(TypedExprNode::Var(y.clone())).with_ty(Type::Hole);
@@ -927,7 +945,7 @@ fn reduce_application(
                 let project = |k: usize| {
                     Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k))).with_ty(Type::Hole)
                 };
-                let mut level = inner.clone_preserving_ids();
+                let mut level = inner.as_ref().clone_preserving_ids();
                 for k in 0..*n {
                     let key = applied(a(), project(k), Type::Hole, fuel);
                     let at = if k + 1 == *n { ty.clone() } else { Type::Hole };
@@ -1008,19 +1026,20 @@ fn normal_function_value(
     body: Expr,
 ) -> Expr {
     let lambda = normal_lambda(name, body, ty);
-    let (binder, mut result_ty) =
-        crate::ccl::provenance::preserving_ids(|| match function.ty.peel_refinements() {
-            Type::Fun {
-                binder: crate::ccl::FunBinder::Whole(b),
-                codomain,
-                ..
-            } => (
-                Some(b.clone()),
-                crate::ccl::subst::open_codomain(&function.ty, codomain),
-            ),
-            Type::Fun { codomain, .. } => (None, (**codomain).clone()),
-            _ => (None, ty.clone()),
-        });
+    // The codomain is the function's own, read here, so opening it keeps the ids it copies.
+    let (binder, mut result_ty) = match function.ty.peel_refinements() {
+        Type::Fun {
+            binder: binder @ crate::ccl::FunBinder::Whole(b),
+            domain,
+            codomain,
+            ..
+        } => (
+            Some(b.clone()),
+            crate::ccl::subst::open_at_binder(binder, domain, codomain, Ids::Kept),
+        ),
+        Type::Fun { codomain, .. } => (None, (**codomain).clone()),
+        _ => (None, ty.clone()),
+    };
     if result_ty.fun_kind().is_some_and(|k| k.resolved().is_data())
         && cast_target_refinement(&result_ty).is_some()
     {
@@ -1341,7 +1360,7 @@ fn excludes(negating: &[Expr], negated: &[Expr]) -> bool {
             return false;
         };
         let mut denied = Vec::new();
-        conjuncts_of(inner.clone_preserving_ids(), &mut denied);
+        conjuncts_of(inner.as_ref().clone_preserving_ids(), &mut denied);
         denied.iter().all(|denied| {
             negated
                 .iter()
@@ -1505,7 +1524,7 @@ fn read_fan_out(argument: &Expr, legs: &[Expr], ty: &Type, fuel: &mut usize) -> 
         let bool_ty = Type::Base(BaseType::Bool);
         let mut guard = applied(
             argument.clone_preserving_ids(),
-            gate.clone_preserving_ids(),
+            gate.as_ref().clone_preserving_ids(),
             bool_ty,
             fuel,
         );
@@ -1534,7 +1553,7 @@ fn read_fan_out(argument: &Expr, legs: &[Expr], ty: &Type, fuel: &mut usize) -> 
                     if crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard) => {}
                 _ => return None,
             }
-            guard = left.clone_preserving_ids();
+            guard = left.as_ref().clone_preserving_ids();
         }
         let body = values
             .iter()
@@ -1599,9 +1618,11 @@ impl Substitution<'_> {
         let x = self.x;
         match &mut body.node {
             TypedExprNode::Var(n) if n == x => {
-                return crate::ccl::provenance::preserving_ids(|| {
-                    crate::ccl::subst::shift_elems(self.replacement, self.elem_depth)
-                });
+                return crate::ccl::subst::shift_elems(
+                    self.replacement,
+                    self.elem_depth,
+                    Ids::Kept,
+                );
             }
             // A `let` binding `x` shadows it in its body only.
             TypedExprNode::Let {
@@ -1689,11 +1710,11 @@ pub(crate) fn read_at(input: &Expr, f: &Expr) -> Expr {
     let cod = match f.ty.peel_refinements() {
         Type::Fun {
             binder, codomain, ..
-        } => crate::ccl::subst::discharge_at_binder(binder, input, codomain),
+        } => crate::ccl::subst::discharge_at_binder(binder, input, codomain, Ids::Fresh),
         _ => f.ty.codomain().unwrap_or(Type::Hole),
     };
     read_back_application(input, f, &cod)
-        .unwrap_or_else(|| Expr::apply(input.clone(), f.clone()).with_ty(cod))
+        .unwrap_or_else(|| Expr::apply(input.duplicate(), f.duplicate()).with_ty(cod))
 }
 
 /// [`read_at`]'s reading of `input ▷ f`, typed `ty`, or `None` where `f` is no shape it reads.
@@ -1704,7 +1725,7 @@ fn read_back_application(input: &Expr, f: &Expr, ty: &Type) -> Option<Expr> {
         {
             match &argument.node {
                 TypedExprNode::Tuple(parts) if parts.len() == 2 => {
-                    Some((parts[0].clone(), parts[1].clone()))
+                    Some((parts[0].duplicate(), parts[1].duplicate()))
                 }
                 _ => None,
             }
@@ -1712,18 +1733,18 @@ fn read_back_application(input: &Expr, f: &Expr, ty: &Type) -> Option<Expr> {
         _ => None,
     };
     match &f.node {
-        TypedExprNode::Builtin(Builtin::Id) => Some(input.clone()),
+        TypedExprNode::Builtin(Builtin::Id) => Some(input.duplicate()),
         TypedExprNode::Apply { argument, function }
             if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)) =>
         {
-            Some(argument.as_ref().clone())
+            Some(argument.as_ref().duplicate())
         }
         TypedExprNode::Builtin(Builtin::BinOp(op)) => match &input.node {
             TypedExprNode::Tuple(parts) if parts.len() == 2 => Some(
                 Expr::new(TypedExprNode::BinOp {
-                    left: Box::new(parts[0].clone()),
+                    left: Box::new(parts[0].duplicate()),
                     op: *op,
-                    right: Box::new(parts[1].clone()),
+                    right: Box::new(parts[1].duplicate()),
                 })
                 .with_ty(ty.clone()),
             ),
@@ -1732,14 +1753,14 @@ fn read_back_application(input: &Expr, f: &Expr, ty: &Type) -> Option<Expr> {
         TypedExprNode::Builtin(Builtin::Apply) => match &input.node {
             TypedExprNode::Tuple(parts) if parts.len() == 2 => Some(
                 read_back_application(&parts[0], &parts[1], ty).unwrap_or_else(|| {
-                    Expr::apply(parts[0].clone(), parts[1].clone()).with_ty(ty.clone())
+                    Expr::apply(parts[0].duplicate(), parts[1].duplicate()).with_ty(ty.clone())
                 }),
             ),
             _ => None,
         },
         // A chain reads one step at a time, each step's reading the next one's input.
         TypedExprNode::Compose(elts) => {
-            let mut read = input.clone();
+            let mut read = input.duplicate();
             for step in elts {
                 read = read_at(&read, step);
             }
@@ -1757,7 +1778,7 @@ fn read_back_application(input: &Expr, f: &Expr, ty: &Type) -> Option<Expr> {
 /// [`discharge_transparent_lets`] on a bare term, bottom-up so a chain of
 /// bindings collapses in one pass.
 fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
-    let mut out = e.clone();
+    let mut out = e.duplicate();
     out.map_children(|c| discharge_transparent_lets_in_term(&c));
     if let TypedExprNode::Let {
         binding,
@@ -1766,7 +1787,7 @@ fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
     } = &out.node
         && binding.transparency == BindingTransparency::Transparent
     {
-        let mut body = body.as_ref().clone();
+        let mut body = body.as_ref().duplicate();
         Subst::discharge_in_place(&mut body, &binding.name, bound_expr);
         return body;
     }
@@ -1881,9 +1902,9 @@ pub fn apply_function(expr: Expr, function: Expr, output_ty: Type) -> Expr {
 /// fan-out in the pipeline partitions its domain with the same encoding.
 pub fn synthesize_arm_predicate(guard: &Expr, prior: &[Expr]) -> Expr {
     let bool_ty = Type::Base(BaseType::Bool);
-    let mut pred = guard.clone();
+    let mut pred = guard.duplicate();
     for g in prior {
-        let mut neg = Expr::unary(UnaryOpKind::Not, g.clone());
+        let mut neg = Expr::unary(UnaryOpKind::Not, g.duplicate());
         neg.ty = bool_ty.clone();
         let mut conj = Expr::binop(pred, BinOpKind::BoolLogic(LogicKind::And), neg);
         conj.ty = bool_ty.clone();
@@ -2171,7 +2192,7 @@ pub(crate) fn applied_type(function: &Type, argument: &Expr) -> Type {
     match function.read_view().peel_refinements() {
         Type::Fun {
             binder, codomain, ..
-        } => crate::ccl::subst::discharge_at_binder(binder, argument, codomain),
+        } => crate::ccl::subst::discharge_at_binder(binder, argument, codomain, Ids::Fresh),
         other => panic!("an applied value is a function, got {other}"),
     }
 }
@@ -2551,7 +2572,7 @@ pub fn make_iterate(predicate: Expr) -> Expr {
 ///
 /// [`typecheck`]: crate::ccl::infer::typecheck
 pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
-    make_restrict_stating(predicate.clone(), predicate, upstream)
+    make_restrict_stating(predicate.duplicate(), predicate, upstream)
 }
 
 /// [`make_restrict`] applying `predicate` while the refinement states `stated`.
@@ -3070,7 +3091,7 @@ pub(crate) fn refine_with(base: Type, predicate: &Expr) -> Type {
     if is_trivially_true_predicate(predicate) {
         return base;
     }
-    let bare = bare_predicate_of_fn(&base, predicate.clone());
+    let bare = bare_predicate_of_fn(&base, predicate.duplicate());
     Type::refined_one(base, Refinement::born(Rc::new(bare)))
 }
 
@@ -3108,7 +3129,7 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
     if is_trivially_true_bare_predicate(bare_predicate) {
         return base;
     }
-    Type::refined_one(base, Refinement::born(Rc::new(bare_predicate.clone())))
+    Type::refined_one(base, Refinement::born(Rc::new(bare_predicate.duplicate())))
 }
 
 /// Count free occurrences of `name` in `expr`, including occurrences in
@@ -3408,7 +3429,7 @@ impl<C> Default for PredMemo<C> {
 }
 
 impl<C> PredMemo<C> {
-    /// Rebuild with identity-preserving expression clones.
+    /// Rebuild keeping the ids of the predicates it copies ([`Ids::Kept`]).
     ///
     /// The traversal must replace every occurrence of each rebuilt predicate.
     /// Otherwise old and new terms can coexist with the same IDs. `uniquify`
@@ -3418,6 +3439,15 @@ impl<C> PredMemo<C> {
         let m = Self::default();
         m.0.borrow_mut().replacing = true;
         m
+    }
+
+    /// The memo for a rewrite whose copies of predicates follow `ids`: replacing for
+    /// [`Ids::Kept`], deriving for [`Ids::Fresh`].
+    pub(crate) fn copying(ids: Ids) -> Self {
+        match ids {
+            Ids::Kept => Self::replacing(),
+            Ids::Fresh => Self::default(),
+        }
     }
 
     fn is_replacing(&self) -> bool {
@@ -3512,18 +3542,16 @@ impl<C: PartialEq + Clone> PredMemo<C> {
         // The scope covers both copying and callback work. Replacing mode requires
         // the full-traversal obligation; deriving mode records against the origin.
         let (pred, reported) = if self.is_replacing() {
-            crate::ccl::provenance::preserving_ids(|| {
-                let mut pred = (*keepalive).clone();
-                let reported = f(&mut pred);
-                (pred, reported)
-            })
+            let mut pred = keepalive.clone_preserving_ids();
+            let reported = f(&mut pred);
+            (pred, reported)
         } else {
             let _g = crate::ccl::provenance::enter(
                 keepalive.node_id(),
                 "predicate.rebuild",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let mut pred = (*keepalive).clone();
+            let mut pred = (*keepalive).duplicate();
             let reported = f(&mut pred);
             (pred, reported)
         };
@@ -3562,18 +3590,16 @@ impl TermMemo {
         let keepalive = Rc::clone(refinement.held());
         // Copy and rewrite under the memo's declared intent; see `rebuild`.
         let pred = if self.0.is_replacing() {
-            crate::ccl::provenance::preserving_ids(|| {
-                let mut pred = (*keepalive).clone();
-                f(&mut pred);
-                pred
-            })
+            let mut pred = keepalive.clone_preserving_ids();
+            f(&mut pred);
+            pred
         } else {
             let _g = crate::ccl::provenance::enter(
                 keepalive.node_id(),
                 "predicate.rebuild",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let mut pred = (*keepalive).clone();
+            let mut pred = (*keepalive).duplicate();
             f(&mut pred);
             pred
         };
@@ -4040,7 +4066,7 @@ mod tests {
                 Expr::apply(
                     Expr::tuple(vec![
                         constant(Expr::lit(Lit::Bool(true))),
-                        Expr::compose(vec![first_gate.clone(), Expr::builtin(Builtin::NotFn)]),
+                        Expr::compose(vec![first_gate.duplicate(), Expr::builtin(Builtin::NotFn)]),
                     ]),
                     Expr::builtin(Builtin::Zip),
                 ),
@@ -4205,7 +4231,7 @@ mod tests {
         assert_eq!(disjoint_join_gap(&product), None);
         let per_row = Expr::builtin(Builtin::Id);
         assert!(
-            disjoint_join_gap(&[leg("xs", per_row.clone()), leg("ys", per_row)])
+            disjoint_join_gap(&[leg("xs", per_row.duplicate()), leg("ys", per_row)])
                 .is_some_and(|gap| gap.contains("restricts another collection"))
         );
     }

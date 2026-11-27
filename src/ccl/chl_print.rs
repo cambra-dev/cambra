@@ -1424,6 +1424,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::{NOT_PRINTABLE, OUTER_ARGUMENT, chl_type};
+    use crate::ccl::Duplicate;
     use crate::ccl::lower::test_helpers::lower_type;
     use crate::ccl::{
         BaseType, BinOpKind, Builtin, ChanLevel, CompareKind, FunKind, Lit, LogicKind, Name,
@@ -1625,7 +1626,7 @@ mod tests {
         let independent = Type::fun_of_params(
             vec![
                 (lo.clone(), int()),
-                (x.clone(), refined(at_least_lo.clone())),
+                (x.clone(), refined(at_least_lo.duplicate())),
             ],
             int(),
             FunKind::Compute,
@@ -1635,7 +1636,7 @@ mod tests {
             "(lo: Int, x: {Int where _ >= lo}) => Int"
         );
         let ty = Type::fun_of_params(
-            vec![(lo, int()), (x, refined(at_least_lo.clone()))],
+            vec![(lo, int()), (x, refined(at_least_lo.duplicate()))],
             refined(at_least_lo),
             FunKind::Compute,
         );

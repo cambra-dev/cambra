@@ -11,6 +11,7 @@ use crate::ccl::Occurrence;
 use std::collections::HashSet;
 
 use super::*;
+use crate::ccl::Duplicate;
 use crate::ccl::RefinementSet;
 
 // Predicate compilation is a predicate-*rebuilding* pass like any other, so it
@@ -221,10 +222,10 @@ pub(crate) fn fn_of_bare_predicate(
         );
         if crate::ccl::channelize::holds_defer(function) || (!membership && holds_lambda(function))
         {
-            return eliminate_lifted((**function).clone())
+            return eliminate_lifted((**function).duplicate())
                 .expect("lambda-elim of a refinement predicate");
         }
-        return (**function).clone();
+        return (**function).duplicate();
     }
     // A plain collection carries no binders; a sum carries the telescope `base` is written
     // under, since a reference names no kind and the binder is the one place a kind is
@@ -368,18 +369,19 @@ fn compile_predicates_in_type(
         }
         Type::DepTuple(components) => {
             let names = crate::ccl::subst::tuple_component_names(components);
-            let mut opened: Vec<(Option<Name>, Type)> =
-                crate::ccl::subst::open_tuple_components(components, |j, _| {
-                    crate::ccl::subst::Mapping::Rename(names[j].clone())
-                })
-                .into_iter()
-                .zip(&names)
-                .map(|(mut t, name)| {
-                    compile_predicates_in_type(&mut t, memo, slot);
-                    (Some(name.clone()), t)
-                })
-                .collect();
-            crate::ccl::subst::close_tuple_components(&mut opened);
+            let mut opened: Vec<(Option<Name>, Type)> = crate::ccl::subst::open_tuple_components(
+                components,
+                |j, _| crate::ccl::subst::Mapping::Rename(names[j].clone()),
+                crate::ccl::Ids::Fresh,
+            )
+            .into_iter()
+            .zip(&names)
+            .map(|(mut t, name)| {
+                compile_predicates_in_type(&mut t, memo, slot);
+                (Some(name.clone()), t)
+            })
+            .collect();
+            crate::ccl::subst::close_tuple_components(&mut opened, crate::ccl::Ids::Fresh);
             for ((_, component), (_, t)) in components.iter_mut().zip(opened) {
                 *component = t;
             }

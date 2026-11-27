@@ -2,6 +2,7 @@
 //! collection's domain as `map(filter_values(𝑞))`.
 
 use super::{join::combine_predicates, *};
+use crate::ccl::Duplicate;
 use crate::ccl::{Name, Refinement, application_order, subst::Subst, subst::open_codomain};
 
 /// Insert a per-group filter wherever a morphism's codomain refines the collection its
@@ -439,13 +440,13 @@ fn value_predicate(predicate: &Expr, binder: &Name) -> Option<Expr> {
     }
     let q = match rest {
         [] => return None,
-        [only] => only.clone(),
+        [only] => only.duplicate(),
         many => {
             let ty = match (many.first()?.ty.domain(), many.last()?.ty.codomain()) {
                 (Some(d), Some(c)) => Type::fun(d, c),
                 _ => Type::Hole,
             };
-            ccl_utils::chain_typed(many.to_vec(), ty)
+            ccl_utils::chain_typed(many.iter().map(Duplicate::duplicate).collect(), ty)
         }
     };
     // The filter is handed the values alone, so a value predicate reading the site's input
@@ -563,7 +564,7 @@ mod tests {
         };
         refinements.insert(closed);
 
-        let before = expr.clone();
+        let before = expr.duplicate();
         insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(planned(&expr).0, None, "no filter was inserted");
         assert_eq!(expr, before, "the site is untouched");

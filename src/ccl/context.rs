@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::Annotation;
+use crate::ccl::Duplicate;
 use crate::ccl::Occurrence;
 use crate::ccl::lower::ResolvedName;
 use smol_str::SmolStr;
@@ -2378,7 +2379,7 @@ fn recover_rejected_runs(tree: &mut Expr, runs: &RunSites, rejected: &HashSet<Sp
                     init,
                     body,
                 } => {
-                    let mut binding = binding.clone();
+                    let mut binding = binding.duplicate();
                     binding.ty = Type::Hole;
                     binding.user_annotation = None;
                     let mut failed = std::mem::take(init);
@@ -2491,7 +2492,7 @@ fn check_modules(
         blame.derive(&derivation.into_log(), Phase::Comprehension);
         // As in `run_passes`: an error in a definition inference drops reads a binding the
         // tree it leaves no longer holds.
-        let reads_named = mut_read::read_respelling(&tree);
+        let reads_named = mut_read::read_respelling(&tree, crate::ccl::Ids::Fresh);
         recover_checked_statements(&mut tree, &recovered, &blame);
         recover_rejected_runs(&mut tree, &check.instantiations, &rejected_runs);
         // Inference can raise an error at a node it minted, such as a copied predicate.
@@ -2552,7 +2553,7 @@ fn check_modules(
             // A contract printed for a reader names no A-normalization temp: a public member
             // bound after one reads it in its type, and the temp is machinery no program
             // mentions.
-            let temps = anf::temp_respelling(&tree);
+            let temps = anf::temp_respelling(&tree, crate::ccl::Ids::Fresh);
             contracts.extend(checked.contracts.into_iter().map(|(name, contract)| {
                 let contract = contract.map_type(|ty| *ty = temps.apply_type(ty));
                 (SmolStr::from(name.base()), contract)
@@ -2583,8 +2584,11 @@ fn check_modules(
         });
         // As in `run_passes`: an A-normalization temp reads as the term it names.
         let respelling = crate::ccl::subst::Subst::then(
-            &anf::temp_respelling(&tree),
-            &crate::ccl::subst::Subst::then(&mut_read::read_respelling(&tree), &reads_named),
+            &anf::temp_respelling(&tree, crate::ccl::Ids::Fresh),
+            &crate::ccl::subst::Subst::then(
+                &mut_read::read_respelling(&tree, crate::ccl::Ids::Fresh),
+                &reads_named,
+            ),
         );
         let errors = errors
             .map(|mut located| {
@@ -3111,7 +3115,7 @@ fn run_passes(
     // copies.
     // The reads named before inference, for an error inference raises in a definition it then
     // drops, whose bindings the tree it leaves no longer holds.
-    let reads_named = mut_read::read_respelling(&expr);
+    let reads_named = mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh);
     // The root's public members head the linked program's spine with no home.
     let root_public = match &ctx.lowering_ctx().root_interface {
         Some(interface) => expr
@@ -3144,8 +3148,11 @@ fn run_passes(
         // here, where the tree still carries the bindings (`mut_read::unbind`
         // erases them below) and nothing types the error's types again.
         let respelling = crate::ccl::subst::Subst::then(
-            &anf::temp_respelling(&expr),
-            &crate::ccl::subst::Subst::then(&mut_read::read_respelling(&expr), &reads_named),
+            &anf::temp_respelling(&expr, crate::ccl::Ids::Fresh),
+            &crate::ccl::subst::Subst::then(
+                &mut_read::read_respelling(&expr, crate::ccl::Ids::Fresh),
+                &reads_named,
+            ),
         );
         let errors = errors
             .into_iter()

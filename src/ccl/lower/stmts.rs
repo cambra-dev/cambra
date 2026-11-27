@@ -10,6 +10,7 @@ use std::{collections::HashSet, rc::Rc};
 use super::modules::Reached;
 use super::modules::module_body;
 use super::*;
+use crate::ccl::Duplicate;
 use crate::{
     ccl::{
         BaseType, BindingTransparency, Branch, Expr, FieldKey, Label, Lit, Pattern, PatternHead,
@@ -4502,6 +4503,7 @@ fn lower_type_expr_inner(
             let codomain = crate::ccl::subst::close_at_binder(
                 &crate::ccl::FunBinder::Parameters(names),
                 &codomain?,
+                crate::ccl::Ids::Fresh,
             );
             let binder = if crate::ccl::subst::references_enclosing_function(&codomain) {
                 crate::ccl::FunBinder::Whole(Name::fresh("p"))
@@ -5814,7 +5816,7 @@ fn named_product(components: NamedComponents) -> Type {
         .into_iter()
         .map(|(name, ty)| (name.map(|n| Name::raw(n.node)), ty))
         .collect();
-    crate::ccl::subst::close_tuple_components(&mut components);
+    crate::ccl::subst::close_tuple_components(&mut components, crate::ccl::Ids::Fresh);
     // Closed, a component's name is its spelling for display, so it is a binder of its own.
     for (name, _) in &mut components {
         if let Some(n) = name {
@@ -5830,7 +5832,7 @@ fn named_product(components: NamedComponents) -> Type {
     if hole_under_a_name {
         Type::DepTuple(components)
     } else {
-        Type::closed_dep_tuple(components)
+        Type::closed_dep_tuple(components, crate::ccl::Ids::Fresh)
     }
 }
 
@@ -5864,7 +5866,11 @@ fn under_type_binders(
         .iter()
         .map(|(name, _)| Some(Name::raw(name.node.clone())))
         .collect();
-    Ok(crate::ccl::subst::close_pi_binders(&enclosing, &lowered?))
+    Ok(crate::ccl::subst::close_pi_binders(
+        &enclosing,
+        &lowered?,
+        crate::ccl::Ids::Fresh,
+    ))
 }
 
 /// The family over `scope`'s binders whose body, closed over them, is `body`.

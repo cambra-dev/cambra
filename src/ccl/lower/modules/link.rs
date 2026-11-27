@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ccl::Annotation;
+use crate::ccl::Duplicate;
 use crate::ccl::Occurrence;
 use crate::ccl::capabilities::Owner;
 use crate::ccl::provenance::NodeId;
@@ -410,7 +411,7 @@ fn copy_predicates(expr: &mut Expr, copies: &mut HashMap<PredicateId, (Rc<Expr>,
                 let copy = match copies.get(&id) {
                     Some((_, copy)) => Rc::clone(copy),
                     None => {
-                        let mut copy = (*refinement.predicate).clone();
+                        let mut copy = (*refinement.predicate).duplicate();
                         copy_predicates(&mut copy, copies);
                         let copy = Rc::new(copy);
                         let original = Rc::clone(&refinement.predicate);
@@ -1412,7 +1413,7 @@ impl<'a> ProgramLowering<'a> {
         let first = self.holding_predicates.insert(file);
         let mut chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");
-            let mut chain = lowered.chain.clone();
+            let mut chain = lowered.chain.duplicate();
             if !first {
                 copy_predicates(&mut chain, &mut HashMap::new());
             }

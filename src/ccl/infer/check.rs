@@ -29,6 +29,7 @@ use super::emit::{
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, Typing};
 use super::{lit_base, map_constrain_err};
+use crate::ccl::Duplicate;
 use crate::ccl::infer::solver::traits::{
     Assoc, InstanceHead, InstanceTable, StdTrait, Trait, compares_by_value, offered_head,
 };
@@ -361,7 +362,7 @@ impl Typing for CheckCtx {
             "check.require_trait",
             provenance::Nature::Machinery,
         );
-        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).clone()).collect();
+        let args: Vec<TypedExpr> = operand_exprs.iter().map(|e| (*e).duplicate()).collect();
         Ok(refinement.refine(base, &args))
     }
 
@@ -918,9 +919,12 @@ impl Typing for CheckCtx {
         // free names when a name-spelled form survived; both discharge to
         // the same argument term.
         let result = match function.as_ref() {
-            Type::Fun { binder, .. } => {
-                crate::ccl::subst::discharge_at_binder(binder, argument, &codomain)
-            }
+            Type::Fun { binder, .. } => crate::ccl::subst::discharge_at_binder(
+                binder,
+                argument,
+                &codomain,
+                crate::ccl::Ids::Fresh,
+            ),
             _ => codomain,
         };
         let result = match generic {
@@ -1443,16 +1447,15 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                 // **The scratch lambda never enters a tree, so it consumes no identity.**
                 // It exists only to give the predicate the binder it is open in — a bare
                 // predicate would report `__elem` unbound. Minting it would put a birth with
-                // no recording open into the record a phase scope is auditing, and cloning
-                // its body or renaming its element the ordinary way would put copies there
-                // too: `TypedExpr`'s `Clone` freshens. A check reads, and must not perturb
-                // the record it may be reporting on ([`TypedExpr::throwaway`]).
+                // no recording open into the record a phase scope is auditing, and duplicating
+                // its body or renaming its element with duplicating copies would put copies
+                // there too. A check reads, and must not perturb the record it may be
+                // reporting on ([`TypedExpr::throwaway`]), so both copies keep their ids.
                 let param = Name::fresh("elem");
                 let mut body = r.predicate.as_ref().clone_preserving_ids();
-                provenance::preserving_ids(|| {
-                    crate::ccl::subst::Subst::rename(Name::elem(), param.clone())
-                        .rewrite_expr(&mut body)
-                });
+                crate::ccl::subst::Subst::rename(Name::elem(), param.clone())
+                    .copying(crate::ccl::Ids::Kept)
+                    .rewrite_expr(&mut body);
                 let bound_ty = Type::fun((**base).clone(), body.ty.clone());
                 let mut bound = Expr::throwaway(TypedExprNode::Lambda {
                     params: vec![TypedBinding {
