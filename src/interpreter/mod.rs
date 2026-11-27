@@ -7,11 +7,11 @@ mod binop;
 pub mod commit_operator;
 pub mod dispatcher;
 pub mod http_server;
+mod notifications;
 pub mod operator_conversion;
 pub mod operator_graph;
 mod producer_releases;
 mod scalar_expr;
-mod scheduler;
 pub mod sinks;
 mod stdio;
 mod stream_buffer;
@@ -29,8 +29,8 @@ pub mod value_probe;
 
 pub use binop::*;
 pub use http_server::HttpServerDataSource;
+pub use notifications::*;
 pub use scalar_expr::ScalarProgram;
-pub use scheduler::*;
 pub use stdio::*;
 pub use subscribe_context::*;
 #[cfg(test)]
@@ -48,72 +48,37 @@ use std::rc::{Rc, Weak};
 // Consumer Protocol
 // ============================================================================
 
-/// Receives a signal that a producer's output changed; notifications carry no tile data.
+/// Receives decided regions from a producer and passes each toward its dispatcher entries.
+/// Regions carry no tile data. See `src/interpreter/design-operators.md`,
+/// "The notification contract".
 ///
-/// A notification names the region of the producer's outermost keys that changed. A producer
-/// that cannot name it sends [`Projection::Everything`]. Deferred or coalesced notifications
-/// need not correspond one-to-one with changed results, and coalescing unites their regions.
-/// See `src/interpreter/design-operators.md`, "The notification contract".
+/// A planner reads a push's routes by walking the same `notify` with a routing landing
+/// ([`dispatcher::Landing::route`]), so planning reads the paths a delivery takes off the code
+/// that takes them. What `notify` does only for a delivery ([`dispatcher::Landing::is_delivery`])
+/// is not walked: a package it queues, or a complete region it records, fails the run unless a
+/// walk took the same path (`src/interpreter/design-dispatcher.md`, "Running a compiled
+/// program").
 pub trait Consumer {
-    /// Notify the consumer that the keys `arrived` changed, and that it should pull again if it
-    /// reads this producer.
-    fn notify(&mut self, arrived: &Projection);
-
-    /// Hand on `region` of the producer's keys at any level, which a pipeline breaker pushed
-    /// ([`dispatcher::Pushes`]): a consumer between two breakers restates it as it restates a
-    /// notification and passes it on, and the next breaker's [`dispatcher::Entry`] queues it in
-    /// `landing` as a work package of the breaker's pipeline. No gate holds a push back, since
-    /// every region becomes a package, and a consumer that pulls ignores it, which is the default:
-    /// a push wakes no one.
-    ///
-    /// TODO: this is a second path beside `notify` while runs still pull. Once every run goes
-    /// through the dispatcher, `notify`, its gates (`GatedConsumer`) and `WakeupQueue` go, and
-    /// this method takes `notify`'s place.
-    fn push(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
-
-    /// Declare where a push through this consumer goes and how, in `routes`, without pushing: a
-    /// consumer that passes a push on walks on to the consumers it passes it to, one that widens
-    /// it walks them through [`Routes::widened`](dispatcher::Routes::widened), and the
-    /// [`dispatcher::Entry`] of a placed breaker records its pipeline. It mirrors
-    /// [`push`](Self::push): a consumer that ignores a push declares nothing, which is the default.
-    fn route(&mut self, _routes: &mut dispatcher::Routes) {}
+    /// Record an announced region and deliver it toward its dispatcher entries.
+    fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
 // shared-state-ok: this is what makes a shared *notification* handle a consumer;
 // a wakeup carries no value, so it is not a dataflow edge.
-impl<C: Consumer> Consumer for Rc<RefCell<C>> {
-    fn notify(&mut self, arrived: &Projection) {
-        self.borrow_mut().notify(arrived)
-    }
-
-    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        self.borrow_mut().push(region, landing)
-    }
-    fn route(&mut self, routes: &mut dispatcher::Routes) {
-        self.borrow_mut().route(routes)
+impl<C: Consumer + ?Sized> Consumer for Rc<RefCell<C>> {
+    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        self.borrow_mut().notify(region, landing)
     }
 }
 
 /// A weak handle notifies its consumer while some owner keeps the consumer alive, and does
 /// nothing once it is gone: a subscription that does not keep its subscriber alive
 /// (`src/ccl/design/program-evolution.md`, "A subscription lasts as long as its producer").
-impl<C: Consumer> Consumer for Weak<RefCell<C>> {
-    fn notify(&mut self, arrived: &Projection) {
+impl<C: Consumer + ?Sized> Consumer for Weak<RefCell<C>> {
+    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         if let Some(consumer) = self.upgrade() {
-            consumer.borrow_mut().notify(arrived);
-        }
-    }
-
-    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        if let Some(consumer) = self.upgrade() {
-            consumer.borrow_mut().push(region, landing);
-        }
-    }
-
-    fn route(&mut self, routes: &mut dispatcher::Routes) {
-        if let Some(consumer) = self.upgrade() {
-            consumer.borrow_mut().route(routes);
+            consumer.borrow_mut().notify(region, landing);
         }
     }
 }
@@ -121,27 +86,18 @@ impl<C: Consumer> Consumer for Weak<RefCell<C>> {
 /// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
 /// [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
-    fn notify(&mut self, arrived: &Projection) {
-        (**self).notify(arrived)
-    }
-
-    fn push(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        (**self).push(region, landing)
-    }
-    fn route(&mut self, routes: &mut dispatcher::Routes) {
-        (**self).route(routes)
+    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        (**self).notify(region, landing)
     }
 }
 
 /// Blanket implementation: FnMut() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
-impl<F> Consumer for F
-where
-    F: FnMut(),
-{
-    fn notify(&mut self, _arrived: &Projection) {
-        dispatcher::debug_assert_outside_a_run();
-        self()
+impl<F: FnMut()> Consumer for F {
+    fn notify(&mut self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        if landing.is_delivery() {
+            self()
+        }
     }
 }
 

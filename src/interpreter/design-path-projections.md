@@ -12,19 +12,18 @@ the answer. A push beneath the outermost keys lands in its reader as a projectio
 
 ## Where a region crosses an operator
 
-A region crosses an operator on four paths, and only three need a path.
+A region crosses an operator through reads, notifications and releases.
 
 | Path | What crosses | Needs a path |
 | --- | --- | --- |
-| Notification (`Consumer::notify`) | the keys that changed | no |
 | Pull (`TileProducer::get`) | the region asked for | yes |
-| Push (`Consumer::push`) and package | the region a breaker decided | yes |
+| Notification (`Consumer::notify`) and package | the region a breaker decided | yes |
 | Release (`TileProducer::release`) | the region read no more | yes |
 
-A notification only has to be sound: naming more than changed costs a read and loses nothing, so
-a change at `(k, j)` is notified as the key `k`, or widened to `Everything`. A push names a region
-its reader's pipeline consumes once in the run (`Pushes::record`), so a push of `k` for a change at
-`(k, j)` would consume the row `k` at its first position. A pull at a package's region answers
+`Consumer::notify` marks cached reads dirty and forwards the region through the dispatcher routes.
+A dispatcher notification names a region its reader's pipeline consumes once in the run
+(`Pushes::record`), so notifying `k` for a decided position at `(k, j)` would consume the row `k`
+at its first position. A pull at a package's region answers
 that region and no more (`Tile::within`), and the breaker releases its input at what the answer
 states, which a finish checks covers the package (`finish_with`).
 

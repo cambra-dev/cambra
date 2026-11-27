@@ -21,8 +21,7 @@ use crate::interpreter::dispatcher::{
     BreakerHandle, Dispatcher, Event, Next, PipelineId, WorkPackage, finish_pipeline, run,
 };
 use crate::interpreter::{
-    BaseType, ColumnValue, Extent, WakeupQueue, domain_prefix, forwarding_consumer_tagging,
-    shared_consumer,
+    BaseType, ColumnValue, Extent, domain_prefix, forwarding_consumer_tagging, shared_consumer,
 };
 
 /// A morsel size larger than any held collection: every guard is one morsel.
@@ -145,8 +144,6 @@ impl TileProducer for Scripted {
 }
 
 impl Breaker for Scripted {
-    fn enter_consuming_mode(&mut self) {}
-
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         self.input.get(guard);
         if let Some(released) = &self.releases {
@@ -174,10 +171,6 @@ impl BreakingProducer for Scripted {
 
     fn morsels(&self, guard: &TileGuard, _rows: usize) -> Vec<TileGuard> {
         self.cut.clone().unwrap_or_else(|| vec![guard.clone()])
-    }
-
-    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
-        self.tiling().empty_tile()
     }
 }
 
@@ -248,13 +241,15 @@ fn an_aggregate_folds_what_the_memo_below_it_pushed() {
 #[test]
 fn a_partly_released_breaker_pushes_only_what_is_left() {
     let memo = memo_over_rows(0..6);
-    memo.borrow_mut().enter_consuming_mode();
+    memo.borrow_mut().begin_run();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     memo.borrow_mut().release(keys_between(2, 3));
     push_to(&mut *memo.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        memo.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     let package = dispatcher.pop().expect("one package for the reader");
     assert_eq!(package.pipeline, PipelineId(1));
     assert!(same_region(
@@ -490,7 +485,7 @@ fn finish_with_a_package_queued_panics() {
     ];
     wire(&[vec![], vec![0]], &breakers);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    breakers[0].borrow_mut().enter_consuming_mode();
+    breakers[0].borrow_mut().begin_run();
     breakers[0]
         .borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
@@ -540,7 +535,7 @@ fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
     let Next::Package(package) = dispatcher.try_claim(None) else {
         panic!("a started source hands out its package")
     };
-    memo.borrow_mut().enter_consuming_mode();
+    memo.borrow_mut().begin_run();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, keys_between(0, 3));
     dispatcher.acknowledge(package);
@@ -895,7 +890,7 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
 #[test]
 fn a_memos_morsels_partition_its_final_guard_and_leave_out_released_keys() {
     let mut memo = MemoProducer::over(Box::new(Input::over(&source(SPARSE))), &ints());
-    memo.enter_consuming_mode();
+    memo.begin_run();
     memo.consume_impl(InputId::ONLY, ints().universal_guard());
     memo.release(keys_between(3, 3));
     memo.release(keys_between(8, 8));
@@ -925,13 +920,15 @@ fn a_memos_morsels_partition_its_final_guard_and_leave_out_released_keys() {
 #[test]
 fn a_partly_released_source_pushes_morsels_over_what_is_left() {
     let memo = memo_over_rows(0..6);
-    memo.borrow_mut().enter_consuming_mode();
+    memo.borrow_mut().begin_run();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     memo.borrow_mut().release(keys_between(2, 3));
     push_to(&mut *memo.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        memo.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     let mut morsels = Vec::new();
     while let Some(package) = dispatcher.pop() {
         morsels.push(package.guard);
@@ -944,12 +941,14 @@ fn a_partly_released_source_pushes_morsels_over_what_is_left() {
 #[test]
 fn a_breaker_of_one_value_pushes_one_morsel() {
     let sum = aggregate_over(Box::new(Input::over(&source(SPARSE))), &sum_tiling());
-    sum.borrow_mut().enter_consuming_mode();
+    sum.borrow_mut().begin_run();
     sum.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     push_to(&mut *sum.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| sum.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        sum.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     let package = dispatcher.pop().expect("one morsel");
     assert_eq!(package.guard, sum_tiling().universal_guard());
     assert_eq!(dispatcher.pop(), None, "one morsel");
@@ -975,7 +974,7 @@ fn random_morsel_sizes_partition_and_answer_the_same() {
         let trace = format!("seed {seed}: keys {keys:?}, released {released:?}, rows {rows}");
 
         let mut memo = MemoProducer::over(Box::new(Input::over(&source_rows(&keys))), &ints());
-        memo.enter_consuming_mode();
+        memo.begin_run();
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         for key in &released {
             memo.release(keys_between(*key, *key));
@@ -1013,7 +1012,9 @@ fn overlapping_morsels_are_refused() {
     let breaker = Scripted::cutting(ints().universal_guard(), cut);
     push_to(&mut *breaker.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| breaker.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        breaker.borrow_mut().finish(InputId::ONLY, pushes)
+    });
 }
 
 /// A pipeline that would consume a region twice is refused: a guard pushed twice names the region
@@ -1059,7 +1060,7 @@ fn a_final_guard_pushed_twice_is_pushed_once() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         for _ in 0..2 {
-            breakers[0].borrow_mut().finish(pushes);
+            breakers[0].borrow_mut().finish(InputId::ONLY, pushes);
         }
     });
     let pushed: Vec<_> = std::iter::from_fn(|| dispatcher.pop())
@@ -1072,7 +1073,7 @@ fn a_final_guard_pushed_twice_is_pushed_once() {
 #[test]
 fn a_guard_naming_part_of_what_is_held_is_cut_at_the_keys_it_names() {
     let mut memo = MemoProducer::over(Box::new(Input::over(&source(0..8))), &ints());
-    memo.enter_consuming_mode();
+    memo.begin_run();
     memo.consume_impl(InputId::ONLY, ints().universal_guard());
     let guard = keys_between(3, 6);
     let morsels = memo.morsels(&guard, 2);
@@ -1149,7 +1150,7 @@ fn ordered_reader() -> (Dispatcher, Vec<BreakerHandle>) {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.order(PipelineId(1));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        breakers[0].borrow_mut().finish(pushes)
+        breakers[0].borrow_mut().finish(InputId::ONLY, pushes)
     });
     (dispatcher, breakers)
 }
@@ -1448,7 +1449,7 @@ fn pushes_dropped_with_morsels_are_refused() {
 #[should_panic(expected = "pipeline 0 lands its pushes through Dispatcher::land")]
 fn pushes_dropped_with_only_a_completion_are_refused() {
     let memo = memo_over_rows(0..6);
-    memo.borrow_mut().enter_consuming_mode();
+    memo.borrow_mut().begin_run();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     push_to(&mut *memo.borrow_mut(), &[1]);
@@ -1495,30 +1496,20 @@ fn an_aggregate_pushes_its_value_once_it_is_final() {
 struct Boxed(Box<dyn Consumer>);
 
 impl Consumer for Boxed {
-    fn notify(&mut self, arrived: &Projection) {
-        self.0.notify(arrived);
-    }
-
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        self.0.push(region, landing);
-    }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.0.route(routes);
+        self.0.notify(region, landing);
     }
 }
 
 /// The entry of pipeline 1 behind a gated consumer, as an operator between two breakers shares
 /// one: the gate, which every pull clears and nothing pulls here, and the shared consumer.
-fn gated_entry(input: &Tiling) -> (Gate, GatedConsumer) {
-    let entry =
-        crate::interpreter::dispatcher::Entry::new(PipelineId(1), input.clone(), Box::new(|| {}));
-    let (shared, gate) = shared_consumer(Box::new(entry));
-    (gate, shared)
+fn gated_entry(input: &Tiling) -> SharedConsumer {
+    let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(1), input.clone());
+    shared_consumer(Box::new(entry))
 }
 
 /// The tiling of a collection keyed by a tagged union of `UInt` keys under tags `0` and `1`.
@@ -1563,14 +1554,16 @@ fn a_push_lands_restated_by_the_chain_and_past_the_gate() {
         vec![domain(low.clone()), domain(high.clone())],
     );
     let input = keyed_by_two_tags();
-    let (_gate, shared) = gated_entry(&input);
-    let arm = forwarding_consumer_tagging(&shared, &WakeupQueue::default(), FieldKey::Index(1));
+    let shared = gated_entry(&input);
+    let arm = forwarding_consumer_tagging(&shared, FieldKey::Index(1));
     scripted
         .borrow_mut()
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(arm))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| package.guard)
         .collect();
@@ -1592,14 +1585,16 @@ fn a_push_naming_every_tag_whole_lands_universal() {
     let every_tag = under_tags(vec![(0, Predicate::True), (1, Predicate::True)]);
     assert!(!every_tag.is_universal(), "{every_tag:?}");
     let scripted = Scripted::holding(every_tag);
-    let (_gate, shared) = gated_entry(&input);
-    let path = forwarding_consumer_keeping_keys(&shared, &WakeupQueue::default());
+    let shared = gated_entry(&input);
+    let path = forwarding_consumer_keeping_keys(&shared);
     scripted
         .borrow_mut()
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(path))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| package.guard)
         .collect();
@@ -1611,18 +1606,20 @@ fn a_push_naming_every_tag_whole_lands_universal() {
 #[test]
 fn a_push_reaching_a_reader_twice_is_queued_once() {
     let scripted = Scripted::holding(ints().universal_guard());
-    let (_gate, shared) = gated_entry(&ints());
-    let wakeups = WakeupQueue::default();
+    let shared = gated_entry(&ints());
+
     let paths = vec![
-        forwarding_consumer_keeping_keys(&shared, &wakeups),
-        forwarding_consumer_keeping_keys(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared),
+        forwarding_consumer_keeping_keys(&shared),
     ];
     scripted
         .borrow_mut()
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Paths(paths))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     assert_eq!(
         dispatcher.pop().map(|package| package.guard),
         Some(ints().universal_guard())
@@ -1634,70 +1631,185 @@ fn a_push_reaching_a_reader_twice_is_queued_once() {
 struct Paths(Vec<Box<dyn Consumer>>);
 
 impl Consumer for Paths {
-    fn notify(&mut self, _arrived: &Projection) {}
-
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         for path in &mut self.0 {
-            path.push(region, landing);
-        }
-    }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        for path in &mut self.0 {
-            path.route(routes);
+            path.notify(region, landing);
         }
     }
 }
 
-/// A route declares, per path, whether the consumers on it keep the pushing pipeline's keys: a
+/// The routes a push of key 0 takes through `consumer` ([`Landing::route`]).
+fn walk(consumer: &mut dyn Consumer) -> Vec<crate::interpreter::dispatcher::Route> {
+    let mut landing = crate::interpreter::dispatcher::Landing::route();
+    consumer.notify(
+        &Projection::admitting(Predicate::point(Value::UInt(0))),
+        &mut landing,
+    );
+    landing.routes()
+}
+
+/// A route walk records, per path, whether the consumers on it keep the pushing pipeline's keys: a
 /// path through a widening consumer reaches the entry widened, and one through a consumer that
-/// keeps keys reaches it with them kept. Nothing is pushed.
+/// keeps keys reaches it with them kept. Nothing is queued.
 #[test]
-fn a_route_declares_whether_each_path_keeps_its_keys() {
-    let (_gate, shared) = gated_entry(&ints());
-    let wakeups = WakeupQueue::default();
+fn a_route_walk_records_whether_each_path_keeps_its_keys() {
+    let shared = gated_entry(&ints());
+
     let mut paths = Paths(vec![
-        forwarding_consumer(&shared, &wakeups),
-        forwarding_consumer_keeping_keys(&shared, &wakeups),
+        forwarding_consumer(&shared),
+        forwarding_consumer_keeping_keys(&shared),
     ]);
-    let mut routes = crate::interpreter::dispatcher::Routes::new();
-    paths.route(&mut routes);
-    let reached: Vec<_> = routes
-        .reached()
+    let reached: Vec<_> = walk(&mut paths)
         .into_iter()
         .map(|route| (route.pipeline, route.keeps_keys))
         .collect();
     assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
 }
 
-/// A route declares, per path, whether its decided region names only part of what a row depends
-/// on: a widening path's does, and so does a lookup operand's, which names rows by the key they
+/// A consumer that passes a route walk's push on with its keys kept and widens every push it
+/// delivers: deliberately inconsistent, as a consumer is whose `notify` passes a region the walk
+/// does not send otherwise than the ones it does.
+struct WidensDeliveries(Box<dyn Consumer>);
+
+impl Consumer for WidensDeliveries {
+    fn notify(
+        &mut self,
+        region: &Projection,
+        landing: &mut crate::interpreter::dispatcher::Landing<'_>,
+    ) {
+        match landing.is_delivery() {
+            true => landing.widened(|landing| self.0.notify(&Projection::Everything, landing)),
+            false => self.0.notify(region, landing),
+        }
+    }
+}
+
+/// Pipeline 1 reading pipeline 0, with the routes the planner walks of `walked` for a push of key
+/// 0 planned as pipeline 0's ([`walk_routes`](crate::interpreter::dispatcher::walk_routes)), and
+/// pipeline 0's breaker pushing `held` through `pushed` once it finishes. With `waits`, pipeline 1
+/// waits for its inputs, so it takes a widened push.
+fn planned_through(
+    walked: Box<dyn Consumer>,
+    pushed: Box<dyn Consumer>,
+    held: TileGuard,
+    waits: bool,
+) -> Dispatcher {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    if waits {
+        dispatcher.wait_for_inputs(PipelineId(1));
+    }
+    let walked: SharedConsumer = Rc::new(RefCell::new(Boxed(walked)));
+    let (changes, completions) = crate::interpreter::dispatcher::walk_routes(
+        &walked,
+        &[Projection::admitting(Predicate::point(Value::UInt(0)))],
+        1,
+    );
+    dispatcher.plan_routes(PipelineId(1), PipelineId(0), changes, completions);
+    let scripted = Scripted::holding(held);
+    scripted
+        .borrow_mut()
+        .base_mut()
+        .pushing_to(Rc::new(RefCell::new(Boxed(pushed))));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
+    dispatcher
+}
+
+/// A push lands along a route its planner walked: the walk of a consumer that keeps keys plans the
+/// route its push then takes.
+#[test]
+fn a_push_lands_along_the_route_its_planner_walked() {
+    let shared = gated_entry(&ints());
+    let dispatcher = planned_through(
+        forwarding_consumer_keeping_keys(&shared),
+        forwarding_consumer_keeping_keys(&shared),
+        keys_between(0, 1),
+        false,
+    );
+    assert_eq!(
+        dispatcher.pop().map(|package| package.guard),
+        Some(keys_between(0, 1))
+    );
+}
+
+/// A widening passes a push of every key on unwidened, and the planner walks a push of every key
+/// too, so that push lands along the unwidened route the walk found.
+#[test]
+fn a_push_of_every_key_lands_unwidened_through_a_widening() {
+    let shared = gated_entry(&ints());
+    let dispatcher = planned_through(
+        forwarding_consumer(&shared),
+        forwarding_consumer(&shared),
+        ints().universal_guard(),
+        false,
+    );
+    assert_eq!(
+        dispatcher.pop().map(|package| package.guard),
+        Some(ints().universal_guard())
+    );
+}
+
+/// A consumer whose delivery takes a path its walk did not fails the run where the push is queued:
+/// the walk plans a route that keeps keys, and the delivery arrives widened at a reader that waits
+/// for its inputs, which takes a widened push.
+#[test]
+#[should_panic(
+    expected = "a push of pipeline 0 reaches pipeline 1 along a path its planner's route walk did \
+                not take (widened: true"
+)]
+fn a_push_along_a_route_its_planner_did_not_walk_fails_the_run() {
+    let shared = gated_entry(&ints());
+    planned_through(
+        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
+        Box::new(WidensDeliveries(forwarding_consumer_keeping_keys(&shared))),
+        keys_between(0, 1),
+        true,
+    );
+}
+
+/// A complete region that reaches a reader whose walk reached no entry of it fails the run where
+/// the read records it.
+#[test]
+#[should_panic(
+    expected = "a complete region of pipeline 0 reaches pipeline 1 along a path its planner's route \
+                walk did not take"
+)]
+fn a_complete_region_for_a_reader_its_walk_did_not_reach_fails_the_run() {
+    let shared = gated_entry(&ints());
+    planned_through(
+        Box::new(|| {}),
+        forwarding_consumer_keeping_keys(&shared),
+        keys_between(0, 1),
+        false,
+    );
+}
+
+/// A route walk records, per path, whether its decided region names only part of what a row
+/// depends on: a widening path's does, and so does a lookup operand's, which names rows by the key they
 /// read whatever their input holds. A path that keeps its keys does not, and neither does an
 /// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
 #[test]
-fn a_route_declares_whether_each_path_completes_part_of_a_row() {
-    let (_gate, shared) = gated_entry(&ints());
-    let wakeups = WakeupQueue::default();
+fn a_route_walk_records_whether_each_path_completes_part_of_a_row() {
+    let shared = gated_entry(&ints());
+
     let mut paths = Paths(vec![
-        forwarding_consumer(&shared, &wakeups),
-        forwarding_consumer_keeping_keys(&shared, &wakeups),
-        crate::interpreter::scheduler::widening_restating_complete(
+        forwarding_consumer(&shared),
+        forwarding_consumer_keeping_keys(&shared),
+        crate::interpreter::notifications::widening_restating_complete(
             |region| region.clone(),
-            forwarding_consumer_keeping_keys(&shared, &wakeups),
+            forwarding_consumer_keeping_keys(&shared),
         ),
-        crate::interpreter::scheduler::restating_lookup(
+        crate::interpreter::notifications::restating_lookup(
             Box::new(|region| region.clone()),
-            forwarding_consumer_keeping_keys(&shared, &wakeups),
+            forwarding_consumer_keeping_keys(&shared),
         ),
     ]);
-    let mut routes = crate::interpreter::dispatcher::Routes::new();
-    paths.route(&mut routes);
-    let parts: Vec<_> = routes
-        .reached()
+    let parts: Vec<_> = walk(&mut paths)
         .into_iter()
         .map(|route| route.completes_part)
         .collect();
@@ -1714,11 +1826,11 @@ fn a_read_decided_only_whole_records_no_part() {
     use crate::interpreter::dispatcher::Completion;
     let recorded = |whole_only: bool| {
         let scripted = Scripted::holding(keys_between(0, 1));
-        let (_gate, shared) = gated_entry(&ints());
-        let wakeups = WakeupQueue::default();
+        let shared = gated_entry(&ints());
+
         let paths = vec![
-            forwarding_consumer(&shared, &wakeups),
-            forwarding_consumer_keeping_keys(&shared, &wakeups),
+            forwarding_consumer(&shared),
+            forwarding_consumer_keeping_keys(&shared),
         ];
         scripted
             .borrow_mut()
@@ -1729,7 +1841,9 @@ fn a_read_decided_only_whole_records_no_part() {
         if whole_only {
             dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
         }
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+            scripted.borrow_mut().finish(InputId::ONLY, pushes)
+        });
         dispatcher.complete_of(PipelineId(1), PipelineId(0))
     };
     assert!(matches!(recorded(true), Completion::Nothing));
@@ -1743,11 +1857,11 @@ fn a_read_decided_only_whole_records_no_part() {
 fn a_read_decided_only_whole_records_its_whole_push() {
     use crate::interpreter::dispatcher::Completion;
     let scripted = Scripted::holding(ints().universal_guard());
-    let (_gate, shared) = gated_entry(&ints());
-    let wakeups = WakeupQueue::default();
+    let shared = gated_entry(&ints());
+
     let paths = vec![
-        forwarding_consumer(&shared, &wakeups),
-        forwarding_consumer_keeping_keys(&shared, &wakeups),
+        forwarding_consumer(&shared),
+        forwarding_consumer_keeping_keys(&shared),
     ];
     scripted
         .borrow_mut()
@@ -1756,7 +1870,9 @@ fn a_read_decided_only_whole_records_its_whole_push() {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.wait_for_inputs(PipelineId(1));
     dispatcher.completes_whole_only(PipelineId(1), PipelineId(0));
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     assert!(matches!(
         dispatcher.complete_of(PipelineId(1), PipelineId(0)),
         Completion::Whole
@@ -1771,14 +1887,16 @@ fn a_read_decided_only_whole_records_its_whole_push() {
 )]
 fn a_push_widened_on_its_way_fails_the_run() {
     let scripted = Scripted::cutting(keys_between(0, 1), vec![keys_between(0, 1)]);
-    let (_gate, shared) = gated_entry(&ints());
-    let widening = forwarding_consumer(&shared, &WakeupQueue::default());
+    let shared = gated_entry(&ints());
+    let widening = forwarding_consumer(&shared);
     scripted
         .borrow_mut()
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(widening))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
 }
 
 /// A push whose chain leads back into a consumer it is passing through fails the run: only a
@@ -1789,32 +1907,29 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
     /// A consumer whose push climbs `back`, a forwarder into the consumer this one sits behind.
     struct Cycle(test_helpers::InputConsumer);
     impl Consumer for Cycle {
-        fn notify(&mut self, _arrived: &Projection) {}
-
-        fn push(
+        fn notify(
             &mut self,
             region: &Projection,
             landing: &mut crate::interpreter::dispatcher::Landing<'_>,
         ) {
             if let Some(back) = self.0.borrow_mut().as_mut() {
-                back.push(region, landing);
+                back.notify(region, landing);
             }
         }
     }
     let back = Rc::new(RefCell::new(None));
-    let (shared, _gate) = shared_consumer(Box::new(Cycle(back.clone())));
-    *back.borrow_mut() = Some(forwarding_consumer_keeping_keys(
-        &shared,
-        &WakeupQueue::default(),
-    ));
+    let shared = shared_consumer(Box::new(Cycle(back.clone())));
+    *back.borrow_mut() = Some(forwarding_consumer_keeping_keys(&shared));
     let scripted = Scripted::cutting(keys_between(0, 1), vec![keys_between(0, 1)]);
-    let path = forwarding_consumer_keeping_keys(&shared, &WakeupQueue::default());
+    let path = forwarding_consumer_keeping_keys(&shared);
     scripted
         .borrow_mut()
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(path))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
 }
 
 /// A push reaches every live slot of a fan-out, past the fan-out's own gate, so each pipeline
@@ -1834,11 +1949,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
     let mut cx = SubscribeContext::new();
     let _slots: Vec<_> = (1..=2)
         .map(|reader| {
-            let entry = crate::interpreter::dispatcher::Entry::new(
-                PipelineId(reader),
-                ints(),
-                Box::new(|| {}),
-            );
+            let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(reader), ints());
             let mut slot = fan.slot();
             let guard = slot.tiling().universal_guard();
             slot.subscribe(guard, Box::new(entry), &mut cx)
@@ -1849,7 +1960,9 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Through(input))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(InputId::ONLY, pushes)
+    });
     let mut queued: Vec<(usize, TileGuard)> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| (package.pipeline.0, package.guard))
         .collect();
@@ -1864,9 +1977,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
 struct Through(test_helpers::InputConsumer);
 
 impl Consumer for Through {
-    fn notify(&mut self, _arrived: &Projection) {}
-
-    fn push(
+    fn notify(
         &mut self,
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
@@ -1875,15 +1986,7 @@ impl Consumer for Through {
             .borrow_mut()
             .as_mut()
             .expect("the operator was subscribed")
-            .push(region, landing);
-    }
-
-    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
-        self.0
-            .borrow_mut()
-            .as_mut()
-            .expect("the operator was subscribed")
-            .route(routes);
+            .notify(region, landing);
     }
 }
 
@@ -2045,10 +2148,9 @@ fn appended_ingress_keeps_external_pushes_at_the_control_boundary() {
     body.restrict_ingress(PipelineId(1), 0..2);
     assert_eq!(dispatcher.append_graph(body), 2);
 
-    let entry =
-        crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone(), Box::new(|| {}));
+    let entry = crate::interpreter::dispatcher::Entry::new(PipelineId(3), input.clone());
     *entry.complete_target().borrow_mut() = Some((PipelineId(1), input.clone()));
-    let consumer: crate::interpreter::scheduler::SharedConsumer = Rc::new(RefCell::new(entry));
+    let consumer: SharedConsumer = Rc::new(RefCell::new(entry));
 
     for (pusher, expected_reader) in [(0, 1), (2, 3)] {
         let breaker = Scripted::holding(input.universal_guard());

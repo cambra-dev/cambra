@@ -10,16 +10,20 @@
 //! fan-out that held its consumers strongly would keep them alive past the program.
 
 use std::cell::RefCell;
+use std::ops::ControlFlow;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use cambra::ccl::context::{CompileResultExt, CompiledProgram, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
+use cambra::interpreter::dispatcher::{Ended, RunObserver, run_program};
 use cambra::interpreter::sinks::SinkConsumer;
+use cambra::interpreter::{DataSink, Tile};
 use cambra::live_program::{LiveProgram, MAIN_BRANCH};
 use indoc::indoc;
 use rstest::rstest;
 
-/// How many scheduler passes a program gets to complete.
+/// How many drained passes a run gets before the test gives up on it.
 const CAP: usize = 10_000;
 
 /// A weak reference to each of `program`'s sink consumers.
@@ -36,16 +40,25 @@ fn sink_consumers(program: &CompiledProgram) -> Vec<Weak<RefCell<SinkConsumer>>>
     consumers
 }
 
-/// Drive `ctx`'s scheduler until `program`'s sinks are all terminal.
-fn run_to_completion(ctx: &mut GlobalContext, program: &CompiledProgram) {
-    let finished = (0..CAP).any(|_| {
-        ctx.scheduler().check_for_notifications();
-        program.done.try_recv().is_ok()
-    });
-    assert!(
-        finished,
-        "the program finishes within {CAP} scheduler passes"
-    );
+/// Ends a run after [`CAP`] drained passes, so a program that never finishes fails the test
+/// rather than hanging it.
+struct Capped(usize);
+
+impl RunObserver for Capped {
+    fn drained(&mut self, _changed: bool) -> ControlFlow<()> {
+        self.0 += 1;
+        if self.0 < CAP {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    }
+}
+
+struct IgnoreMain;
+
+impl DataSink for IgnoreMain {
+    fn process(&self, _: &Tile) {}
 }
 
 fn assert_released(consumers: &[Weak<RefCell<SinkConsumer>>]) {
@@ -82,8 +95,9 @@ fn dropping_a_program_releases_its_sinks(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
     let _sink = ctx.register_test_sink("out");
     let loaded = LoadedProgram::test(code);
-    let program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    run_to_completion(&mut ctx, &program);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    run_program(&mut program, 1).expect("the program dispatches");
+    assert!(program.done.try_recv().is_ok(), "the program finishes");
     let consumers = sink_consumers(&program);
     drop(program);
     assert_released(&consumers);
@@ -100,9 +114,16 @@ fn dropping_a_live_program_releases_its_sinks() {
         for i in [1, 2]:
             out << i
     "});
-    let live = LiveProgram::start(&mut ctx, &loaded, &|| Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut live =
+        LiveProgram::start(&mut ctx, &loaded, &|| Box::new(|| {})).unwrap_or_render(&loaded);
+    let ended = live
+        .run(1, &|_| Arc::new(IgnoreMain), &mut Capped(0))
+        .expect("the program dispatches");
+    assert!(
+        matches!(ended, Ended::Done(_)),
+        "the program finishes within {CAP} drained passes"
+    );
     let (_, program) = live.program(MAIN_BRANCH).expect("`main` runs");
-    run_to_completion(&mut ctx, program);
     let consumers = sink_consumers(program);
     drop(live);
     assert_released(&consumers);
