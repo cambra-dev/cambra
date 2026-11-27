@@ -974,7 +974,6 @@ impl SteppedStore for InductionStoreProducer {
 impl Breaker for InductionStoreProducer {
     fn enter_consuming_mode(&mut self) {
         self.breaker.consuming = true;
-        #[cfg(test)]
         self.enter_loop_consuming();
     }
 
@@ -1001,7 +1000,6 @@ impl Breaker for InductionStoreProducer {
 
     /// As [`finish_store`].
     fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>) {
-        #[cfg(test)]
         if self.run.is_some() {
             assert!(
                 self.final_guard().is_universal(),
@@ -1086,9 +1084,9 @@ impl CommitProducer {
     fn writer_source<R>(&self, f: impl FnOnce(&dyn TileProducer) -> R) -> R {
         let [writer] = self.writer_producers.as_slice() else {
             panic!(
-                "a transaction store of {} writers has no consuming mode: a morsel names positions \
-                 of one writer's source",
-                self.writer_producers.len()
+                "{}",
+                self.no_consuming_mode()
+                    .expect("a store of one writer has a consuming mode")
             )
         };
         drive_source(&**writer, &mut Some(f))
@@ -1119,6 +1117,21 @@ impl SteppedStore for CommitProducer {
 impl Breaker for CommitProducer {
     fn enter_consuming_mode(&mut self) {
         self.breaker.consuming = true;
+    }
+
+    fn no_consuming_mode(&self) -> Option<String> {
+        assert!(
+            !self.writer_producers.is_empty(),
+            "a transaction store has a writer: its keys are the footprints of its `with \
+             begin():` blocks, each one of its writers"
+        );
+        (self.writer_producers.len() > 1).then(|| {
+            format!(
+                "a transaction store of {} writers has no consuming mode: a morsel names positions \
+                 of one writer's source",
+                self.writer_producers.len()
+            )
+        })
     }
 
     /// Drains the store until the writer's drive has released `guard` ([`consume_store`]).
@@ -2172,14 +2185,16 @@ impl TileOperator for CommitOperator {
         // Kick once immediately to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
-        // A seed forwards, rather than being drained here: it is ordinary dataflow, so a
+        // A seed stays subscribed rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
         // instead bounds a program by how far its seed's input can advance before the
-        // runtime has started ([`InductionStore::subscribe`] says the same).
+        // runtime has started ([`InductionStore::subscribe`] says the same). The store reads a
+        // seed by pull at a step, so a push from a pipeline beneath the seed stops in front of it
+        // (`subscribe_pulled`) rather than climb to the store's readers.
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| (key, subscribe_forwarding(&mut *op, &consumer, scheduler)))
+            .map(|(key, mut op)| (key, subscribe_pulled(&mut *op, &consumer, scheduler)))
             .collect();
         // A writer is the store's input as a pipeline breaker, so it is subscribed behind an
         // entry, as an induction store's body is: the entry stops every push from beneath before
@@ -2370,7 +2385,6 @@ impl TileProducer for CommitProducer {
         }
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -2876,7 +2890,6 @@ impl TileOperator for InductionStore {
             .map(|(key, mut op)| (key, subscribe_pulled(&mut *op, &consumer, scheduler)))
             .collect();
         Box::new(InductionStoreProducer {
-            #[cfg(test)]
             run: None,
             base: ProducerBase::new(
                 InductionStoreProducer::alloc_id(),
@@ -2940,7 +2953,6 @@ impl ChangeNotifier {
 }
 
 pub struct InductionStoreProducer {
-    #[cfg(test)]
     pub(crate) run: Option<crate::interpreter::dispatcher::loop_scope::InductionRun>,
     /// Wakes this store's readers when a pull changes what it answers.
     notifier: ChangeNotifier,
@@ -3418,17 +3430,14 @@ impl TileProducer for InductionStoreProducer {
         self.notifier.notify_if_changed(store)
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
 
-    #[cfg(test)]
     fn as_induction_store_mut(&mut self) -> Option<&mut InductionStoreProducer> {
         Some(self)
     }
 
-    #[cfg(test)]
     fn read_cycle_again(&mut self) {
         let cycle = self
             .breaker
@@ -3876,6 +3885,8 @@ impl TileProducer for StoreFinalReadProducer {
         if self.released {
             return self.tiling().empty_tile();
         }
+        // A reader can pull some rows, as one that takes rows as they arrive does, so the answer
+        // keeps the rows the pull names.
         if self.levels_above > 0 {
             let mut tile = self.per_row();
             tile.restrict_to(&projection_guard.projection_for(self), self.tiling());
@@ -5528,7 +5539,6 @@ impl TileProducer for InductionDriverProducer {
 
     impl_producer_base!();
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -5554,7 +5564,6 @@ impl TileProducer for InductionDriverProducer {
         self.step(&Projection::Everything)
     }
 
-    #[cfg(test)]
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
         let next = self
             .source

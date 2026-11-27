@@ -20,7 +20,6 @@ use crate::interpreter::{
     scheduler::{SharedConsumer, WakeupQueue},
     tile_operators::TileProducer,
 };
-#[cfg(test)]
 use crate::interpreter::{
     dispatcher::{Landing, PipelineId, pushed_guard},
     tile_operators::Tiling,
@@ -102,21 +101,16 @@ impl DoneNotifier {
 /// outlives any one version of a program, and the consumer that feeds it does not.
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the consumer owns the slot, and the pull reads it through a weak handle"
-        )
-    )]
     producer: ProducerSlot,
+    /// The sink a pull hands the producer's answer to, which a dispatched run's sink breaker
+    /// hands its packages' answers to instead.
+    sink: Arc<dyn DataSink>,
     /// The pull a notification schedules: one `get` of the producer, handed to the sink.
     pull: SharedConsumer,
     /// Where a notification schedules [`pull`](Self::pull).
     wakeups: WakeupQueue,
-    /// The sink's pipeline in a test's program run, and the tiling of the producer it pulls,
+    /// The sink's pipeline in a dispatched run, and the tiling of the producer it pulls,
     /// which a push names regions of ([`place`](Self::place)).
-    #[cfg(test)]
     placed: Option<(PipelineId, Tiling)>,
 }
 
@@ -135,13 +129,14 @@ impl SinkConsumer {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
         let producer = Rc::downgrade(&slot);
         let mut done = Some(done);
+        let sink_handle = sink.clone();
         let pull: SharedConsumer = Rc::new(RefCell::new(move || {
             let Some(producer) = producer.upgrade() else {
                 return;
             };
             if let Some(prod) = producer.borrow_mut().as_mut() {
                 let guard = prod.tiling().universal_guard();
-                let tile = prod.get(guard);
+                let tile = prod.get(guard).closed_over(prod.tiling());
                 sink.process(&tile);
                 let is_terminal = tile.is_terminal();
                 prod.release(tile.to_guard());
@@ -153,9 +148,9 @@ impl SinkConsumer {
         (
             Self {
                 producer: slot.clone(),
+                sink: sink_handle,
                 pull,
                 wakeups,
-                #[cfg(test)]
                 placed: None,
             },
             slot,
@@ -169,15 +164,23 @@ impl SinkConsumer {
         self.pull.borrow_mut().notify(&Projection::Everything);
     }
 
-    /// The slot holding the producer this consumer pulls, which a test driver walks.
-    #[cfg(test)]
+    /// The slot holding the producer this consumer pulls, which a dispatched run walks.
     pub(crate) fn producer_slot(&self) -> &ProducerSlot {
         &self.producer
     }
 
-    /// Place the sink in `pipeline` of a test's program run, whose breaker pulls a producer of
+    /// The sink this consumer hands its producer's answers to.
+    pub(crate) fn sink(&self) -> Arc<dyn DataSink> {
+        self.sink.clone()
+    }
+
+    /// Take the sink out of the pipeline it was placed in: a push that reaches it queues nothing.
+    pub(crate) fn unplace(&mut self) {
+        self.placed = None;
+    }
+
+    /// Place the sink in `pipeline` of a dispatched run, whose breaker pulls a producer of
     /// `input`: a push that reaches the sink queues for that pipeline what it names of `input`.
-    #[cfg(test)]
     pub(crate) fn place(&mut self, pipeline: PipelineId, input: Tiling) {
         self.placed = Some((pipeline, input));
     }
@@ -190,7 +193,6 @@ impl Consumer for SinkConsumer {
         self.wakeups.request(self.pull.clone());
     }
 
-    #[cfg(test)]
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if let Some((pipeline, input)) = &self.placed
             && let Some(guard) = pushed_guard(region, input)
