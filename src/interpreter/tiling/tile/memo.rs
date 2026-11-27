@@ -2,10 +2,74 @@
 use super::*;
 use crate::interpreter::Projection;
 
+// A broad delivery may inspect prior coverage once. Reading this same cache a
+// second time inside the direct calculation would reintroduce the snapshot fallback.
+// Track the tile on its worker thread; input tiles and the test oracle are independent.
+#[cfg(test)]
+thread_local! {
+    static CACHE_SNAPSHOTS: std::cell::Cell<Option<(*const Tile, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct CacheSnapshotCheck(Option<(*const Tile, bool)>);
+
+#[cfg(test)]
+impl CacheSnapshotCheck {
+    fn enter(cache: &Tile) -> Self {
+        Self(CACHE_SNAPSHOTS.replace(Some((cache, false))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for CacheSnapshotCheck {
+    fn drop(&mut self) {
+        CACHE_SNAPSHOTS.set(self.0);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn check_cache_snapshot(tile: &Tile) {
+    if let Some((cache, already_read)) = CACHE_SNAPSHOTS.get()
+        && std::ptr::eq(cache, tile)
+    {
+        assert!(
+            !already_read,
+            "memo append took two whole-cache snapshots to produce a delta"
+        );
+        CACHE_SNAPSHOTS.set(Some((cache, true)));
+    }
+}
+
 impl Tile {
     /// Materialize a delivery and return the newly completed region. Reclaimed
     /// fields still count towards completing their enclosing record.
     pub(crate) fn append(
+        &mut self,
+        incoming: Tile,
+        projection: &Projection,
+        tiling: &Tiling,
+        released: &TileGuard,
+    ) -> TileGuard {
+        #[cfg(test)]
+        let before = self.to_guard().union(released);
+        #[cfg(test)]
+        let snapshots = CacheSnapshotCheck::enter(self);
+        let delta = self.append_direct(incoming, projection, tiling, released);
+        #[cfg(test)]
+        {
+            drop(snapshots);
+            // Whole-cache reads are an independent oracle for all the direct append paths.
+            let after = self.to_guard().union(released);
+            let expected = after.difference_over(&before, tiling);
+            assert!(
+                delta.subsumes(&expected) && expected.subsumes(&delta),
+                "memo append must return its exact delta for {projection:?}: returned {delta:?}, expected {expected:?}"
+            );
+        }
+        delta
+    }
+
+    fn append_direct(
         &mut self,
         mut incoming: Tile,
         projection: &Projection,
@@ -14,6 +78,16 @@ impl Tile {
     ) -> TileGuard {
         #[cfg(debug_assertions)]
         self.check_memo_row(&incoming, Some(0), 0, &mut Vec::new(), false);
+
+        // The fast paths track cells still in the cache. A closing statement can
+        // also cover cells the reader previously took and the cache has reclaimed.
+        let unreleased = |delta: TileGuard| {
+            if released.is_empty() {
+                delta
+            } else {
+                delta.difference_over(released, tiling)
+            }
+        };
 
         if let (
             Tile::DataFunction {
@@ -42,14 +116,16 @@ impl Tile {
             self.append_keys(incoming, true);
             self.close_memo_positions(tiling);
             let after = self.level_statement();
-            return TileGuard::Function(FunctionGuard::Domain(after.minus(&before)));
+            return unreleased(TileGuard::Function(FunctionGuard::Domain(
+                after.minus(&before),
+            )));
         }
 
         let nested_record_items = contains_record_item_below(tiling, 2);
         if !nested_record_items
             && let Some(delta) = self.insert_memo_items(&mut incoming, projection, tiling)
         {
-            return delta;
+            return unreleased(delta);
         }
 
         if projection.names_part_of_values() && incoming.to_guard().is_empty() {
@@ -63,7 +139,7 @@ impl Tile {
             self.merge(incoming);
             // merge already compacts earlier statements. Readers projecting below a
             // newly closed ancestor still need the child statement recorded by settle.
-            return nested.settle(self, tiling);
+            return unreleased(nested.settle(self, tiling));
         }
 
         incoming.state_nested_memo_items();
@@ -236,14 +312,11 @@ impl Tile {
                 }
                 let affected = complete.intersect(&touched);
                 let all = domain_predicate.union(&complete);
-                let parents = Predicate::union_all(
-                    rows.iter()
-                        .filter(|(_, p)| {
-                            !affected.within(p, 0).is_false()
-                                && covers_domain(&all.within(p, 0), Some(extent))
-                        })
-                        .map(|(_, p)| Predicate::exactly(p))
-                        .collect(),
+                let parents = completed_parents(
+                    rows.iter().map(|(_, path)| path.as_slice()),
+                    &affected,
+                    &all,
+                    Some(extent),
                 );
                 let closed = if depth == 0 {
                     parents
@@ -665,10 +738,8 @@ struct NestedAppend<'a> {
     field: Option<&'a SmolStr>,
     tiling: &'a Tiling,
     previous: Predicate,
-    facts: Vec<Predicate>,
-    /// Physical parent paths in this delivery at each level. An absence can also
-    /// concern a parent held only in the cache.
-    rows: Vec<Vec<Vec<Value>>>,
+    /// Each level carries its completion statement and the parent paths in this delivery.
+    levels: Vec<(Predicate, Vec<Vec<Value>>)>,
 }
 
 impl<'a> NestedAppend<'a> {
@@ -721,9 +792,8 @@ impl<'a> NestedAppend<'a> {
             return None;
         }
         let leaf = CurryLevel::new(levels - 1);
-        let mut facts = Vec::with_capacity(levels);
+        let mut evidence = Vec::with_capacity(levels);
         let mut parents = rows;
-        let mut rows = Vec::with_capacity(levels);
         for depth in 0..levels {
             let node = chain.values_at(CurryLevel::new(depth));
             let mut stated = node.level_statement();
@@ -755,16 +825,14 @@ impl<'a> NestedAppend<'a> {
             } else {
                 Vec::new()
             };
-            rows.push(parents);
+            evidence.push((stated, parents));
             parents = children;
-            facts.push(stated);
         }
         Some(Self {
             field,
             tiling: ty,
             previous: old.completion_at(leaf).union(&outer_closed.descend(levels)),
-            rows,
-            facts,
+            levels: evidence,
         })
     }
 
@@ -773,8 +841,7 @@ impl<'a> NestedAppend<'a> {
             field,
             tiling,
             previous,
-            rows,
-            facts,
+            levels,
         } = self;
         let (chain, parents) = if let Some(name) = field {
             let Tile::DataFunction {
@@ -790,10 +857,10 @@ impl<'a> NestedAppend<'a> {
         } else {
             (cache, None)
         };
-        let leaf = CurryLevel::new(facts.len() - 1);
+        let leaf = CurryLevel::new(levels.len() - 1);
         let mut from_children = Predicate::False;
         let mut delta = Predicate::False;
-        for (depth, (arrived, rows)) in facts.into_iter().zip(rows).enumerate().rev() {
+        for (depth, (arrived, rows)) in levels.into_iter().enumerate().rev() {
             let level = CurryLevel::new(depth);
             let mut changed = arrived.union(&from_children);
             let ext = tiling.values_at(level).domain_extent();
@@ -900,12 +967,23 @@ fn closed_memo_rows(
         }
         selected.into_iter().map(|(_, path)| path).collect()
     };
+    completed_parents(rows.iter().map(Vec::as_slice), changed, stated, extent)
+}
+
+/// A parent closes on an affected path once its own children cover the domain.
+fn completed_parents<'a>(
+    paths: impl Iterator<Item = &'a [Value]>,
+    changed: &Predicate,
+    stated: &Predicate,
+    extent: Option<&Extent>,
+) -> Predicate {
     Predicate::union_all(
-        rows.iter()
-            .filter(|p| {
-                !changed.within(p, 0).is_false() && covers_domain(&stated.within(p, 0), extent)
+        paths
+            .filter(|path| {
+                !changed.within(path, 0).is_false()
+                    && covers_domain(&stated.within(path, 0), extent)
             })
-            .map(|p| Predicate::exactly(p))
+            .map(Predicate::exactly)
             .collect(),
     )
 }
@@ -977,21 +1055,20 @@ impl NestedAnswer {
                 return;
             };
             let already_closed = cache.completion_at(parent);
-            let mut closed = Vec::new();
-            for path in rows.take().unwrap_or_else(|| cache.paths_at(parent)) {
-                if already_closed.contains_path(&path) || arrived.within(&path, 0).is_false() {
-                    continue;
-                }
-                let known = stated.within(&path, 0);
-                if covers_domain(&known, extent.as_ref()) {
-                    closed.push(Predicate::exactly(&path));
-                }
-            }
-            if closed.is_empty() {
+            let candidates = rows.take().unwrap_or_else(|| cache.paths_at(parent));
+            arrived = completed_parents(
+                candidates
+                    .iter()
+                    .map(Vec::as_slice)
+                    .filter(|path| !already_closed.contains_path(path)),
+                &arrived,
+                &stated,
+                extent.as_ref(),
+            );
+            if arrived.is_false() {
                 return;
             }
             level = parent;
-            arrived = Predicate::union_all(closed);
         }
     }
 }
@@ -1099,6 +1176,36 @@ mod tests {
             Predicate::False,
             BitSet::new(),
         )
+    }
+
+    #[test]
+    fn a_closure_only_append_excludes_reclaimed_keys_from_its_raw_delta() {
+        let ty = keyed(integer());
+        let keys = |keys: &[u64]| Predicate::from_column_value(&ColumnValue::UInts(keys.to_vec()));
+        let guard = |keys| TileGuard::Function(FunctionGuard::Domain(keys));
+        let mut cache = ty.empty_tile();
+        let mut close = ty.empty_tile();
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut close
+        else {
+            unreachable!()
+        };
+        *domain_predicate = keys(&[4, 5, 6, 7]);
+        let released = guard(keys(&[5, 6]));
+        let delta = cache.append(close, &Projection::Everything, &ty, &released);
+        assert_eq!(delta, guard(keys(&[4, 7])));
+    }
+
+    #[test]
+    #[should_panic(expected = "memo append took two whole-cache snapshots")]
+    fn a_second_snapshot_of_the_same_cache_fails_the_direct_append_check() {
+        let cache = ints(&[0], &[1]);
+        let input = cache.clone();
+        let _check = CacheSnapshotCheck::enter(&cache);
+        cache.to_guard();
+        input.to_guard();
+        cache.to_guard();
     }
 
     #[test]
