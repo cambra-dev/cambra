@@ -4013,20 +4013,25 @@ mod tests {
             );
         }
 
-        /// Cells two levels beneath the keys name paths whose outermost key no predicate reads,
-        /// so the difference with outermost keys panics rather than subtract at the wrong level.
         #[test]
-        #[should_panic(expected = "spelled one level beneath the keys")]
-        fn cells_two_levels_beneath_the_keys_have_no_difference_with_keys() {
-            let deep = TileGuard::Function(FunctionGuard::Codomain(Box::new(record_cells(
-                TileGuard::Scalar(Predicate::qualified(keys(0, 3), Predicate::True)),
-                TileGuard::Scalar(Predicate::False),
-            ))));
-            let held = TileGuard::Or(vec![
-                domain(keys(5, 5)),
-                record_cells(deep, TileGuard::Scalar(Predicate::False)),
-            ]);
-            guard_minus(&held, &domain(keys(0, 0)));
+        fn subtracting_an_outer_key_preserves_deep_fields_under_other_keys() {
+            let held = |rows| {
+                let inner_keys =
+                    Predicate::qualified(Predicate::qualified(rows, Predicate::True), keys(0, 3));
+                let deep = TileGuard::Function(FunctionGuard::Codomain(Box::new(record_cells(
+                    TileGuard::Scalar(Predicate::qualified(inner_keys, Predicate::True)),
+                    TileGuard::Scalar(Predicate::False),
+                ))));
+                TileGuard::flatten_or(vec![
+                    domain(keys(5, 5)),
+                    record_cells(deep, TileGuard::Scalar(Predicate::False)),
+                ])
+            };
+            let released = keys(0, 0);
+            assert_eq!(
+                guard_minus(&held(Predicate::True), &domain(released.clone())),
+                held(Predicate::True.minus(&released)),
+            );
         }
 
         /// A field predicate that is an `Or` of differently qualified arms loses the arms whose
