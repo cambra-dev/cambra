@@ -541,11 +541,13 @@ removes its entry, even when an earlier package is still running. A package whos
 region of a package in flight is not claimed, and the packages behind it wait with it, until that
 package is acknowledged (`Queue::claim`). A pipeline can be notified of a region again before its
 package for the region is acknowledged, as a reader keyed by one row is at each push of what it
-reads, and two packages naming one region would read it at once. Package indices increase for the
-run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
-pipelines permit at most one package in flight. No queue lock is held while an operator executes.
-A delivery takes no lock beyond what each consumer's own state needs
-([The notification contract](design-operators.md#the-notification-contract)).
+reads, and two packages naming one region would read it at once. The queue reserves the guard it
+receives. A producer may pull enclosing keys internally and cut the answer to the requested fields
+before delivery and release. Disjoint field and item packages can run together, including beneath
+the same key. Package indices increase for the run and are never reused. An acknowledgement must
+match an in-flight index and guard. Ordered pipelines permit at most one package in flight. No queue
+lock is held while an operator executes. A delivery takes no lock beyond what each consumer's own
+state needs ([The notification contract](design-operators.md#the-notification-contract)).
 
 Queue entries retain only ready and in-flight guards. Collection capacity can retain its peak
 allocation; it does not grow with the number of acknowledged packages. The accumulated region
@@ -650,16 +652,31 @@ With more than one worker, two kinds of claimant share the dispatcher:
 
 A worker consumes, publishes and acknowledges its own claim, in that order:
 
-1. For a concurrent pipeline, it calls `consume_impl` under the shared breaker handle. An
-   ordered pipeline has at most one package in flight and holds the handle exclusively through
-   consume and publication.
-2. Where the breaker answers `pushes_while_consuming`, as on the coordinator (`consume_with`), it
-   computes the pipeline's pushes under the handle held exclusively (`Pushes::push_final`), so the
-   push reads the breaker with no consume between the merge of a consume's rows and the release of
-   its input. A sink or a breaker that publishes only at its finish or in the resume pass can
-   acknowledge a concurrent consume as soon as it drops the shared handle, even while a peer is
-   consuming.
-3. It lands the pushes with no handle held, then acknowledges the package.
+1. For a concurrent pipeline, the worker consumes under the shared breaker handle, and a memo
+   pushes the region its own consume newly completes:
+   - `Tile::append` returns that region while the worker holds the cache lock. It excludes the
+     paths the cache already stated complete, so two workers never push one path twice.
+   - A flat keyed memo pushes the keys it has just cached, less the released keys, cut at the
+     answer's own keys where the package is larger than a morsel. Another delta of outermost keys
+     is cut at the memo's cached keys (`MemoProducer::morsels`).
+   - A package of one field of some rows is pushed as one package, uncut.
+   - A nested memo pushes the inner keys it completed, with their enclosing paths. A merge that
+     completes a row pushes the row's end, and a closure-only delivery can complete several
+     ancestor rows at once. Collections of scalar items, a selected record field among them,
+     record their completed paths in the collection statements.
+   - For other shapes, append subtracts the relevant prior coverage and releases from
+     the incoming region and the cache's completion statements. Nested record items
+     deliver their still-needed scalar fields together. Collection fields can keep growing.
+
+   The worker releases its input, then pushes its delta, even where a peer's merge has already
+   seen those paths in the cache. Two workers' deltas are disjoint because `Tile::append` returns
+   only paths the cache had not stated complete; the dispatcher subtracts the region pushed so far
+   from each push as well (`Pushes::push_region`).
+2. When another breaker needs a snapshot, the worker takes the breaker handle exclusively to run
+   `Pushes::push_final`. An ordered pipeline holds the handle exclusively through consume and
+   publication. A sink or a breaker that defers publication only consumes here.
+3. After the input release and with no breaker handle held, the worker lands the pushes and
+   acknowledges the package.
 
 A finish is claimable only once every package is acknowledged, so no claimant holds the pipeline.
 The claimant releases a concurrently consumed input whole (`Breaker::finish_parallel_input`) and

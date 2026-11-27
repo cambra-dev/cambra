@@ -1,7 +1,7 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use smol_str::SmolStr;
 
@@ -17,8 +17,8 @@ use std::sync::PoisonError;
 /// The part of a producer's tile that a `get` asks for.
 ///
 /// A projection guard is any [`TileGuard`], and a projection is the shapes a pipeline cuts a
-/// tile with: everything, nothing, the keys of one collection level that a predicate admits, and
-/// a projection per field of a record of values. Anything else is a gap the producer reports
+/// tile with, including collection keys, record fields, and the payloads of tagged values.
+/// Anything else is a gap the producer reports
 /// rather than answers with a smaller region (`src/interpreter/design-operators.md`, "Guard
 /// operations are exact").
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +56,8 @@ pub enum Projection {
         keys: Predicate,
         values: Box<Projection>,
     },
+    /// The part requested from each constructor of a tagged value, keyed by its tag.
+    Arms(TagMap<Projection>),
     /// The union of regions no one projection names, as keys of one level with different parts of
     /// their values. Construct through [`Projection::any_of`]: two or more arms, none an `Or`,
     /// everything or nothing, and no two arms one projection names.
@@ -174,6 +176,13 @@ impl Projection {
     /// The projection one arm of `guard` names: a domain guard, at the level the codomain guards
     /// around it step to.
     fn of_arm(arm: &TileGuard, guard: &TileGuard) -> Result<Self, String> {
+        if let TileGuard::Union(arms) = arm {
+            return Ok(Projection::of_arms(
+                arms.iter()
+                    .map(|(tag, arm)| Ok((tag.clone(), Projection::of(arm)?)))
+                    .collect::<Result<_, String>>()?,
+            ));
+        }
         if let TileGuard::Record(fields) = arm {
             let fields = fields
                 .iter()
@@ -244,6 +253,16 @@ impl Projection {
             Projection::Or(arms) => {
                 TileGuard::flatten_or(arms.iter().map(|arm| arm.guard(tiling)).collect())
             }
+            Projection::Arms(parts) => {
+                let Tiling::Union(arms) = tiling else {
+                    panic!("{self:?} names arms of {tiling}")
+                };
+                assert!(
+                    parts.keys().eq(arms.keys()),
+                    "arm projections match their union"
+                );
+                TileGuard::Union(arms.map(|tag, ty| parts.get(tag).unwrap().guard(ty)))
+            }
             Projection::Fields { fields: listed, .. } => {
                 let Tiling::Record(fields) = tiling else {
                     panic!("{self:?} names the fields of a record, and {tiling} is none")
@@ -277,8 +296,8 @@ impl Projection {
                     "{self:?} names part of some values, which no guard spells without their tiling"
                 )
             }
-            Projection::Fields { .. } => {
-                panic!("{self:?} names the fields of a record, which is no collection")
+            Projection::Fields { .. } | Projection::Arms(_) => {
+                panic!("{self:?} names parts of a value with no collection keys")
             }
         }
     }
@@ -336,7 +355,7 @@ impl Projection {
     /// [`Within`](Projection::Within) or an [`Or`](Projection::Or).
     pub(crate) fn field(&self, name: &str) -> Projection {
         match self {
-            part @ (Projection::Within { .. } | Projection::Or(_)) => {
+            part @ (Projection::Within { .. } | Projection::Or(_) | Projection::Arms(_)) => {
                 Projection::refuse_part_of_values("Projection::field", part)
             }
             Projection::Everything | Projection::Nothing => self.clone(),
@@ -432,6 +451,47 @@ impl Projection {
         pulled
     }
 
+    fn of_arms(parts: TagMap<Projection>) -> Projection {
+        if parts.values().all(|part| *part == Projection::Nothing) {
+            Projection::Nothing
+        } else if parts.values().all(|part| *part == Projection::Everything) {
+            Projection::Everything
+        } else {
+            Projection::Arms(parts)
+        }
+    }
+
+    fn arm(&self, tag: &FieldKey) -> &Projection {
+        match self {
+            Projection::Arms(parts) => parts
+                .get(tag)
+                .expect("a projection covers its union's tags"),
+            Projection::Everything | Projection::Nothing => self,
+            _ => panic!("{self:?} is not a projection of a tagged value"),
+        }
+    }
+
+    fn over_arms(
+        &self,
+        other: &Projection,
+        op: fn(&Projection, &Projection) -> Projection,
+    ) -> Option<Projection> {
+        let parts = match (self, other) {
+            (Projection::Arms(a), Projection::Arms(b)) => {
+                assert!(
+                    a.keys().eq(b.keys()),
+                    "both projections address the same union"
+                );
+                a
+            }
+            (Projection::Arms(parts), _) | (_, Projection::Arms(parts)) => parts,
+            _ => return None,
+        };
+        Some(Projection::of_arms(
+            parts.map(|tag, _| op(self.arm(tag), other.arm(tag))),
+        ))
+    }
+
     /// The level whose keys this projection names, `None` for everything and nothing.
     pub fn level(&self) -> Option<CurryLevel> {
         match self {
@@ -443,6 +503,9 @@ impl Projection {
 
     /// The projection of `self` within `other`: what both name.
     pub fn intersect(&self, other: &Projection) -> Projection {
+        if let Some(part) = self.over_arms(other, Projection::intersect) {
+            return part;
+        }
         if self.names_part_of_values()
             || other.names_part_of_values()
             || matches!(self, Projection::Or(_))
@@ -459,6 +522,9 @@ impl Projection {
 
     /// What `self` names that `other` does not: the region still unread after a read at `other`.
     pub fn minus(&self, other: &Projection) -> Projection {
+        if let Some(part) = self.over_arms(other, Projection::minus) {
+            return part;
+        }
         if self.names_part_of_values()
             || other.names_part_of_values()
             || matches!(self, Projection::Or(_))
@@ -476,6 +542,9 @@ impl Projection {
     /// The projection naming what either names: the region a memo has read or must read
     /// again.
     pub fn union(&self, other: &Projection) -> Projection {
+        if let Some(part) = self.over_arms(other, Projection::union) {
+            return part;
+        }
         if self.names_part_of_values()
             || other.names_part_of_values()
             || matches!(self, Projection::Or(_))
@@ -516,8 +585,8 @@ impl Projection {
                     .unwrap_or_else(|| panic!("{self:?} is read at {level}, above its own level"));
                 keys.descend(beneath)
             }
-            Projection::Fields { .. } => {
-                panic!("{self:?} names the fields of a record, which has no level of keys")
+            Projection::Fields { .. } | Projection::Arms(_) => {
+                panic!("{self:?} names parts of a value with no level of keys")
             }
         }
     }
@@ -543,8 +612,8 @@ impl Projection {
             Projection::Keys { level, keys } => {
                 Projection::keys_at(*level, tagged_at(keys, level.index(), tag))
             }
-            Projection::Fields { .. } => {
-                panic!("{self:?} names the fields of a record, which is no arm of a tagged union")
+            Projection::Fields { .. } | Projection::Arms(_) => {
+                panic!("{self:?} names parts of a value with no keys to tag")
             }
         }
     }
@@ -660,8 +729,8 @@ impl Projection {
             merged.len() < 2
                 || !merged
                     .iter()
-                    .any(|arm| matches!(arm, Projection::Fields { .. })),
-            "a union names a record's fields beside keys or part of the values at keys, which no \
+                    .any(|arm| matches!(arm, Projection::Fields { .. } | Projection::Arms(_))),
+            "a union names fields or tags beside another shape, which no \
              one tile has both of: {merged:?}"
         );
         match merged.len() {
@@ -688,7 +757,8 @@ impl Projection {
                     values: vb,
                 },
             ) => la == lb && (va == vb || ka == kb),
-            (Projection::Fields { .. }, Projection::Fields { .. }) => true,
+            (Projection::Fields { .. }, Projection::Fields { .. })
+            | (Projection::Arms(_), Projection::Arms(_)) => true,
             _ => false,
         }
     }
@@ -715,6 +785,7 @@ impl Projection {
                 true => Projection::within(level, ka.union(&kb), *va),
                 false => Projection::within(level, ka, va.union(&vb)),
             },
+            (a @ Projection::Arms(_), b @ Projection::Arms(_)) => a.union(&b),
             (a @ Projection::Fields { .. }, b @ Projection::Fields { .. }) => {
                 a.field_by_field(&b, Projection::union)
             }
@@ -727,6 +798,10 @@ impl Projection {
     fn fits(&self, tiling: &Tiling) -> bool {
         match (self, tiling) {
             (Projection::Everything | Projection::Nothing, _) => true,
+            (Projection::Arms(parts), Tiling::Union(arms)) => {
+                parts.keys().eq(arms.keys())
+                    && parts.iter().all(|(tag, p)| p.fits(arms.get(tag).unwrap()))
+            }
             (Projection::Fields { fields, .. }, Tiling::Record(record)) => fields
                 .iter()
                 .all(|(name, part)| record.get(name).is_some_and(|field| part.fits(field))),
@@ -761,9 +836,7 @@ impl Projection {
         }
     }
 
-    /// The keys holding what this projection names: each arm within some values as its keys
-    /// whole. A pull of part of some values pulls these keys and is answered with more than it
-    /// names, which is sound for a `get`.
+    /// The enclosing keys a whole-value kernel may pull before cutting its answer.
     pub fn rows(&self) -> Projection {
         Projection::any_of(self.arms().into_iter().map(|arm| match arm {
             Projection::Within { level, keys, .. } => Projection::keys_at(level, keys),
@@ -1050,7 +1123,7 @@ pub(crate) fn skeleton(guards: &[&TileGuard]) -> Option<Tiling> {
             },
             TileGuard::Record(parts) => {
                 let mut fields = match shape {
-                    None => std::collections::HashMap::new(),
+                    None => HashMap::new(),
                     Some(Tiling::Record(fields)) => fields,
                     Some(_) => return None,
                 };
@@ -1084,7 +1157,14 @@ pub(crate) fn skeleton(guards: &[&TileGuard]) -> Option<Tiling> {
                 Some(Tiling::Union(arms))
             }
             TileGuard::Scalar(_) => Some(shape.unwrap_or_else(placeholder)),
-            TileGuard::Aggregation(_) => return None,
+            TileGuard::Aggregation(_) => match shape {
+                None => Some(Tiling::Aggregation {
+                    kind: crate::ccl::AggregateKind::Sum,
+                    accumulator: Box::new(placeholder()),
+                }),
+                Some(Tiling::Aggregation { .. }) => shape,
+                Some(_) => return None,
+            },
         })
     }
     let mut shape = None;
@@ -1190,6 +1270,9 @@ fn spell(level: CurryLevel, keys: &Predicate) -> TileGuard {
 /// at level `from`, beneath `to`; an unqualified arm runs through every key above it.
 fn through_at(keys: &Predicate, from: CurryLevel, to: CurryLevel) -> Predicate {
     fn up(keys: &Predicate, levels: usize) -> Predicate {
+        if keys.is_false() {
+            return Predicate::False;
+        }
         match levels {
             0 => keys.clone(),
             _ => arms_of(keys)
@@ -1260,6 +1343,38 @@ fn within_paths(stated: &Predicate, keys: &Predicate, level: usize, depth: usize
 }
 
 impl TileGuard {
+    /// Adapt a partial-value pull for operator kernels that read complete values.
+    pub(crate) fn enclosing_rows(&self) -> Option<Self> {
+        match self {
+            TileGuard::Function(FunctionGuard::Codomain(_)) => {
+                let asked = Projection::of(self).ok()?;
+                asked
+                    .names_part_of_values()
+                    .then(|| asked.rows().collection_guard())
+            }
+            TileGuard::Record(fields) => {
+                let mut wide = None;
+                for (name, field) in fields {
+                    if let Some(rows) = field.enclosing_rows() {
+                        wide.get_or_insert_with(|| fields.clone())
+                            .insert(name.clone(), rows);
+                    }
+                }
+                wide.map(TileGuard::Record)
+            }
+            TileGuard::Or(arms) => {
+                let mut wide = None;
+                for (i, arm) in arms.iter().enumerate() {
+                    if let Some(rows) = arm.enclosing_rows() {
+                        wide.get_or_insert_with(|| arms.clone())[i] = rows;
+                    }
+                }
+                wide.map(TileGuard::flatten_or)
+            }
+            _ => None,
+        }
+    }
+
     /// The projection this guard names, for a producer that restates the outermost keys only
     /// ([`Restates::Outermost`]), or a panic naming `producer` and the guard.
     pub fn projection(&self, producer: &str) -> Projection {
@@ -1391,15 +1506,67 @@ impl Tile {
     /// only where it names a key of the tiling's domain. A union's domain carries its tags, so a
     /// statement of the arms past them names no key.
     pub fn within_over(&self, projection: &Projection, tiling: &Tiling) -> Result<(), String> {
+        if projection.names_part_of_values() || matches!(projection, Projection::Or(_)) {
+            return self.within_part(projection, tiling);
+        }
+        if matches!(projection, Projection::Fields { .. })
+            && let Tiling::Record(types) = tiling
+        {
+            let Tile::Record { fields, .. } = self else {
+                return Err("it has no fields to project".into());
+            };
+            return fields.iter().try_for_each(|(name, field)| {
+                field
+                    .within_over(&projection.field(name), &types[name])
+                    .map_err(|why| format!("its field {name}: {why}"))
+            });
+        }
         self.cells_within(projection)?;
         self.statements_within(projection, Some(tiling))
     }
 
-    /// [`within`](Self::within) for the keys and cells the tile holds.
+    /// A partial-value answer is unchanged by cutting its cells and statements to the request.
+    fn within_part(&self, projection: &Projection, tiling: &Tiling) -> Result<(), String> {
+        let mut live = self.clone();
+        live.compact();
+        let mut cut = live.clone();
+        cut.restrict_to(projection, tiling);
+        if live == cut {
+            Ok(())
+        } else {
+            Err(format!("the answer extends beyond {projection:?}"))
+        }
+    }
+
     fn cells_within(&self, projection: &Projection) -> Result<(), String> {
         match projection {
-            part @ (Projection::Within { .. } | Projection::Or(_)) => {
-                Projection::refuse_part_of_values("Tile::cells_within", part)
+            part @ (Projection::Within { .. } | Projection::Or(_) | Projection::Arms(_)) => {
+                // Standalone validation has no declared extents. Spelling a projection guard
+                // needs just the layout of collections, record fields, and leaves.
+                fn layout(tile: &Tile) -> Tiling {
+                    let extent = || Extent::Base(crate::interpreter::BaseType::Int);
+                    match tile {
+                        Tile::Scalar(_) => Tiling::Scalar(extent()),
+                        Tile::Union(arms) => Tiling::Union(arms.map(|_, arm| layout(&arm.tile))),
+                        Tile::Record { fields, .. } => Tiling::Record(
+                            fields.iter().map(|(n, f)| (n.clone(), layout(f))).collect(),
+                        ),
+                        Tile::DataFunction { codomain, .. } => {
+                            Tiling::data_function(extent(), layout(codomain))
+                        }
+                        Tile::Aggregation {
+                            kind, accumulator, ..
+                        } => Tiling::Aggregation {
+                            kind: *kind,
+                            accumulator: Box::new(layout(accumulator)),
+                        },
+                        Tile::Store { seed, .. } => Tiling::Store {
+                            domain: extent(),
+                            codomain: Box::new(layout(seed)),
+                        },
+                    }
+                }
+                self.within_part(part, &layout(self))
             }
             Projection::Everything => Ok(()),
             Projection::Fields { .. } => self.each_field_within(projection, Tile::cells_within),
@@ -1435,17 +1602,17 @@ impl Tile {
                 }
                 let mut live = self.clone();
                 live.compact();
+                // A collection field has one group per enclosing record. Its projection
+                // names paths relative to each of those groups.
+                let mut paths = vec![Vec::new(); live.rows()];
                 for depth in 0..=level.index() {
                     let at = CurryLevel::new(depth);
+                    paths = live.values_at(at).key_paths(&paths);
                     let admits = match at == *level {
                         true => keys.clone(),
                         false => through_at(keys, *level, at),
                     };
-                    if let Some(path) = live
-                        .paths_at(at)
-                        .into_iter()
-                        .find(|path| !admits.contains_path(path))
-                    {
+                    if let Some(path) = paths.iter().find(|path| !admits.contains_path(path)) {
                         return Err(format!(
                             "it holds the path {path:?}, which {admits:?} omits"
                         ));
@@ -1470,9 +1637,8 @@ impl Tile {
         }
         let stated = self.stated_completeness();
         let allowed = match projection {
-            part @ (Projection::Within { .. } | Projection::Or(_)) => {
-                Projection::refuse_part_of_values("Tile::statements_within", part)
-            }
+            // cells_within checked the complete cut, including every statement, for partial values.
+            Projection::Within { .. } | Projection::Or(_) | Projection::Arms(_) => return Ok(()),
             Projection::Everything => return Ok(()),
             Projection::Fields { .. } => unreachable!("a projection of fields returned above"),
             Projection::Nothing => vec![Predicate::False; stated.len()],
@@ -1555,13 +1721,195 @@ impl Tile {
         }
     }
 
-    /// Cut this tile to `projection`.
-    ///
-    /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
+    /// A partial record can select different leaves in different rows. Walk one guard over the
+    /// columns, keeping the parent paths and pushing ancestor completeness only into selected
+    /// leaves.
+    fn cut_guard(
+        &mut self,
+        guard: Option<&TileGuard>,
+        tiling: &Tiling,
+        rows: &[Vec<Value>],
+        whole: &Predicate,
+        closed: &Predicate,
+    ) -> Vec<bool> {
+        use super::guard::Parts;
+        let parts = Parts::of(guard);
+        match (self, tiling) {
+            (
+                tile @ Tile::DataFunction { .. },
+                Tiling::DataFunction {
+                    codomain: values, ..
+                },
+            ) => {
+                let paths = tile.key_paths(rows);
+                let Tile::DataFunction {
+                    codomain,
+                    domain_predicate,
+                    ..
+                } = tile
+                else {
+                    unreachable!()
+                };
+                let complete = domain_predicate.union(&closed.descend(1));
+                let selected = parts.domain.union(&whole.descend(1));
+                *domain_predicate = complete.intersect(&selected);
+                let child = codomain.cut_guard(
+                    parts.codomain.as_ref(),
+                    values,
+                    &paths,
+                    &selected,
+                    &complete.minus(&selected),
+                );
+                let keep: Vec<_> = paths
+                    .iter()
+                    .zip(child)
+                    .map(|(path, child)| selected.contains_path(path) || child)
+                    .collect();
+                if keep.contains(&false) {
+                    tile.retain_keys(&keep);
+                }
+                // An existing parent still holds the selected collection if its group is empty.
+                let addressed = guard.map_or(Predicate::False, TileGuard::touched_keys);
+                let parents =
+                    through_at(&addressed, CurryLevel::new(1), CurryLevel::OUTERMOST).union(whole);
+                rows.iter()
+                    .map(|path| parents.contains_path(path))
+                    .collect()
+            }
+            (Tile::Record { fields, absent }, Tiling::Record(types)) => {
+                let mut held = vec![false; rows.len()];
+                for (name, field) in fields {
+                    let part = parts.record.as_ref().and_then(|fields| fields.get(name));
+                    if field.is_row_field() || matches!(field, Tile::Union(_)) {
+                        let missing = absent.entry(name.clone()).or_default();
+                        let mask: Vec<bool> = if matches!(field, Tile::Union(_)) {
+                            // The tagged column is packed. Cut each payload using its original
+                            // row path, then put the selection back at the record's positions.
+                            let paths: Vec<_> = rows
+                                .iter()
+                                .enumerate()
+                                .filter(|(row, _)| !missing.contains(*row))
+                                .map(|(_, path)| path.clone())
+                                .collect();
+                            let whole = part.map_or_else(
+                                || whole.clone(),
+                                |g| whole.union(&super::guard::whole_rows(g)),
+                            );
+                            let selected =
+                                field.cut_guard(part, &types[name], &paths, &whole, closed);
+                            let mut selected = selected.into_iter();
+                            (0..rows.len())
+                                .map(|row| !missing.contains(row) && selected.next().unwrap())
+                                .collect()
+                        } else {
+                            let selected = whole.union(
+                                part.and_then(TileGuard::field_rows)
+                                    .unwrap_or(&Predicate::False),
+                            );
+                            rows.iter().map(|p| selected.contains_path(p)).collect()
+                        };
+                        if let Tile::Store { closures, .. } = field
+                            && !closed.is_false()
+                        {
+                            let settled: Vec<_> = rows
+                                .iter()
+                                .enumerate()
+                                .filter(|(row, _)| !missing.contains(*row))
+                                .map(|(_, path)| closed.contains_path(path))
+                                .collect();
+                            closures.close_rows(&settled);
+                        }
+                        let present = field.retain_field_rows(missing, &mask);
+                        for (held, present) in held.iter_mut().zip(present) {
+                            *held |= present;
+                        }
+                        if missing.is_empty() {
+                            absent.remove(name);
+                        }
+                    } else {
+                        let present = field.cut_guard(part, &types[name], rows, whole, closed);
+                        for (held, present) in held.iter_mut().zip(present) {
+                            *held |= present;
+                        }
+                    }
+                }
+                held
+            }
+            (Tile::Union(arms), Tiling::Union(types)) => {
+                let mut held = vec![false; rows.len()];
+                for (tag, arm) in arms.iter_mut() {
+                    let paths = arm
+                        .rows
+                        .iter()
+                        .map(|&r| rows[r].clone())
+                        .collect::<Vec<_>>();
+                    let part = parts.union.as_ref().and_then(|arms| arms.get(tag));
+                    let payload = types.get(tag).expect("tile arm belongs to its tiling");
+                    for (&r, keep) in arm
+                        .rows
+                        .iter()
+                        .zip(arm.tile.cut_guard(part, payload, &paths, whole, closed))
+                    {
+                        held[r] = keep || whole.contains_path(&rows[r]);
+                    }
+                }
+                held
+            }
+            (Tile::Scalar(_), Tiling::Scalar(_)) => {
+                let selected = whole.union(TileGuard::leaf_rows(&parts.scalar));
+                rows.iter().map(|p| selected.contains_path(p)).collect()
+            }
+            (_, Tiling::Aggregation { .. } | Tiling::Store { .. }) => {
+                rows.iter().map(|p| whole.contains_path(p)).collect()
+            }
+            _ => unreachable!("a projected tile conforms to its producer's tiling"),
+        }
+    }
+
+    /// Cut this tile to the requested values and the completeness it can restate there.
     pub fn restrict_to(&mut self, projection: &Projection, tiling: &Tiling) {
         match projection {
-            part @ (Projection::Within { .. } | Projection::Or(_)) => {
-                Projection::refuse_part_of_values("Tile::restrict_to", part)
+            Projection::Arms(parts) => {
+                let Tile::Union(arms) = self else {
+                    panic!("{projection:?} requires a tagged tile")
+                };
+                let mut keep = vec![false; arms.values().map(|arm| arm.rows.len()).sum()];
+                for (tag, arm) in arms.iter() {
+                    if *parts
+                        .get(tag)
+                        .expect("a projection covers its union's tags")
+                        != Projection::Nothing
+                    {
+                        for &row in &arm.rows {
+                            keep[row] = true;
+                        }
+                    }
+                }
+                if keep.contains(&false) {
+                    self.retain_rows(&keep);
+                }
+                let (Tile::Union(arms), Tiling::Union(types)) = (self, tiling) else {
+                    unreachable!()
+                };
+                for (tag, arm) in arms.iter_mut() {
+                    let part = parts.get(tag).unwrap();
+                    let ty = types.get(tag).unwrap();
+                    if *part == Projection::Nothing {
+                        arm.tile = ty.empty_at_no_rows();
+                    } else {
+                        arm.tile.restrict_to(part, ty);
+                    }
+                }
+            }
+            Projection::Within { .. } | Projection::Or(_) => {
+                self.state_derived();
+                self.cut_guard(
+                    Some(&projection.guard(tiling)),
+                    tiling,
+                    &[Vec::new()],
+                    &Predicate::False,
+                    &Predicate::False,
+                );
             }
             Projection::Everything => {}
             Projection::Nothing => *self = tiling.empty_tile(),
@@ -1790,12 +2138,108 @@ mod tests {
                 let deeper = path.len() - 1 - level.index();
                 keys.descend(deeper).contains_path(&path)
             }
-            Projection::Fields { .. } => unreachable!("a path of keys is no record's field"),
+            Projection::Fields { .. } | Projection::Arms(_) => {
+                unreachable!("a path of keys is no record's field")
+            }
         }
     }
 
     fn field_of_keys(name: &str, k: u64) -> Projection {
         Projection::of_field(name, Projection::admitting(key(k)))
+    }
+
+    #[test]
+    fn a_tagged_collection_delta_lands_only_its_completed_keys() {
+        let groups = FieldKey::Name("groups".into());
+        let other = FieldKey::Index(0);
+        let ints = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let ty = Tiling::Union(TagMap::from_arms(vec![
+            (groups.clone(), ints.clone()),
+            (other.clone(), ints.clone()),
+        ]));
+        let region = |tag: &FieldKey, k| {
+            TileGuard::Union(match &ty {
+                Tiling::Union(arms) => arms.map(|name, t| {
+                    if name == tag {
+                        Projection::admitting(key(k)).guard(t)
+                    } else {
+                        t.empty_guard()
+                    }
+                }),
+                _ => unreachable!(),
+            })
+        };
+        let first = region(&groups, 0);
+        let next = region(&groups, 1);
+        let other_tag = region(&other, 0);
+        let projection = |g: &TileGuard| Projection::of(g).unwrap();
+        let delivered = projection(&first);
+        assert_eq!(
+            crate::interpreter::dispatcher::pushed_guard(&delivered, &ty),
+            Some(first.clone())
+        );
+        assert_eq!(
+            delivered.intersect(&projection(&other_tag)),
+            Projection::Nothing
+        );
+        assert_eq!(
+            delivered.union(&projection(&next)).minus(&delivered),
+            projection(&next)
+        );
+        let mut tile = Tile::Union(TagMap::from_arms(vec![
+            (
+                groups.clone(),
+                crate::interpreter::UnionArmTile {
+                    rows: vec![0],
+                    tile: ints_by_position(&[11, 22], true),
+                },
+            ),
+            (
+                other,
+                crate::interpreter::UnionArmTile {
+                    rows: vec![],
+                    tile: ints.empty_at_no_rows(),
+                },
+            ),
+        ]));
+        let mut excluded = tile.clone();
+        excluded.restrict_to(&projection(&other_tag), &ty);
+        assert_eq!(excluded.rows(), 0);
+
+        let record = Tiling::Record([("variant".into(), ty.clone())].into());
+        let rows = Tiling::data_function(Extent::uint_range(16), record);
+        let mut customers = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record([("variant".into(), tile.clone())].into())),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let selection = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field("variant", projection(&next)),
+        );
+        assert_eq!(Projection::of(&selection.guard(&rows)).unwrap(), selection);
+        customers.restrict_to(&selection, &rows);
+        let Tile::DataFunction { codomain, .. } = customers else {
+            unreachable!()
+        };
+        let Tile::Record { fields, .. } = *codomain else {
+            unreachable!()
+        };
+        let Tile::Union(selected) = &fields["variant"] else {
+            unreachable!()
+        };
+        assert_eq!(int_entries(&selected.get(&groups).unwrap().tile), [(1, 22)]);
+
+        tile.restrict_to(&projection(&next), &ty);
+        let Tile::Union(arms) = tile else {
+            unreachable!()
+        };
+        assert_eq!(int_entries(&arms.get(&groups).unwrap().tile), [(1, 22)]);
     }
 
     /// The union, intersection and difference of projections of a record of values go field by
@@ -1888,6 +2332,194 @@ mod tests {
         }
     }
 
+    #[test]
+    fn omitting_a_nested_record_keeps_the_release_at_the_selected_scalar() {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record(
+                [
+                    ("id".into(), scalar.clone()),
+                    (
+                        "profile".into(),
+                        Tiling::Record([("rank".into(), scalar)].into()),
+                    ),
+                ]
+                .into(),
+            ),
+        );
+        let column = |n| Tile::Scalar(ColumnValue::Ints(vec![n]));
+        let row = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), column(7)),
+                    (
+                        "profile".into(),
+                        Tile::record([("rank".into(), column(1))].into()),
+                    ),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let projection = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field("id", Projection::Everything),
+        );
+        let mut id = row.clone();
+        id.restrict_to(&projection, &tiling);
+        assert_eq!(id.to_guard(), projection.guard(&tiling));
+        let mut rest = row.clone();
+        rest.remove_guarded(id.to_guard());
+        id.merge(rest);
+        assert_eq!(id, row);
+    }
+
+    #[test]
+    fn a_partial_record_read_preserves_only_its_requested_tagged_fields() {
+        use crate::interpreter::UnionArmTile;
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let variant = Tiling::Union(TagMap::from_positional(vec![int.clone(), int.clone()]));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record([("id".into(), int), ("variant".into(), variant)].into()),
+        );
+        let column = |values| Tile::Scalar(ColumnValue::Ints(values));
+        let arms = TagMap::from_positional(vec![
+            UnionArmTile {
+                rows: vec![0],
+                tile: column(vec![11]),
+            },
+            UnionArmTile {
+                rows: vec![1],
+                tile: column(vec![22]),
+            },
+        ]);
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![7, 8]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), column(vec![7, 8])),
+                    ("variant".into(), Tile::Union(arms)),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let field = |row, name| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                key(row),
+                Projection::of_field(name, Projection::Everything),
+            )
+        };
+        let projection = field(7, "id").union(&field(8, "variant"));
+        let mut remainder = tile.clone();
+        tile.restrict_to(&projection, &tiling);
+        assert_eq!(tile.to_guard(), projection.guard(&tiling));
+        remainder.remove_guarded(tile.to_guard());
+        assert_eq!(
+            remainder.to_guard(),
+            field(8, "id").union(&field(7, "variant")).guard(&tiling)
+        );
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            unreachable!()
+        };
+        let Tile::Record { fields, absent } = &**codomain else {
+            unreachable!()
+        };
+        assert_eq!(fields["id"], column(vec![7]));
+        assert!(absent["variant"].contains(0));
+        let Tile::Union(arms) = &fields["variant"] else {
+            unreachable!()
+        };
+        assert_eq!(arms.values().next().unwrap().rows, Vec::<usize>::new());
+        let second = arms.values().nth(1).unwrap();
+        assert_eq!(second.rows, [0]);
+        assert_eq!(second.tile, column(vec![22]));
+    }
+
+    #[test]
+    fn a_closed_empty_collection_field_keeps_its_parent_and_states_only_the_requested_path() {
+        let collection = |values| Tiling::data_function(Extent::uint_range(16), values);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let history = collection(collection(scalar.clone()));
+        let tiling = collection(Tiling::Record(
+            [("id".into(), scalar), ("history".into(), history.clone())].into(),
+        ));
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    ("history".into(), history.empty_tile()),
+                ]
+                .into(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let asked = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field(
+                "history",
+                Projection::of_path(&[Value::UInt(3), Value::UInt(2)]),
+            ),
+        );
+        tile.restrict_to(&asked, &tiling);
+        assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
+        assert_eq!(tile.to_guard(), asked.guard(&tiling));
+        assert!(tile.within_over(&asked, &tiling).is_ok());
+    }
+
+    #[test]
+    fn a_partial_pull_in_a_record_field_claims_just_that_fields_row() {
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let rows = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record([("a".into(), int.clone()), ("b".into(), int.clone())].into()),
+        );
+        let root = Tiling::Record([("items".into(), rows), ("total".into(), int)].into());
+        let items = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::record(
+                [
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+                    ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![20, 21]))),
+                ]
+                .into(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tile = Tile::record(
+            [
+                ("items".into(), items),
+                ("total".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+            ]
+            .into(),
+        );
+        let (producer, pulled, _) = ProjectionSpy::new(tile, root.clone());
+        let part = Projection::of_field(
+            "items",
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                key(1),
+                Projection::of_field("a", Projection::Everything),
+            ),
+        );
+        let requested = part.guard(&root);
+        let row = Projection::of_field("items", Projection::admitting(key(1))).guard(&root);
+        let answer = producer.get(requested.clone());
+        assert_eq!(*pulled.read().unwrap(), [row]);
+        assert_eq!(answer.to_guard(), requested);
+    }
+
     /// A record of two collection fields `a` and `b`, and the field `c` of plain values.
     fn record_of_fields() -> Tiling {
         let ints = Tiling::data_function(
@@ -1974,7 +2606,7 @@ mod tests {
 
     /// A union of a record's fields with keys names no region of one tile.
     #[test]
-    #[should_panic(expected = "a union names a record's fields beside keys")]
+    #[should_panic(expected = "a union names fields or tags beside another shape")]
     fn any_of_a_record_s_fields_and_keys_panics() {
         Projection::any_of([field_of_keys("a", 1), Projection::admitting(key(2))]);
     }

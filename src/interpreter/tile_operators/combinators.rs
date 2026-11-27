@@ -1403,15 +1403,10 @@ fn retain_answered(
     for (i, path) in input_paths.iter().enumerate() {
         match answer_at.get(path.as_slice()) {
             Some(&answer) => keep[i] = answer,
-            None => {
-                // The filter releases both sides by what it hands on, so a key the input
-                // still holds, deleted or not, is one the predicate has not let go of.
-                debug_assert!(
-                    !deleted.contains(i),
-                    "a key the input holds deleted is unanswered: {path:?}"
-                );
-                withheld.push(path)
-            }
+            // The predicate and input are read separately. A deleted input row
+            // can already be gone from the predicate and has no value to wait for.
+            None if !deleted.contains(i) => withheld.push(path),
+            None => {}
         }
     }
     input.withhold(level, &keep, &withheld);
@@ -2665,6 +2660,31 @@ mod tests {
     /// An input row the predicate has not answered yet is withheld: its entries are left out
     /// and its key out of the outer level's completeness, while the answered rows are masked
     /// by their own answers.
+    #[test]
+    fn a_filter_does_not_wait_for_a_deleted_rows_predicate() {
+        let mut input = Tile::data_function(
+            uints(&[0, 1, 2]),
+            Box::new(Tile::Scalar(uints(&[10, 11, 12]))),
+            Predicate::True,
+            [0].into_iter().collect(),
+        );
+        let paths = input.paths_at(CurryLevel::OUTERMOST);
+        retain_answered(
+            &mut input,
+            CurryLevel::OUTERMOST,
+            &paths,
+            &paths[1..2],
+            &[true],
+        );
+        assert_eq!(
+            input.paths_at(CurryLevel::OUTERMOST),
+            [vec![Value::UInt(1)]]
+        );
+        let stated = input.level_statement();
+        assert!(stated.contains(&Value::UInt(0)));
+        assert!(!stated.contains(&Value::UInt(2)));
+    }
+
     #[test]
     fn a_filter_withholds_the_rows_its_predicate_has_not_answered() {
         let rows = |codomain: Tile, complete: Predicate| {
