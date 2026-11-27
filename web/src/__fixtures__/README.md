@@ -1,18 +1,13 @@
-# Golden snapshot fixtures
+# Test payloads
 
-Real `/api/snapshot` payloads emitted by the `cambra` backend, used by
-`store.test.ts` to test the frontend's derived logic (the B5 hole→type stitch,
-cross-pane resolution) **and** to guard the wire-shape contract: if the Rust
-payload drifts from the TypeScript wire types in `../types.ts`, these tests
-break. The corpus lives in `../../../scripts/fixtures.manifest`: which program
-each fixture is dumped from, and a comment per row saying what that row pins. It
-is shared by `regen-fixtures.sh`, the ci.sh drift gate, and the cargo golden
-tests (`tests/it/inspector_goldens.rs`), so a row and the thing it describes move
-together.
-
-Every fixture is the full live wire. A program too large or too volatile to pin
-byte-for-byte gets no fixture at all and a structural assertion over a fresh dump
-instead, in `tests/it/inspector_goldens.rs`.
+The frontend's tests read real `/api/snapshot` payloads: the `--dump-snapshot`
+output of every gallery program (`tests/programs/`). Vitest's global setup
+(`dumps.ts`) dumps them before any test runs, by running `write_gallery_snapshots`
+in `tests/it/inspector_wire.rs` through `cargo test`, into
+`target/inspector-snapshots/`. A test reads one with `dumped("<program>")` from
+`helpers.ts`, and `fixture` validates it against `wireValidate.ts`, so a payload
+that drifts from the TypeScript wire types in `../types.ts` fails there.
+`wireValidate.test.ts` validates every dumped program.
 
 A successful **live** payload carries one entry of `panes` per declared pane, in
 pipeline order — `pre-inference` (kind `holes`), then `post-inference` (kind
@@ -59,25 +54,12 @@ subscription, stored on the consumer: `subscribed` names the operator it holds a
 calls `get` on, so the relation runs against dataflow. `notify` runs the other
 way.
 
-## Regenerating
+## Dumping
 
-```bash
-web/scripts/regen-fixtures.sh   # from the cambra/ repo root
-```
-
-This wraps the per-example `--dump-snapshot` dumps (one-shot — it does **not**
-start the never-exiting HTTP server) and pretty-prints each fixture for
-reviewable diffs. Regenerate after any backend change to the snapshot schema and
-commit the result; CI fails if the committed fixtures drift from the backend
-(the `ci_fixtures` gate in `ci.sh` regenerates to a temp dir and diffs), and the
-cargo golden test compares each committed fixture against a fresh dump.
-`store.test.ts` keys its assertions on node **labels/types**, not raw NodeIds, so
-ordinary id churn does not require touching the tests — but a shape change will,
-by design (and `wireValidate.ts` enforces the shape).
-
-A re-bless pins more than the shape, and every diff in one has to be classified
-before it is committed: see
-[The golden fixtures](../../CLAUDE.md#the-golden-fixtures).
+`CAMBRA_SNAPSHOT_PROFILE` names the cargo profile `dumps.ts` dumps with, so CI
+reuses the build its suite made; unset, it is the default test profile. A test
+keys its assertions on what a payload means (pane ids, node labels, types), not
+on `NodeId`s, which come from a process-global counter.
 
 ## The probe frame
 

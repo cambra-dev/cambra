@@ -1,31 +1,20 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this directory — the inspector's `web/` frontend and its golden-fixture corpus. The Rust half lives in the `cambra` crate at `src/inspector_model/` and `src/inspector_server/`.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this directory — the inspector's `web/` frontend and its tests. The Rust half lives in the `cambra` crate at `src/inspector_model/` and `src/inspector_server/`.
 
-## The golden fixtures
+## The tests' payloads
 
-`web/src/__fixtures__/*.snapshot.json` are full `/api/snapshot` payloads for the
-corpus in `scripts/fixtures.manifest` — shared by the regen script, the
-`ci_fixtures` byte gate, and `tests/it/inspector_goldens.rs`. Re-bless via:
+The tests read the `/api/snapshot` payload of every gallery program
+(`tests/programs/`), dumped fresh before they run: vitest's global setup
+(`src/__fixtures__/dumps.ts`) runs `write_gallery_snapshots` in
+`tests/it/inspector_wire.rs` through `cargo test`. `CAMBRA_SNAPSHOT_PROFILE`
+names the cargo profile to dump with; unset, it is the default test profile.
+A test reads a payload with `dumped("<program>")` from `src/__fixtures__/helpers.ts`.
 
-```bash
-web/scripts/regen-fixtures.sh   # from the repo root
-```
-
-**Re-bless discipline:** classify every diff into a named, explained class
-before committing — id renumbering vs label rename vs structural change —
-and state the classes in the commit message. A diff you cannot explain is a
-bug, not a re-bless: stop and investigate. `NodeId` is a process-global mint
-counter, so anything shifting upstream mint *counts* renumbers every later id
-and rewrites the whole corpus; that diff is expected and still has to be named
-as that.
-
-**What a re-bless pins, beyond the shape.** Each node's `type` is `Display for
-Type`'s rendering — `src/ccl/ty.rs`'s `Serialize` hands `collect_str` that
-string — so the corpus pins the type notation on every node in every pane. A
-literal's singleton spelling is part of that, and an operator node's `tiling` is
-`Display for Tiling`'s rendering the same way. Changing either notation is a
-deliberate corpus-wide re-bless.
+A test keys on what a payload means, such as pane ids, node labels and types, and
+never on a `NodeId`: ids come from a process-global counter and carry no meaning
+across compiler changes. Each node's `type` is `Display for Type`'s rendering
+(`src/ccl/ty.rs`), so a test that asserts a type asserts that notation.
 
 ## Frontend
 
@@ -41,8 +30,8 @@ deliberate corpus-wide re-bless.
 
 The Rust validator (`src/inspector_server/wire_check.rs`) and the TypeScript
 validator (`web/src/wireValidate.ts`) assert the same contract and are always
-updated together. A schema change means: update both validators, regenerate fixtures
-(classified), rebuild the bundle.
+updated together. A schema change means: update both validators and `src/types.ts`,
+then rebuild the bundle.
 
 `SCHEMA_VERSION` stays at 1 through all of it. Nothing durable consumes the
 payload — this frontend is rebuilt from this repo — so a breaking change costs

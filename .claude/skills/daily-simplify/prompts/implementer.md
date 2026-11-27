@@ -82,7 +82,7 @@ hard-wrapping Markdown at 100 columns.
    - `scope-creep`: you need a file outside the budget, the diff outside `tests/` passes
      {{MAX_LINES}} lines, or you need a new abstraction the candidate did not describe.
    - `behaviour-change`: an existing test fails for a reason other than a typo in your edit; any
-     inspector golden fixture or pinned expectation moves; or any diagnostic text, `Display`
+     pinned expectation moves, the frontend tests' included; or any diagnostic text, `Display`
      output or iteration order changes.
    - `gate-failure`: five fix rounds without `./ci.sh fast` going green.
    - `not-simpler`: the finished code does not read simpler. This includes the case where it has

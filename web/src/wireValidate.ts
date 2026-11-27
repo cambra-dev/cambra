@@ -1,6 +1,6 @@
 // Runtime validator for the `/api/snapshot` wire shape.
 //
-// The fixtures (and, in production, the fetched payload) are untyped JSON. A
+// The tests' payloads (and, in production, the fetched one) are untyped JSON. A
 // bare `json as Snapshot` cast gives zero runtime checking, so a backend wire
 // drift surfaces only as a confusing downstream crash. `validateSnapshot` walks
 // the required keys and types of the Snapshot shape and throws an Error naming
@@ -18,8 +18,8 @@
 // `value` edge subscribes, derived; and every node's `rewritten` tag stays inside the pinned
 // vocabulary. Extend both validators together.
 //
-// One contract, no relaxations: a committed fixture is a whole payload document,
-// so a fixture and a live payload are validated on identical terms.
+// One contract, no relaxations: the tests' payloads are whole dumps, so a dump
+// and a live payload are validated on identical terms.
 
 import type {
   IrChild,

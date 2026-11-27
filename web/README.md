@@ -94,7 +94,7 @@ and can hold live content.
 npm install
 npm run build      # tsc --noEmit, then vite build -> dist/index.html
 npm run typecheck  # tsc --noEmit only
-npm run test       # vitest run (offsets + indices unit tests)
+npm run test       # vitest run; its setup dumps every gallery program through `cargo test`
 npm run dev        # local Vite dev server (proxy /api to a running inspector)
 ```
 
@@ -103,7 +103,9 @@ npm run dev        # local Vite dev server (proxy /api to a running inspector)
 ## Tests
 
 The correctness-critical pure functions are unit-tested with **vitest** (run in
-CI via `./ci.sh web`):
+CI via `./ci.sh web`). Vitest's setup first dumps every gallery program's payload
+through `cargo test` (`src/__fixtures__/dumps.ts`), so a run needs `cargo`, and the
+first one builds the Rust test suite unless that build is already in place:
 
 - `offsets.test.ts` — the byte↔char bridge, round-trips on multi-byte (`café`,
   `×`) and astral (emoji surrogate-pair) input.
@@ -113,7 +115,7 @@ CI via `./ci.sh web`):
 - `links.test.ts` — the cross-pane resolver: identity adjacency (both
   directions), mono fan-out edges (1→N, transitive to sibling clones),
   source-span projection/dedup, and graceful degradation on unknown seeds.
-- `store.test.ts` — over golden fixtures: the B5 hole→type stitch, cross-pane
+- `store.test.ts` — over gallery programs' payloads: the B5 hole→type stitch, cross-pane
   resolution, and the wire-shape contract (including `meta.schema === 1`).
 - `sourceView.test.ts` — the pure gesture logic `hoverPayloadAt` (label / type
   set / provenance / goto-def name) and `resolveSourceClick` (plain vs.
@@ -121,7 +123,7 @@ CI via `./ci.sh web`):
 - `main.test.ts` — the byte-based `byteLineStarts`/`lineCol`/`formatSpan`
   arithmetic, `serializeDiagnostics` (the Diagnostics pane's copy text, asserted
   against the same `diagnosticLines` the pane renders from), and a jsdom
-  degraded-render test over `failed.snapshot.json`.
+  degraded-render test over `type_error`'s payload.
 - `treeView.test.ts` — `resolvedTypeTooltip`, and `serializeTree`: the copy
   grammar row by row, the two-space indent, the omitted refinement-predicate
   subtrees, and a fixture case pinning one line per rendered node.

@@ -922,11 +922,11 @@ path, and text. The `file` of every `span` on the wire indexes `sources`
 at a time, with a file list. Clicking a node in another pane opens the file its span points into. A
 node of a member also names its run.
 
-This moves every golden wire fixture. The re-bless procedure is in
-[web/CLAUDE.md](../web/CLAUDE.md). Until then, a program of several modules gets the degraded
-payload, with a diagnostic saying the inspector shows one file. The std root's files do not count:
-a program of one module and the std modules it reaches gets the full payload, and a node's spans in
-a std module's file do not ship.
+This changes the wire shape, so both validators change with it
+([web/CLAUDE.md](../web/CLAUDE.md#wire-shape-changes)). Until then, a program of several modules
+gets the degraded payload, with a diagnostic saying the inspector shows one file. The std root's
+files do not count: a program of one module and the std modules it reaches gets the full payload,
+and a node's spans in a std module's file do not ship.
 
 ---
 

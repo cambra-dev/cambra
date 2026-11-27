@@ -11,12 +11,12 @@ cargo fmt        # Run formatter
 cargo build      # Build the project
 cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inner-loop check, NOT the full gate
 cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
-./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + the `z3` check + tests over every workspace member, plus the frontend's typecheck and vitest. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, the fixtures gate, the editor grammars, and the vendored-bundle freshness check. ~1/3 the time of the full gate — use this while iterating.
+./ci.sh fast     # Inner-loop gate: fmt + debug clippy (lib/bins) + the `z3` check + tests over every workspace member, plus the frontend's typecheck and vitest. Skips the release clippy pass, doc, shellcheck, doc-refs, formal, the editor grammars, and the vendored-bundle freshness check. ~1/3 the time of the full gate — use this while iterating.
 ./ci.sh formal   # The Lean model (formal/): `lake build` — which elaborates every theorem and evaluates every #guard — then the differential oracles. Skips loudly with no `lake` on PATH; fails instead under CI.
 ./ci.sh solver   # Checks for `z3` on PATH. Refinement subtyping runs queries against it, so without it the suite is red; this reports it once instead of as dozens of unrelated failures. Runs inside `fast` and the full gate.
 ./ci.sh editors  # The editor grammars (`editors/`) against the lexer: the TextMate grammar under Node, the Vim syntax file under headless Neovim, and the inspector's source-pane highlighting (`web/src/cambraSyntax.ts`) under Node, over every `.cambra` file, each editor's indentation against `editors/indent-cases.json`, and the language server through Neovim's client. Skips loudly per editor with no `node` or `nvim` on PATH; fails instead under CI. Part of the full gate, not of `fast`.
 ./ci.sh vscode   # The language server through VS Code's client and the extension in `editors/vscode/`, in a headless VS Code that the first run downloads (about 1 GB). Runs in CI's `editors` job, not in the local full gate. Pins the VS Code version (`CAMBRA_VSCODE_VERSION`, default in `ci_vscode`).
-./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + fixtures, auto-formatting first. Run when asked; GitHub CI runs the same gates on every push.
+./ci.sh --fix    # Authoritative gate: fmt + ALL THREE clippy passes + doc + formal + tests + the frontend, auto-formatting first. Run when asked; GitHub CI runs the same gates on every push.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
@@ -297,8 +297,6 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. **Before creating or pushing a PR, run `./ci.sh fast` and confirm it is clean** (fmt + debug clippy + the frontend's typecheck and tests + the Rust suite, roughly a third of the full gate's time). Run the full `./ci.sh` only when asked. GitHub CI runs every gate on each push, including the parts `fast` skips: the release and lib-only clippy configurations, the doc build, the suite with `debug_assertions` off, the vendored-bundle freshness check in `ci_web`, and the `formal` gate (the Lean model plus its differential oracles). A green `fast` does not guarantee a green CI run; read the PR's checks after pushing.
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
-
-The inspector crate has its own pinned-expectation suite (the golden wire fixtures) with a re-bless procedure; see `web/CLAUDE.md` before touching anything that moves it. Anything that changes `Display for Type`, or that shifts how many `NodeId`s a phase mints, moves the whole corpus.
 
 ### Compact instructions
 

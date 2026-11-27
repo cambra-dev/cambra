@@ -22,30 +22,35 @@ import type { GraphLayout, LayoutRequest, Placed } from "./graph/layout";
 import type { Selection } from "./store";
 import type { OperatorPane, Snapshot } from "./types";
 
-import { fixture, irPaneById, operatorPaneById, stubLayout } from "./__fixtures__/helpers";
+import {
+  allDumped,
+  dumped,
+  fixture,
+  irPaneById,
+  operatorPaneById,
+  stubLayout,
+} from "./__fixtures__/helpers";
 
-import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
-import deferLiftJson from "./__fixtures__/defer_lift.snapshot.json";
-import listMinJson from "./__fixtures__/list_min.snapshot.json";
-import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
-import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
+const listMinJson = dumped("list_min");
+const polymorphicJson = dumped("polymorphic");
+const sourceSharedJson = dumped("source_shared");
 
-// `polymorphic` is the fixture with a fanned-out graph: three walk starts and
+// `polymorphic` is the program with a fanned-out graph: three walk starts and
 // a `share` edge into one of them. `list_min` is the degenerate one — one
 // walk start, all value edges.
 const polymorphic = fixture(polymorphicJson);
 const listMin = fixture(listMinJson);
-// The only fixture with a `Source` node, and so the only one that pins a node
-// nothing subscribes getting a row.
+// A program that reads a source, whose reads start at input-free
+// `IterateExtent`s.
 const sourceShared = fixture(sourceSharedJson);
-// Every committed fixture with an operator graph. `failed` has none.
-const withOperators: [string, Snapshot][] = [
-  ["arithmetic", fixture(arithmeticJson)],
-  ["defer_lift", fixture(deferLiftJson)],
-  ["list_min", listMin],
-  ["polymorphic", polymorphic],
-  ["source_shared", sourceShared],
-];
+// Every gallery program with an operator graph. A program that does not compile
+// has none.
+const withOperators: [string, Snapshot][] = allDumped()
+  .map(([file, json]): [string, Snapshot] => [
+    file.replace(/\.snapshot\.json$/, ""),
+    fixture(json),
+  ])
+  .filter(([, snap]) => snap.panes.some((p) => p.kind === "operators"));
 
 /**
  * A layout that places every node on its own row, in the order given.
@@ -153,7 +158,7 @@ describe("OperatorView", () => {
     const suppressed = pane.nodes
       .filter((n) => n.label === "FanOutSlot" || n.label === "Constant")
       .map((n) => n.nodeId);
-    // Something was suppressed, or this fixture would not exercise the rule.
+    // Something was suppressed, or this program would not exercise the rule.
     expect(suppressed.length).toBeGreaterThan(0);
     for (const id of suppressed) expect(boxes).not.toContain(id);
     // ...and every one of them is still an element a selection can land on.
@@ -283,8 +288,8 @@ describe("OperatorView", () => {
   });
 });
 
-describe("every committed fixture", () => {
-  // The model's two guarantees, over every operator graph the corpus pins
+describe("every gallery program", () => {
+  // The model's two guarantees, over every operator graph the gallery has
   // rather than the one a test happened to pick.
   it.each(withOperators)("%s: draws every id once and lays out no cycle", async (_, snap) => {
     const { body, pane } = await mountGraph(snap, "post-conversion");
@@ -372,10 +377,9 @@ describe("a graph that reads a source", () => {
 });
 
 describe("a back edge and a late one", () => {
-  // No committed fixture carries either: the programs that hold a store are
-  // asserted structurally in `tests/it/inspector_goldens.rs` rather than pinned
-  // whole. So the shapes are built by hand, after the ones
-  // `assert_store_edge_shapes` pins on the Rust side.
+  // The shapes are built by hand, after the ones `assert_store_edge_shapes`
+  // pins on the Rust side (`tests/it/inspector_wire.rs`), so each case holds
+  // the one edge it is about.
   const op = (
     nodeId: number,
     label: string,

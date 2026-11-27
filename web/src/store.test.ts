@@ -1,5 +1,5 @@
-// Store-level tests over **golden `/api/snapshot` fixtures** produced by the
-// real backend (`cambra <program> --dump-snapshot`, see
+// Store-level tests over `/api/snapshot` payloads of gallery programs, dumped
+// fresh by the real backend (`cambra <program> --dump-snapshot`, see
 // `__fixtures__/README.md`). `Store` is DOM-free, so it constructs and resolves
 // in plain vitest. These cover:
 //   - T1: the B5 hole -> downstream-type stitch (`resolvedTypesFor`);
@@ -16,17 +16,17 @@ import { describe, expect, it } from "vitest";
 import { Store } from "./store";
 import { isIrPane } from "./types";
 import { PANE_IDS } from "./wireValidate";
-import { allNodes, fixture, irPaneById, theNode } from "./__fixtures__/helpers";
+import { allNodes, dumped, fixture, irPaneById, theNode } from "./__fixtures__/helpers";
 
-import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
-import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
+const arithmeticJson = dumped("udf_closure");
+const polymorphicJson = dumped("polymorphic");
 
 const arithmetic = fixture(arithmeticJson);
 const polymorphic = fixture(polymorphicJson);
 
 const sorted = (xs: string[]): string[] => [...xs].sort();
 
-describe("T3: wire-shape contract (golden fixture matches the TS types)", () => {
+describe("T3: wire-shape contract (a real payload matches the TS types)", () => {
   for (const [name, snap] of [
     ["arithmetic", arithmetic],
     ["polymorphic", polymorphic],
