@@ -83,7 +83,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
     // the rule that reads it pays for it: a label spells the node's whole subtree, so one per
     // node is quadratic in the tree.
     let label = match &expr.node {
-        TypedExprNode::Case { .. } => symbolic(expr),
+        TypedExprNode::Case { .. } => {
+            crate::ccl::symbolic::symbolic_in(&crate::ccl::ty::RenderCtx::new(ctx.solver()), expr)
+        }
         _ => String::new(),
     };
     // The literal's own id, taken before the walk borrows the node — the node the

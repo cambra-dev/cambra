@@ -11,6 +11,7 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::module_type::AliasType;
+use crate::ccl::ty::RenderCtx;
 use crate::ccl::{
     ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
     TypedExprNode, UnaryOpKind, ccl_utils::is_trivially_true_predicate, source_projection_label,
@@ -167,9 +168,9 @@ impl<'a> PiBinderEnv<'a> {
     }
 }
 
-/// Options for configuring the output of `symbolic`
-#[derive(Default)]
-struct SymbolicOpts<'a> {
+/// Options for configuring the output of `symbolic`, and what it reads variables through.
+struct SymbolicOpts<'a, 'r> {
+    ctx: &'a RenderCtx<'r>,
     show_types: bool,
     /// The Pi binders the enclosing type rendering is inside of. Set only when
     /// [`Display for Type`](crate::ccl::Type) reaches a refinement predicate
@@ -178,43 +179,69 @@ struct SymbolicOpts<'a> {
     pi_binders: Option<&'a PiBinderEnv<'a>>,
 }
 
-/// Render a CCL expression as a symbolic string.
+impl<'a, 'r> SymbolicOpts<'a, 'r> {
+    fn new(ctx: &'a RenderCtx<'r>) -> Self {
+        SymbolicOpts {
+            ctx,
+            show_types: false,
+            pi_binders: None,
+        }
+    }
+}
+
+/// Render a CCL expression as a symbolic string, outside every run: a variable reads as
+/// minted ([`RenderCtx::detached`]).
 pub fn symbolic(expr: &Expr) -> String {
-    fmt(expr, Precedence::Lowest, &SymbolicOpts::default())
+    symbolic_in(&RenderCtx::detached(), expr)
+}
+
+/// [`symbolic`], reading variables through `ctx`.
+pub fn symbolic_in(ctx: &RenderCtx<'_>, expr: &Expr) -> String {
+    fmt(expr, Precedence::Lowest, &SymbolicOpts::new(ctx))
 }
 
 /// [`symbolic`], with a statement (`let`, `letrec`, `x := …`, …) rendered without its
 /// continuation: the node a diagnostic blames, not the rest of the program after it.
 pub fn symbolic_head(expr: &Expr) -> String {
-    let opts = SymbolicOpts::default();
+    let ctx = RenderCtx::detached();
+    let opts = SymbolicOpts::new(&ctx);
     match statement_head(expr, &opts) {
         Some((head, _)) => head,
         None => fmt(expr, Precedence::Lowest, &opts),
     }
 }
 
-/// Render a CCL expression as a symbolic string.
+/// Render a CCL expression as a symbolic string, with each node's type.
 pub fn symbolic_typed(expr: &Expr) -> String {
+    symbolic_typed_in(&RenderCtx::detached(), expr)
+}
+
+/// [`symbolic_typed`], reading variables through `ctx`.
+pub fn symbolic_typed_in(ctx: &RenderCtx<'_>, expr: &Expr) -> String {
     fmt(
         expr,
         Precedence::Lowest,
         &SymbolicOpts {
             show_types: true,
-            ..SymbolicOpts::default()
+            ..SymbolicOpts::new(ctx)
         },
     )
 }
 
 /// [`symbolic`] for a refinement predicate reached through `binders` functions,
 /// so a reference to one of them prints as that function's binder name rather than as
-/// its index. Called by `Display for Type`.
-pub(crate) fn symbolic_under(expr: &Expr, binders: Option<&PiBinderEnv<'_>>) -> String {
+/// its index. Called by `Display for Type`, with the context it renders in.
+pub(crate) fn symbolic_under(
+    expr: &Expr,
+    binders: Option<&PiBinderEnv<'_>>,
+    ctx: &RenderCtx<'_>,
+) -> String {
     fmt(
         expr,
         Precedence::Lowest,
         &SymbolicOpts {
-            show_types: false,
             pi_binders: binders,
+            ..SymbolicOpts::new(ctx)
         },
     )
 }
@@ -226,8 +253,11 @@ pub(crate) fn symbolic_under(expr: &Expr, binders: Option<&PiBinderEnv<'_>>) -> 
 /// A type slot inside a term, rendered in the term's binder environment. The
 /// slot may itself carry a reference to a function the enclosing type rendering
 /// descended through, so it takes the same environment the predicate does.
-fn ty_at<'a>(ty: &'a Type, opts: &'a SymbolicOpts<'a>) -> crate::ccl::ty::TypeUnder<'a, 'a> {
-    crate::ccl::ty::TypeUnder(ty, opts.pi_binders)
+fn ty_at<'a, 'r>(
+    ty: &'a Type,
+    opts: &'a SymbolicOpts<'a, 'r>,
+) -> crate::ccl::ty::TypeUnder<'a, 'a, 'r> {
+    crate::ccl::ty::TypeUnder(ty, opts.pi_binders, opts.ctx)
 }
 
 /// What a type alias names, rendered as [`ty_at`] renders a type, a Module

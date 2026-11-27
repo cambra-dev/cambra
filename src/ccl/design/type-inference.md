@@ -1703,10 +1703,15 @@ this run records on it, and what this run records stays in this solver. A type o
 every run takes `Solver::none()`, which panics on reaching an inference or barrier variable, or a
 funkind variable that a solver minted. A funkind variable no solver minted reads as unrecorded
 through it. The type operations most used outside a run have a form that passes it: `Type::pi`
-takes no solver, and `Type::pi_in` takes the run's. A rendering without its run, a type's
-`Display`, takes `Solver::detached()`, through which each variable reads as minted, with nothing
-recorded on it. The rendering may mint variables of its own, as resolving a type does, and record
-on those; recording on any other variable through it panics.
+takes no solver, and `Type::pi_in` takes the run's. A rendering takes a `RenderCtx` (`ty.rs`),
+which reads through a solver for each rendering question and never hands the solver out. Inside a
+run it reads through the run's, so a type renders what the run has recorded on its variables
+(`symbolic_in`, `Type::rendered_in`, `chl_print::Writer::ty_with`). A rendering without its run,
+a type's `Display`, takes `RenderCtx::detached()`. Its solver is detached: each variable reads
+through it as minted, with nothing recorded on it. The rendering may mint variables of its own, as
+resolving a type does, and record on those; recording on any other variable through it panics.
+`RenderCtx::detached` is the only code that makes a detached solver, so no pass other than a
+rendering reads through one.
 
 #### A run closes what it hands back
 

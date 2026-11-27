@@ -20,7 +20,7 @@ use crate::ccl::infer::solver::var::{Recorded, Solved, SolverVar, VarTable};
 use crate::ccl::infer_var::{
     Barrier, BarrierState, BarrierVar, InferState, InferVar, InferVarId, SuspendedMemberships,
 };
-use crate::ccl::ty::{FunKind, FunKindState, FunKindVar};
+use crate::ccl::ty::{FunKind, FunKindState, FunKindVar, RenderCtx};
 
 /// Identity of a [`Solver`], so a handle can tell the solver that minted it from any other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -137,6 +137,16 @@ pub struct Solver {
     pub(crate) fixed_compactions: Option<crate::ccl::infer::solver::compact::FixedCompactions>,
 }
 
+/// The only code that makes a detached solver, so a rendering is the only reader of one: no
+/// [`RenderCtx`] hands its solver out.
+impl RenderCtx<'static> {
+    /// A context rendering outside every run, through a detached solver it owns
+    /// ([`Solver::detached`]).
+    pub(crate) fn detached() -> Self {
+        RenderCtx::owning(Solver::detached())
+    }
+}
+
 impl Default for Solver {
     fn default() -> Self {
         Self::new()
@@ -174,12 +184,12 @@ impl Solver {
         solver
     }
 
-    /// The solver a rendering outside its run reads through ([`std::fmt::Display`] of a type):
-    /// each variable reads as minted, with nothing recorded on it. A rendering shows what a type
-    /// holds, and what a run recorded on its variables only through that run's solver. It may
-    /// mint variables of its own, as resolving a type does, and record on those; recording on any
-    /// other variable through it panics.
-    pub fn detached() -> Self {
+    /// The solver a rendering outside its run reads through ([`RenderCtx::detached`], the only
+    /// code that makes one): each variable reads as minted, with nothing recorded on it. A
+    /// rendering shows what a type holds, and what a run recorded on its variables only through
+    /// that run's solver. It may mint variables of its own, as resolving a type does, and record
+    /// on those; recording on any other variable through it panics.
+    fn detached() -> Self {
         let mut solver = Self::new();
         solver.detached = true;
         solver
