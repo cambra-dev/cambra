@@ -209,7 +209,7 @@ pub fn run(expr: Expr) -> Expr {
 /// only: a write left in the definiens is scoped to it and never reaches the
 /// statements after the call. A binding over a `body` with none of the three
 /// stays, since nothing in this phase reads into it.
-fn peel_effectful_outputs(mut expr: Expr) -> Expr {
+pub(crate) fn peel_effectful_outputs(mut expr: Expr) -> Expr {
     expr.map_children(peel_effectful_outputs);
     match opaque_output::output_body(&expr) {
         Some(body) if holds_loop(body) || writes(body) || feeds(body) => opaque_output::peel(expr),
@@ -357,7 +357,7 @@ fn is_mut_write(e: &Expr) -> bool {
 /// A lambda's body is not a loop body's spine even inside one: a feed-only loop nested in a
 /// loop body is a lambda whose feeds `channelize` takes.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Spine {
+pub(crate) enum Spine {
     OutsideLoops,
     LoopBody,
 }
@@ -850,7 +850,7 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
 /// never meet one in value position. The one exception is a `Let`-bound writing `Case`,
 /// which stays bound inside a writer body ([`Spine::LoopBody`]) for `WriterWalk` to merge,
 /// and outside one where it merges in place for `rewrite` ([`merges_in_place`]).
-fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
+pub(crate) fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
     // As in `push_writing_cases`: a loop body is a writer body, whose `Let`-bound writing
     // `Case` the writer walk merges where it stands.
     if let TypedExprNode::For { iter, body, .. } = &mut e.node {
@@ -929,9 +929,12 @@ fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
     // Hoist mutable writes out of a value-position writer body bound by a `Let`
     // (`y = f(c)`). `Spine::performs` fires for a genuine writer body only —
     // one that heads the write, sequences it after siblings, or computes an
-    // intermediate first — never for a pure `Let`.
+    // intermediate first — never for a pure `Let`. A `with begin():` block in value position
+    // stays bound: its writes commit together with its value, and `crate::ccl::transact_phase`
+    // compiles it where it stands.
     if let TypedExprNode::Let { bound_expr, .. } = &e.node
         && spine.performs(bound_expr)
+        && !matches!(bound_expr.node, TypedExprNode::Begin { .. })
         && !(matches!(bound_expr.node, TypedExprNode::Case { .. })
             && (spine == Spine::LoopBody || merges_in_place(bound_expr)))
     {
