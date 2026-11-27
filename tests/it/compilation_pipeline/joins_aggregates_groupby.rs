@@ -188,6 +188,25 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+/// A key function whose filtered comprehension reads a binding outside the group-by. The
+/// comprehension's type names that binding, so the partition planning builds reads it too.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+// Keys 5, 3, 0, 0: groups {1}, {2}, {3, 4}.
+#[case::filtered_by_the_element(indoc! {r"
+    ys = [1, 2, 3]
+    sum([max(g) for g in groupby([1, 2, 3, 4], \x -> sum([z for z in ys if z > x]))])
+"}, 7)]
+// Keys 3, 4, 4, 5: groups {1}, {2, 3}, {4}.
+#[case::filtered_by_another_binding(indoc! {r"
+    ys = [1, 2, 3]
+    k = 2
+    sum([max(g) for g in groupby([1, 2, 3, 4], \x -> sum([z for z in ys if z > k]) + x // 2)])
+"}, 8)]
+fn a_group_by_key_filters_a_binding_outside_it(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
 // A group-by whose element type is a singleton refinement (`[1]`, `[1, 1]`) keys the same
 // as one whose elements only share a base type (`[1, 2]`). The singleton rides the group
 // key's lower bounds, which a domain's reading meets

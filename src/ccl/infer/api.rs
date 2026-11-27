@@ -3632,6 +3632,17 @@ pub(crate) fn typecheck_in(
     crate::ccl::infer::check::check_located(expr, instances, mode).map_err(unlocated)
 }
 
+/// [`typecheck_in`] of a term that reads binders outside it, with each in scope
+/// ([`crate::ccl::infer::check::check_fragment_located`]).
+pub(crate) fn typecheck_fragment(
+    expr: &Expr,
+    instances: &Rc<InstanceTable>,
+    mode: CheckMode,
+) -> Result<(), Vec<InferError>> {
+    check_fully_typed(expr)?;
+    crate::ccl::infer::check::check_fragment_located(expr, instances, mode).map_err(unlocated)
+}
+
 /// [`typecheck`] for planning's output, at [`Strictness::Planned`], where a refinement predicate
 /// holding a `defer` is an error, and against the types of the registered data sources, which
 /// also verifies the type of each projected source and reports a path through a field its
