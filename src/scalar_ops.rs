@@ -168,6 +168,30 @@ fn zip_views<T, R: Clone>(
                 out.extend(repeat_n(f(a, b), len));
             }
         }
+        (View::Selected { values, positions }, View::Constant { value, .. }) => {
+            out.extend(positions.iter().map(|&p| f(&values[p], value)));
+        }
+        (View::Constant { value, .. }, View::Selected { values, positions }) => {
+            out.extend(positions.iter().map(|&p| f(value, &values[p])));
+        }
+        (View::Selected { values, positions }, View::Slice(r)) => {
+            out.extend(positions.iter().zip(r).map(|(&p, b)| f(&values[p], b)));
+        }
+        (View::Slice(l), View::Selected { values, positions }) => {
+            out.extend(l.iter().zip(positions).map(|(a, &p)| f(a, &values[p])));
+        }
+        (
+            View::Selected {
+                values: lv,
+                positions: lp,
+            },
+            View::Selected {
+                values: rv,
+                positions: rp,
+            },
+        ) => {
+            out.extend(lp.iter().zip(rp).map(|(&a, &b)| f(&lv[a], &rv[b])));
+        }
     }
 }
 
@@ -261,6 +285,36 @@ pub(crate) fn zip_bool_logic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pairing of a selection with a slice, a repeated value or another selection gives the
+    /// result the same values give as slices.
+    #[test]
+    fn a_selection_combines_with_every_view() {
+        let left = [10_i64, 20, 30, 40];
+        let right = [1_i64, 2, 3, 4];
+        let (lp, rp) = ([3, 1, 0], [0, 2, 3]);
+        let lsel = View::Selected {
+            values: &left,
+            positions: &lp,
+        };
+        let rsel = View::Selected {
+            values: &right,
+            positions: &rp,
+        };
+        let (lflat, rflat) = ([40_i64, 20, 10], [1_i64, 3, 4]);
+        let two = 2;
+        let sum = |l: View<'_, i64>, r: View<'_, i64>| {
+            let mut out = Vec::new();
+            zip_arithmetic(ArithmeticKind::Sub, l, r, &mut out);
+            out
+        };
+        let want = |l: &[i64], r: &[i64]| l.iter().zip(r).map(|(a, b)| a - b).collect::<Vec<_>>();
+        assert_eq!(sum(lsel, rsel), want(&lflat, &rflat));
+        assert_eq!(sum(lsel, View::Slice(&rflat)), want(&lflat, &rflat));
+        assert_eq!(sum(View::Slice(&lflat), rsel), want(&lflat, &rflat));
+        assert_eq!(sum(lsel, View::repeated(&two, 3)), want(&lflat, &[2; 3]));
+        assert_eq!(sum(View::repeated(&two, 3), rsel), want(&[2; 3], &rflat));
+    }
 
     #[test]
     fn floor_division_signed_boundaries() {

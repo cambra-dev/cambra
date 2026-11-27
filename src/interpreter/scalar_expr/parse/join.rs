@@ -26,14 +26,13 @@ enum ParsedGate {
     /// The rows where the `Bool` slot holds.
     Holds(Slot),
     /// The rows whose value in the union slot `union` carries `tag`. `tags` are the tags of the
-    /// union's extent. The operand reads its payloads, of `payload` extent, through the input path
-    /// `placeholder`, which no input has and which outlining replaces by [`PAYLOAD`].
+    /// union's extent. The operand reads its payloads through the input path `placeholder`, which
+    /// no input has and which outlining replaces by [`PAYLOAD`].
     Tag {
         union: Slot,
         tag: FieldKey,
         tags: Vec<FieldKey>,
         placeholder: SmolStr,
-        payload: Extent,
     },
 }
 
@@ -111,7 +110,7 @@ impl Parser<'_> {
             Extent::Record(_) | Extent::Union(_) | Extent::Base(BaseType::Unit)
         );
         // A union an arm passes through from the input is copied as its column holds it, which may
-        // carry record fields its extent does not name, so `merge_parts` could not combine it
+        // carry record fields its extent does not name, so `merge_into` could not combine it
         // with a union another arm builds.
         if constructs && arms.iter().any(|arm| passes_a_union_through(&arm.result)) {
             return None;
@@ -123,7 +122,7 @@ impl Parser<'_> {
             } else {
                 self.column(&arm.result)?
             };
-            // Each arm's column must have the join's layout, which `merge_parts` combines: a
+            // Each arm's column must have the join's layout, which `merge_into` combines: a
             // record arm wider than the join's type would carry a field the others lack.
             if !fits(&extent, &codomain) {
                 return None;
@@ -145,16 +144,13 @@ impl Parser<'_> {
                         union,
                         tag,
                         placeholder,
-                        payload,
                         ..
                     },
                 ) => {
                     let scrutinee = self.capture(*union, start, &mut captures);
-                    let shape = Shape(ColumnValue::from_values(Vec::new(), payload));
                     let gate = CaseGate::Tag {
                         scrutinee,
                         tag: tag.clone(),
-                        shape,
                     };
                     (gate, Some(placeholder))
                 }
@@ -279,13 +275,12 @@ impl Parser<'_> {
         let (union, _) = self.copied(&scrutinee)?;
         let placeholder: SmolStr = format!("{PAYLOAD}{}", self.placeholders).into();
         self.placeholders += 1;
-        let arm_cur = Val::Read(vec![placeholder.clone()], payload.clone());
+        let arm_cur = Val::Read(vec![placeholder.clone()], payload);
         let gate = ParsedGate::Tag {
             union,
             tag: tag.clone(),
             tags,
             placeholder,
-            payload,
         };
         Some((Opened::Arm(gate, arm_cur), rest))
     }
@@ -651,6 +646,93 @@ mod tests {
         assert_eq!(out, ColumnValue::Ints(want), "{}", fused.program);
     }
 
+    /// A conditional answers every row when its gates select all of a block's rows left, none of
+    /// them, or some. `x` ascends through three blocks:
+    /// ``(x > 5000 ▷ filter_values ≫ 1000 // (x - 2000)) ⊔ (x > 1500 ∧ ¬(x > 5000) ▷ filter_values
+    /// ≫ x - 1500) ⊔ (¬(x > 1500) ∧ ¬(x > 5000) ▷ filter_values ≫ 0 - x)``. The first arm takes no
+    /// row, and its `//` would panic at `x = 2000` if it ran on one. The second takes none of the
+    /// first block, some of the second and all of the third.
+    #[test]
+    fn a_block_no_gate_splits_moves_whole() {
+        use crate::interpreter::scalar_expr::eval::BLOCK_ROWS;
+        let int_ty = || Type::Base(BaseType::Int);
+        let (never, over) = (
+            compare(CompareKind::Greater, 5000),
+            compare(CompareKind::Greater, 1500),
+        );
+        let and = |a: Expr, b: Expr| {
+            Expr::compose(vec![
+                zip(vec![a, b]),
+                binop(BinOpKind::BoolLogic(LogicKind::And)),
+            ])
+        };
+        let divide = Expr::compose(vec![
+            zip(vec![constant(1000), arith(ArithmeticKind::Sub, 2000)]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::FloorDiv)),
+        ]);
+        let negate = Expr::compose(vec![
+            zip(vec![constant(0), id()]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Sub)),
+        ]);
+        let chain = vec![joined(
+            vec![
+                filtered(never.clone(), divide, int_ty()),
+                filtered(
+                    and(over.clone(), negated(never.clone())),
+                    arith(ArithmeticKind::Sub, 1500),
+                    int_ty(),
+                ),
+                filtered(and(negated(over), negated(never)), negate, int_ty()),
+            ],
+            int_ty(),
+        )];
+        let fused = fuse_typed(&chain, &int(), &[(int_ty(), int())]).expect("first-match gates");
+        let n = 3 * BLOCK_ROWS as i64;
+        assert!(1500 < BLOCK_ROWS as i64 * 2 && 1500 >= BLOCK_ROWS as i64);
+        let out = fused.program.eval(&ColumnValue::Ints((0..n).collect()));
+        let want = (0..n)
+            .map(|x| if x > 1500 { x - 1500 } else { -x })
+            .collect::<Vec<_>>();
+        assert_eq!(out, ColumnValue::Ints(want), "{}", fused.program);
+    }
+
+    /// A conditional reuses its arms' inputs, programs' scratch columns, positions and results
+    /// across blocks, so a block allocates only three short lists of borrows: the captures
+    /// (`Scratch::case_block`), the arms' results to merge (`CaseFn::eval_into`) and their views
+    /// (`merge_into`). ``(x > 1000 ▷ filter_values ≫ x - 1000) ⊔ (x > 1000 ≫ not_fn ▷
+    /// filter_values ≫ 0 - x)`` over scrambled `x`, so every block splits.
+    #[test]
+    fn a_conditional_reuses_its_buffers_across_blocks() {
+        use crate::interpreter::scalar_expr::eval::BLOCK_ROWS;
+        use crate::it::alloc_probe::allocations;
+        let int_ty = || Type::Base(BaseType::Int);
+        let over = compare(CompareKind::Greater, 1000);
+        let negate = Expr::compose(vec![
+            zip(vec![constant(0), id()]),
+            binop(BinOpKind::Arithmetic(ArithmeticKind::Sub)),
+        ]);
+        let chain = vec![joined(
+            vec![
+                filtered(over.clone(), arith(ArithmeticKind::Sub, 1000), int_ty()),
+                filtered(negated(over), negate, int_ty()),
+            ],
+            int_ty(),
+        )];
+        let fused = fuse_typed(&chain, &int(), &[(int_ty(), int())]).expect("the gates split");
+        let allocations_over = |blocks: usize| {
+            let input = ColumnValue::Ints(
+                (0..(blocks * BLOCK_ROWS) as i64)
+                    .map(|i| (i * 7919) % 2000)
+                    .collect(),
+            );
+            allocations(|| {
+                fused.program.eval(&input);
+            })
+        };
+        let per_block = (allocations_over(16) - allocations_over(8)) / 8;
+        assert!(per_block <= 3, "{per_block} allocations per block");
+    }
+
     /// A conditional whose arms build variants is a constructor yielding one union column with
     /// each arm's tag: ``(x > 1 ▷ filter_values ≫ variant_wrap(`some)) ⊔ (x > 1 ≫ not_fn ▷
     /// filter_values ≫ `none(unit) ▷ const)`` over 2,500 rows.
@@ -689,6 +771,125 @@ mod tests {
     /// (variant_project(`none) ≫ 0 ▷ const)`` over 2,500 rows that alternate between the tags.
     #[test]
     fn a_match_selects_each_arm_by_tag() {
+        a_match_selects_each_arm_by_tag_over(|i| i % 3 == 0);
+    }
+
+    /// The `none` arm takes no row of the first block and runs in the later ones, so its payload
+    /// field is absent from one block's input and present in the next.
+    #[test]
+    fn a_match_arm_absent_from_a_block_runs_in_the_next() {
+        a_match_selects_each_arm_by_tag_over(|i| i >= 1024 && i % 5 == 0);
+    }
+
+    /// A `match` arm reads payloads of a base type in place through a selection of its tag's
+    /// payload column, so a block allocates no payload column: only the three short lists that
+    /// [`a_conditional_reuses_its_buffers_across_blocks`] counts. ``(variant_project(`some) ≫ id *
+    /// 2) ⊔ (variant_project(`none) ≫ 0 ▷ const)`` over options alternating between the tags.
+    #[test]
+    fn a_match_reads_its_payloads_in_place() {
+        use crate::interpreter::scalar_expr::eval::BLOCK_ROWS;
+        use crate::it::alloc_probe::allocations;
+        let int_ty = || Type::Base(BaseType::Int);
+        let chain = vec![joined(
+            vec![
+                Expr::compose(vec![
+                    project_option("some", int_ty()),
+                    arith(ArithmeticKind::Mul, 2),
+                ]),
+                Expr::compose(vec![
+                    project_option("none", Type::Base(BaseType::Unit)),
+                    constant(0),
+                ]),
+            ],
+            int_ty(),
+        )];
+        let types = [
+            (int_ty(), int()),
+            (Type::Base(BaseType::Unit), Extent::Base(BaseType::Unit)),
+        ];
+        let fused = fuse_typed(&chain, &option_extent(), &types).expect("the arms name every tag");
+        let allocations_over = |blocks: usize| {
+            let options: Vec<Value> = (0..(blocks * BLOCK_ROWS) as i64)
+                .map(|i| Value::Union {
+                    tag: tag(if i % 3 == 0 { "none" } else { "some" }),
+                    inner: Box::new(if i % 3 == 0 {
+                        Value::Unit
+                    } else {
+                        Value::Int(i)
+                    }),
+                })
+                .collect();
+            let input = ColumnValue::from_values(options, &option_extent());
+            allocations(|| {
+                fused.program.eval(&input);
+            })
+        };
+        let per_block = (allocations_over(16) - allocations_over(8)) / 8;
+        assert!(per_block <= 3, "{per_block} allocations per block");
+    }
+
+    /// An `if` inside a `match` arm reads the arm's payload, read in place, as its capture:
+    /// ``(variant_project(`some) ≫ ((p > 5 ▷ filter_values ≫ p * 2) ⊔ (p > 5 ≫ not_fn ▷
+    /// filter_values ≫ p * 3))) ⊔ (variant_project(`none) ≫ 0 ▷ const)`` over three blocks of
+    /// scrambled options, so both conditionals split every block.
+    #[test]
+    fn an_if_inside_a_match_arm_reads_the_payload() {
+        use crate::interpreter::scalar_expr::eval::BLOCK_ROWS;
+        let int_ty = || Type::Base(BaseType::Int);
+        let over = compare(CompareKind::Greater, 5);
+        let inner = joined(
+            vec![
+                filtered(over.clone(), arith(ArithmeticKind::Mul, 2), int_ty()),
+                filtered(negated(over), arith(ArithmeticKind::Mul, 3), int_ty()),
+            ],
+            int_ty(),
+        );
+        let chain = vec![joined(
+            vec![
+                Expr::compose(vec![project_option("some", int_ty()), inner]),
+                Expr::compose(vec![
+                    project_option("none", Type::Base(BaseType::Unit)),
+                    constant(0),
+                ]),
+            ],
+            int_ty(),
+        )];
+        let types = [
+            (int_ty(), int()),
+            (Type::Base(BaseType::Unit), Extent::Base(BaseType::Unit)),
+        ];
+        let fused = fuse_typed(&chain, &option_extent(), &types).expect("both conditionals split");
+        let n = 3 * BLOCK_ROWS as i64;
+        let some = |i: i64| (i * 7919 % 31 != 0).then_some(i * 7919 % 11);
+        let options: Vec<Value> = (0..n)
+            .map(|i| match some(i) {
+                Some(p) => Value::Union {
+                    tag: tag("some"),
+                    inner: Box::new(Value::Int(p)),
+                },
+                None => Value::Union {
+                    tag: tag("none"),
+                    inner: Box::new(Value::Unit),
+                },
+            })
+            .collect();
+        let want = (0..n)
+            .map(|i| match some(i) {
+                Some(p) if p > 5 => p * 2,
+                Some(p) => p * 3,
+                None => 0,
+            })
+            .collect::<Vec<_>>();
+        let input = ColumnValue::from_values(options, &option_extent());
+        assert_eq!(
+            fused.program.eval(&input),
+            ColumnValue::Ints(want),
+            "{}",
+            fused.program
+        );
+    }
+
+    fn a_match_selects_each_arm_by_tag_over(none_at: impl Fn(i64) -> bool) {
         let int_ty = || Type::Base(BaseType::Int);
         let project = |name: &str, payload: Type| {
             Expr::builtin(Builtin::VariantProject(tag(name)))
@@ -710,8 +911,8 @@ mod tests {
         let n = 2_500;
         let options: Vec<Value> = (0..n)
             .map(|i| Value::Union {
-                tag: tag(if i % 3 == 0 { "none" } else { "some" }),
-                inner: Box::new(if i % 3 == 0 {
+                tag: tag(if none_at(i) { "none" } else { "some" }),
+                inner: Box::new(if none_at(i) {
                     Value::Unit
                 } else {
                     Value::Int(i)
@@ -729,7 +930,7 @@ mod tests {
         )
         .expect("the arms name every tag");
         let want = (0..n)
-            .map(|i| if i % 3 == 0 { 0 } else { i * 2 })
+            .map(|i| if none_at(i) { 0 } else { i * 2 })
             .collect::<Vec<_>>();
         assert_eq!(
             fused.program.eval(&input),
@@ -811,6 +1012,19 @@ mod tests {
         assert_eq!(out, ColumnValue::Ints(want), "{}", fused.program);
         let empty = fused.program.eval(&ColumnValue::Ints(Vec::new()));
         assert_eq!(empty, ColumnValue::Ints(Vec::new()), "an empty input");
+        // Scrambled, every block splits at both levels, so the inner conditional's capture is a
+        // selection the inner arms read gathered.
+        let scrambled: Vec<i64> = (0..3 * n).map(|i| (i * 7919) % 2500).collect();
+        let want = scrambled
+            .iter()
+            .map(|&x| match x {
+                x if x > 2000 => x * 2,
+                x if x > 1000 => x * 3,
+                x => -x,
+            })
+            .collect::<Vec<_>>();
+        let out = fused.program.eval(&ColumnValue::Ints(scrambled));
+        assert_eq!(out, ColumnValue::Ints(want), "scrambled");
     }
 
     /// A `match` inside an `if` arm reads the union narrowed to the arm: over `{k: Int, o: {`none |
