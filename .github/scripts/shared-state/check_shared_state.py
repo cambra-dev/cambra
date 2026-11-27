@@ -163,9 +163,10 @@ EXPECTED_EXCEPTIONS = [
     # one at a time. What crosses it is guards of the scope's input, never a tile.
     ("src/interpreter/dispatcher/scope.rs", "cell of `LoopSchedule`"),
     ("src/interpreter/dispatcher/scope.rs", "cell of `WriterPhase`"),
-    # A settlement group's choice: one claimant at a time publishes across the group and queues
-    # one step. What crosses it is nothing, never a tile.
-    ("src/interpreter/dispatcher/scope.rs", "cell of `()`"),
+    # A settlement group's rotating cursor: the scope whose step it tries first, one past the one
+    # it queued last. One claimant at a time advances it. What crosses it is that index, never a
+    # tile.
+    ("src/interpreter/dispatcher/scope.rs", "cell of `usize`"),
     # The worker pool's drain between source polls: whether a replay or a drain is open and the
     # generation its last quiet pass saw. What crosses it is a generation count, never a tile.
     ("src/interpreter/dispatcher/workers.rs", "cell of `Drain`"),
