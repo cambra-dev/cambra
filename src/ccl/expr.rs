@@ -1840,7 +1840,8 @@ impl TypedExpr {
     }
 
     /// [`Self::absorbing_children_capabilities`] in place, outside every typing run, through
-    /// [`Solver::none`].
+    /// [`Solver::none`]: a child whose capabilities are still a variable leaves the union unread
+    /// ([`crate::ccl::capabilities::of_children`]).
     pub(crate) fn absorb_children_capabilities(&mut self) {
         self.absorb_children_capabilities_in(&mut Solver::none());
     }

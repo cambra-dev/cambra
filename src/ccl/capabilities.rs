@@ -288,12 +288,18 @@ impl Requirement {
 
     /// This requirement with `f` applied to each term argument.
     pub fn map_terms(&self, f: &mut dyn FnMut(&Name) -> Name) -> Requirement {
-        if let Some(order) = self.ordering() {
-            let capabilities = match order.capabilities.repr() {
+        fn mapped(capabilities: &Capabilities, f: &mut dyn FnMut(&Name) -> Name) -> Capabilities {
+            match capabilities.repr() {
                 Repr::Written(w) => Capabilities::written(w.map_names(f)),
-                Repr::Known(_) => order.capabilities.map_known_names(f),
-                Repr::Var(_) => order.capabilities.clone(),
-            };
+                Repr::Known(_) => capabilities.map_known_names(f),
+                Repr::Var(_) => capabilities.clone(),
+                Repr::Children(children) => Capabilities(Rc::new(Repr::Children(
+                    children.map_parts(&mut |part| mapped(part, f)),
+                ))),
+            }
+        }
+        if let Some(order) = self.ordering() {
+            let capabilities = mapped(&order.capabilities, f);
             return self.with_ordering(order.positions.clone(), capabilities);
         }
         Requirement::of(self.0.trait_.clone(), self.0.terms.iter().map(f).collect())
@@ -704,7 +710,9 @@ pub fn assert_monotone_in(solver: &mut Solver, expr: &crate::ccl::Expr, after: &
         if let N::Try { body, handlers } = &expr.node
             && std::ptr::eq(child, &**body)
         {
-            theirs.causes.retain(|e| !caught_by(solver, handlers, e));
+            let clauses: Vec<crate::ccl::Type> =
+                handlers.iter().map(|h| h.catches.clone()).collect();
+            theirs.causes.retain(|e| !caught_by(solver, &clauses, e));
         }
         check(solver, theirs, &|| {
             format!("its child `{}`", crate::ccl::symbolic::symbolic(child))
@@ -816,55 +824,58 @@ impl Capabilities {
 
 /// Whether a `try` with `handlers` catches `effect`: an exception whose type, resolved, a clause
 /// takes, whole or, in error, in part ([`sent`]).
-fn caught_by(solver: &mut Solver, handlers: &[crate::ccl::expr::Handler], effect: &Effect) -> bool {
+fn caught_by(solver: &mut Solver, clauses: &[crate::ccl::Type], effect: &Effect) -> bool {
     let Effect::Raise(raised) = effect else {
         return false;
     };
-    let clauses: Vec<crate::ccl::Type> = handlers.iter().map(|h| h.catches.clone()).collect();
     raised
         .resolved(solver)
-        .is_some_and(|ty| sent(solver, &clauses, &ty) != Sent::On)
+        .is_some_and(|ty| sent(solver, clauses, &ty) != Sent::On)
 }
 
 /// What `expr` requires and causes for what its children do: all of it, but nothing for a
 /// lambda, whose body is latent in its type, and no `Transaction` for a `with begin():`
 /// block, which supplies it. A node with capabilities of its own, a read, a call, a write, a
 /// feed or a block's commit, adds them to this.
+///
+/// A child whose capabilities are still a variable leaves the result a [`Repr::Children`], read
+/// as the variable is, so building a node reads no variable.
 pub fn of_children(solver: &mut Solver, expr: &crate::ccl::Expr) -> Capabilities {
     use crate::ccl::TypedExprNode as N;
     if matches!(expr.node, N::Lambda { .. }) {
         return Capabilities::none();
     }
-    let mut set = CapabilitySet::default();
+    // A `try` lets out of its body what its clauses do not catch.
+    let clauses: Option<Rc<[crate::ccl::Type]>> = match &expr.node {
+        N::Try { handlers, .. } => Some(handlers.iter().map(|h| h.catches.clone()).collect()),
+        _ => None,
+    };
+    let mut parts = Vec::new();
     expr.walk_children(|child| {
-        let mut theirs = child.capabilities.set_in(solver);
-        // A `try` lets out of its body what its clauses do not catch.
-        if let N::Try { body, handlers } = &expr.node
-            && std::ptr::eq(child, &**body)
-        {
-            theirs.causes.retain(|e| !caught_by(solver, handlers, e));
-        }
-        if !theirs.is_empty() {
-            set = set.union(solver, &theirs);
-        }
+        let catches = match &expr.node {
+            N::Try { body, .. } if std::ptr::eq(child, &**body) => clauses.clone(),
+            _ => None,
+        };
+        parts.push((child.capabilities.clone(), catches));
     });
-    if matches!(expr.node, N::Begin { .. }) {
-        set.requires.remove(&Requirement::transaction());
-    }
-    if set.is_empty() {
-        Capabilities::none()
-    } else {
-        Capabilities::known(set)
-    }
+    Capabilities::of(
+        solver,
+        Children::new(parts, matches!(expr.node, N::Begin { .. })),
+    )
 }
 
 /// What a node whose children's capabilities are `parts` requires and causes, when the node itself
 /// neither adds nor discharges anything: a statement sequence, say.
 pub fn of_parts_in(solver: &mut Solver, parts: &[&Capabilities]) -> Capabilities {
-    Capabilities::known(parts.iter().fold(CapabilitySet::default(), |acc, part| {
-        let set = part.set_in(solver);
-        acc.union(solver, &set)
-    }))
+    let children = Children::new(
+        parts.iter().map(|part| ((*part).clone(), None)).collect(),
+        false,
+    );
+    if children.is_pending() {
+        Capabilities(Rc::new(Repr::Children(children)))
+    } else {
+        Capabilities::known(children.union(solver, &mut |solver, part| part.set_in(solver)))
+    }
 }
 
 /// [`of_parts_in`] outside every typing run, through
@@ -1625,6 +1636,105 @@ pub enum Repr {
     /// ([`crate::ccl::infer`]'s `normalize_annotation`): a known set, or a variable holding
     /// the set when a clause ends in `_`.
     Written(Written),
+    /// What a node's children do, built while one of them is still a variable: [`of_children`]
+    /// and [`of_parts`] leave it to be read as each variable is, by the run that holds them,
+    /// and coalesce settles it (`src/ccl/design/type-inference.md`, "Capabilities on every
+    /// expression").
+    Children(Children),
+}
+
+/// The values [`Capabilities::set_reading`] has read, by allocation. Each entry holds its value,
+/// so a walk that replaces the slots it reads cannot free an allocation and see its address
+/// reused while the map stands.
+pub(crate) type ReadValues = HashMap<*const Repr, (Capabilities, CapabilitySet)>;
+
+/// The parts a [`Repr::Children`] unions.
+#[derive(Debug)]
+pub struct Children {
+    /// Each part, with the clauses of the `try` whose body it is: what they catch stays out.
+    parts: Vec<(Capabilities, Option<Rc<[crate::ccl::Type]>>)>,
+    /// Whether the node is a `with begin():` block, which supplies `Transaction`.
+    begin: bool,
+    /// The set the parts union, and the count of capability facts it was read at: still the
+    /// answer while no fact has been written since, as for [`CapabilityVar::resolved`].
+    read_at: RefCell<Option<(u64, CapabilitySet)>>,
+}
+
+/// Equality and hashing read the parts, not what reading them answered.
+impl PartialEq for Children {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts == other.parts && self.begin == other.begin
+    }
+}
+
+impl Eq for Children {}
+
+impl Hash for Children {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts.hash(state);
+        self.begin.hash(state);
+    }
+}
+
+impl Children {
+    /// Whether a part is still a variable, or a union holding one.
+    fn is_pending(&self) -> bool {
+        self.parts.iter().any(|(part, _)| part.is_pending())
+    }
+
+    /// The set the parts union, each read through `read`.
+    fn union(
+        &self,
+        solver: &mut Solver,
+        read: &mut dyn FnMut(&mut Solver, &Capabilities) -> CapabilitySet,
+    ) -> CapabilitySet {
+        let mut set = CapabilitySet::default();
+        for (part, catches) in &self.parts {
+            let mut theirs = read(solver, part);
+            if let Some(clauses) = catches {
+                theirs.causes.retain(|e| !caught_by(solver, clauses, e));
+            }
+            if !theirs.is_empty() {
+                set = set.union(solver, &theirs);
+            }
+        }
+        if self.begin {
+            set.requires.remove(&Requirement::transaction());
+        }
+        set
+    }
+
+    /// These parts with `f` applied to each.
+    fn map_parts(&self, f: &mut dyn FnMut(&Capabilities) -> Capabilities) -> Children {
+        Children::new(
+            self.parts
+                .iter()
+                .map(|(part, catches)| (f(part), catches.clone()))
+                .collect(),
+            self.begin,
+        )
+    }
+
+    fn new(parts: Vec<(Capabilities, Option<Rc<[crate::ccl::Type]>>)>, begin: bool) -> Self {
+        Children {
+            parts,
+            begin,
+            read_at: RefCell::new(None),
+        }
+    }
+
+    /// The set the parts union, read through [`Capabilities::set`].
+    fn set(&self, solver: &mut Solver) -> CapabilitySet {
+        let now = capability_facts();
+        if let Some((at, set)) = &*self.read_at.borrow()
+            && *at == now
+        {
+            return set.clone();
+        }
+        let set = self.union(solver, &mut |solver, part| part.set_in(solver));
+        *self.read_at.borrow_mut() = Some((now, set.clone()));
+        set
+    }
 }
 
 /// The clauses a function type or a `def` writes (`docs/chl-spec.md`, "Writing requirements
@@ -2063,6 +2173,10 @@ thread_local! {
 
 fn capability_fact_written() {
     CAPABILITY_FACTS.with(|n| n.set(n.get() + 1));
+}
+
+fn capability_facts() -> u64 {
+    CAPABILITY_FACTS.with(Cell::get)
 }
 
 /// The capabilities of a function type that inference has not finished collecting: the capabilities
@@ -2815,6 +2929,43 @@ impl Capabilities {
         Capabilities(Rc::new(Repr::Written(written)))
     }
 
+    /// What `children` unions: read now when no part is still a variable, and left to be read
+    /// otherwise. Nothing, empty, is [`Capabilities::none`].
+    fn of(solver: &mut Solver, children: Children) -> Capabilities {
+        if children.is_pending() {
+            return Capabilities(Rc::new(Repr::Children(children)));
+        }
+        let set = children.union(solver, &mut |solver, part| part.set_in(solver));
+        if set.is_empty() {
+            Capabilities::none()
+        } else {
+            Capabilities::known(set)
+        }
+    }
+
+    /// Whether reading this reads a variable: it is one, or a union holding one.
+    pub fn is_pending(&self) -> bool {
+        matches!(self.repr(), Repr::Var(_) | Repr::Children(_))
+    }
+
+    /// [`Self::set`], answering each value `read` already holds from it, and recording each it
+    /// reads: a union's parts are its children's values, so settling a tree bottom up reads
+    /// each union's parts once.
+    pub(crate) fn set_reading(&self, solver: &mut Solver, read: &mut ReadValues) -> CapabilitySet {
+        let key = Rc::as_ptr(&self.0);
+        if let Some((_, set)) = read.get(&key) {
+            return set.clone();
+        }
+        let set = match self.repr() {
+            Repr::Children(children) => {
+                children.union(solver, &mut |solver, part| part.set_reading(solver, read))
+            }
+            _ => self.set_in(solver),
+        };
+        read.insert(key, (self.clone(), set.clone()));
+        set
+    }
+
     pub fn repr(&self) -> &Repr {
         &self.0
     }
@@ -2843,6 +2994,9 @@ impl Capabilities {
                 ..w.clone()
             }),
             Repr::Var(_) => self.clone(),
+            Repr::Children(children) => Capabilities(Rc::new(Repr::Children(
+                children.map_parts(&mut |part| part.with_params_respelled(respell)),
+            ))),
         }
     }
 
@@ -2851,6 +3005,7 @@ impl Capabilities {
         match self.repr() {
             Repr::Known(set) => set.is_empty(),
             Repr::Var(v) => v.resolved(solver).is_empty(),
+            Repr::Children(_) => self.set_in(solver).is_empty(),
             Repr::Written(w) => w.set.is_empty() && !w.open_requires && !w.open_causes,
         }
     }
@@ -2861,6 +3016,7 @@ impl Capabilities {
             Repr::Known(set) => set.clone(),
             Repr::Var(v) => v.resolved_set(solver),
             Repr::Written(w) => w.set.clone(),
+            Repr::Children(children) => children.set(solver),
         }
     }
 
@@ -2873,6 +3029,9 @@ impl Capabilities {
     pub(crate) fn causes_set(&self, solver: &mut Solver) -> CapabilitySet {
         let mut set = match self.repr() {
             Repr::Var(v) => v.resolved_causes_set(solver),
+            Repr::Children(children) => {
+                children.union(solver, &mut |solver, part| part.causes_set(solver))
+            }
             _ => self.set_in(solver),
         };
         set.requires.clear();
@@ -2898,11 +3057,33 @@ impl Capabilities {
             .collect()
     }
 
-    /// The level of a variable, and 0 for a known set.
+    /// The level of a variable, the deepest of a union's parts, and 0 for a known set.
     pub fn level(&self) -> Level {
         match self.repr() {
             Repr::Known(_) | Repr::Written(_) => 0,
             Repr::Var(v) => v.level(),
+            Repr::Children(children) => children
+                .parts
+                .iter()
+                .map(|(part, _)| part.level())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    /// This with each variable it reads replaced by `f`'s answer, a union's parts included: a
+    /// clone takes its use's copies of a definition's variables
+    /// ([`crate::ccl::infer::solver::scheme`]'s `freshen_expr_type_slots`).
+    pub fn map_vars(
+        &self,
+        f: &mut dyn FnMut(&Rc<CapabilityVar>) -> Rc<CapabilityVar>,
+    ) -> Capabilities {
+        match self.repr() {
+            Repr::Var(v) => Capabilities::var(f(v)),
+            Repr::Children(children) => Capabilities(Rc::new(Repr::Children(
+                children.map_parts(&mut |part| part.map_vars(f)),
+            ))),
+            Repr::Known(_) | Repr::Written(_) => self.clone(),
         }
     }
 }
@@ -3012,7 +3193,7 @@ impl Capabilities {
     pub fn known_set(&self) -> Option<&CapabilitySet> {
         match self.repr() {
             Repr::Known(set) => Some(set),
-            Repr::Var(_) | Repr::Written(_) => None,
+            Repr::Var(_) | Repr::Written(_) | Repr::Children(_) => None,
         }
     }
 
