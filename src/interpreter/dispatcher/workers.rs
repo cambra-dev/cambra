@@ -644,6 +644,7 @@ mod tests {
         FlatMemo,
         NestedMemo,
         NestedMemoReleasing,
+        NestedMemoClosingEmpty,
         RecordMemoReleasing,
         RecordMemoDiscarded,
     }
@@ -654,6 +655,7 @@ mod tests {
     #[case::flat_memo(TestBreaker::FlatMemo)]
     #[case::nested_memo(TestBreaker::NestedMemo)]
     #[case::nested_memo_releasing(TestBreaker::NestedMemoReleasing)]
+    #[case::close_without_payload_while_peer_releases(TestBreaker::NestedMemoClosingEmpty)]
     #[case::record_memo_releasing(TestBreaker::RecordMemoReleasing)]
     #[case::release_output_while_input_release_is_paused(TestBreaker::RecordMemoDiscarded)]
     fn acknowledges_while_a_peer_is_still_consuming(#[case] target: TestBreaker) {
@@ -731,7 +733,8 @@ mod tests {
             ]
             .into(),
         );
-        let releasing = matches!(target, TestBreaker::NestedMemoReleasing);
+        let empty_close = matches!(target, TestBreaker::NestedMemoClosingEmpty);
+        let releasing = matches!(target, TestBreaker::NestedMemoReleasing) || empty_close;
         let nested = matches!(target, TestBreaker::NestedMemo) || releasing;
         let point = |key| Predicate::point(Value::UInt(key));
         let claim = |key| {
@@ -774,8 +777,14 @@ mod tests {
                     Box::new(ProjectionSpy::new(tile, record_tiling.clone()).0)
                 }
                 TestBreaker::FlatMemo => Box::new(Input::over(&source(0..2))),
-                TestBreaker::NestedMemo | TestBreaker::NestedMemoReleasing => {
-                    let (tile, tiling) = two_levels_of_ints();
+                TestBreaker::NestedMemo
+                | TestBreaker::NestedMemoReleasing
+                | TestBreaker::NestedMemoClosingEmpty => {
+                    let (mut tile, tiling) = two_levels_of_ints();
+                    if empty_close {
+                        tile.remove_guarded(claim(1));
+                        tile.compact();
+                    }
                     Box::new(ProjectionSpy::new(tile, tiling).0)
                 }
                 _ => Box::new(NestedInput::over(&source(0..2))),
@@ -792,6 +801,7 @@ mod tests {
             TestBreaker::FlatMemo
             | TestBreaker::NestedMemo
             | TestBreaker::NestedMemoReleasing
+            | TestBreaker::NestedMemoClosingEmpty
             | TestBreaker::RecordMemoReleasing
             | TestBreaker::RecordMemoDiscarded => {
                 let tiling = input.tiling().clone();
@@ -889,7 +899,13 @@ mod tests {
                 );
                 assert_eq!(guard_covers(&memo.complete(), &row), key == 0 || releasing);
                 assert!(!guard_covers(&memo.complete(), &keys_between(1, 1)));
-                let values = if key == 0 { vec![0, 1] } else { vec![2] };
+                let values = if key == 0 {
+                    vec![0, 1]
+                } else if empty_close {
+                    vec![]
+                } else {
+                    vec![2]
+                };
                 assert_eq!(
                     tile.deepest_values(),
                     &Tile::Scalar(crate::interpreter::ColumnValue::Ints(values))

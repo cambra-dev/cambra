@@ -660,10 +660,11 @@ A worker consumes, publishes and acknowledges its own claim, in that order:
    A nested memo publishes completed inner keys with their enclosing paths. When the merge
    completes a row, its push includes the row's end. Each peer still publishes its own
    payload after releasing its input, even if the closing worker has seen it in the cache.
-   A memo reserves the new region in the dispatcher's publication record while it holds the
-   cache lock. For an irregular delivery or a newly closed finite domain, it reads the merged
-   cache guard once. Subtracting prior reservations also excludes a peer still releasing its
-   input. Each worker lands its own reservation after its input release.
+   Memo append returns the exact change in completeness while it holds the cache lock.
+   For a scalar collection or a dense history field this includes the newly stated keys
+   and any newly closed region, even when the delivery contains no item. For other
+   shapes it compares the cache across the append. The worker releases its input and
+   then pushes its own delta. A peer can publish first without taking that delta.
 2. When another breaker needs a snapshot, the worker takes the breaker handle exclusively to run
    `Pushes::push_final`. An ordered pipeline holds the handle exclusively through consume and
    publication. A sink or a breaker that defers publication only consumes here.

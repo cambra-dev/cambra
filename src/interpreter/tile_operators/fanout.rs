@@ -1920,7 +1920,7 @@ impl MemoProducer {
         answer.retain_finished_state_fields();
         let released = answer.to_guard();
         answer.compact();
-        let reserved = {
+        let delta = {
             let mut cache = self
                 .cached_tile
                 .write()
@@ -1929,22 +1929,14 @@ impl MemoProducer {
             if !obsolete.is_empty() {
                 answer.remove_guarded(obsolete);
                 answer.compact();
-                // A release can remove the last selected field from a row.
                 answer.restrict_to(projection, self.tiling());
             }
-            let held = answer.to_guard();
-            if !held.is_empty() {
-                cache.append(answer, projection);
-            }
-            pushes.filter(|p| p.has_readers()).map(|pushes| {
-                let new = pushes.reserve_region(self, &held);
-                (pushes, new)
-            })
+            cache.append(answer, projection, self.tiling())
         };
         self.input.release(released);
-        if let Some((pushes, new)) = reserved {
-            let remaining = guard_minus(&new, &self.obsolete_guard());
-            pushes.cut(&remaining, |part, _| vec![part.clone()]);
+        if let Some(pushes) = pushes.filter(|p| p.has_readers()) {
+            let remaining = guard_minus(&delta, &self.obsolete_guard());
+            pushes.push_region(self, &remaining, |part, _| vec![part.clone()]);
         }
     }
 
@@ -1971,7 +1963,7 @@ impl MemoProducer {
             let keys = flat_answer_keys(&input, &guard, &released)?;
             // A package-sized answer needs no key scan or copy when its delta is cut.
             let oversized = (keys.len() > p.morsel_rows()).then(|| keys.clone());
-            Some((released.clone(), oversized))
+            Some(oversized)
         });
         input.compact();
         #[cfg(debug_assertions)]
@@ -1987,64 +1979,24 @@ impl MemoProducer {
 
         input.remove_guarded(self.obsolete_guard());
         input.compact();
-        // A release guard can include deleted input. Only the surviving answer can
-        // contribute nested output. A widened pull can include a peer's region.
-        let nested = nested_answer(&input, &guard);
         let mut cache = self
             .cached_tile
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        // An irregular merge can finish a record or widen an earlier statement.
-        // The dispatcher already remembers every region reserved by prior writers.
-        let mut read_merged = flat.is_none() && nested.is_none();
-        cache.append(input, &projection);
-        let nested = nested.map(|answer| answer.merge_into(&mut cache, self.tiling()));
-        for depth in (0..self.tiling().levels()).rev() {
-            let level = CurryLevel::new(depth);
-            if let Some(closed) =
-                position_closure(cache.values_at(level), self.tiling().values_at(level))
-            {
-                read_merged = true;
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = cache.values_at_mut(level)
-                else {
-                    unreachable!()
-                };
-                *domain_predicate = closed;
-            }
-        }
+        let delta = cache.append(input, &projection, self.tiling());
 
         if let Projection::Keys { level, keys } = &projection {
             let complete = cache.completion_at(*level).intersect(keys);
             released =
                 released.union(&Projection::keys_at(*level, complete).guard(self.input.tiling()));
         }
-        let reserved = pushes.map(|pushes| {
-            let mut region = nested
-                .map(|paths| paths.guard(self.tiling()))
-                .or_else(|| flat.as_ref().map(|(region, _)| region.clone()))
-                .unwrap_or_else(|| self.tiling().empty_guard());
-            if read_merged {
-                region = region.union(&cache.to_guard());
-            }
-            let obsolete = self.obsolete_guard();
-            let region = held_after_release(region, &obsolete, self.tiling());
-            let new = pushes.reserve_region(self, &region);
-            (pushes, new, obsolete)
-        });
         drop(cache);
         self.input.release(released);
-        let Some((pushes, mut region, previous_release)) = reserved else {
-            return;
-        };
-        let obsolete = self.obsolete_guard();
-        if obsolete != previous_release {
-            region = without_obsolete(region, &obsolete);
-        }
-        pushes.cut(&region, |new, rows| match flat {
-            Some((_, None)) => vec![new.clone()],
-            Some((_, Some(keys))) => cut_at_keys(
+        let Some(pushes) = pushes else { return };
+        let remaining = held_after_release(delta, &self.obsolete_guard(), self.tiling());
+        pushes.push_region(self, &remaining, |new, rows| match flat {
+            Some(None) => vec![new.clone()],
+            Some(Some(keys)) => cut_at_keys(
                 new,
                 (0..keys.len()).map(|i| keys.index_at(i)),
                 rows,
@@ -2086,144 +2038,6 @@ fn flat_answer_keys<'a>(
         && !done.qualifies()
         && guard_covers(requested, completed))
     .then_some(domain)
-}
-
-/// The keys a nested answer settled, and their enclosing rows if the answer holds
-/// them all. An absence can settle paths in a row held only by an earlier answer.
-struct NestedAnswer {
-    level: CurryLevel,
-    keys: Predicate,
-    rows: Option<Vec<Vec<Value>>>,
-}
-
-fn nested_answer(input: &Tile, requested: &TileGuard) -> Option<NestedAnswer> {
-    let Tile::DataFunction { codomain, .. } = input else {
-        return None;
-    };
-    if !codomain.is_data_function() {
-        return None;
-    }
-    let held = input.to_guard();
-    let paths = Projection::of(&held).ok()?;
-    let Projection::Keys { level, keys } = &paths else {
-        return None;
-    };
-    if !guard_covers(requested, &held) {
-        return None;
-    }
-    let rows = level.enclosing().and_then(|parent| {
-        let held_parents = Projection::keys_at(parent, input.paths_predicate(parent));
-        (paths.above(*level).minus(&held_parents) == Projection::Nothing)
-            .then(|| input.paths_at(parent))
-    });
-    Some(NestedAnswer {
-        level: *level,
-        keys: keys.clone(),
-        rows,
-    })
-}
-
-impl NestedAnswer {
-    /// Record this answer's completed paths. If a row's accumulated child statement now
-    /// covers its extent, mark the row whole in the cache and publish only its end.
-    ///
-    /// A peer might have merged a sibling path without releasing its input yet. Its
-    /// payload is that peer's to publish: the end excludes *all* merged child paths.
-    fn merge_into(self, cache: &mut Tile, tiling: &Tiling) -> Projection {
-        let Self {
-            mut level,
-            keys: mut arrived,
-            mut rows,
-        } = self;
-        let mut publish = Projection::keys_at(level, arrived.clone());
-        loop {
-            let node = cache.values_at_mut(level);
-            let Tile::DataFunction {
-                domain_predicate, ..
-            } = node
-            else {
-                unreachable!()
-            };
-            *domain_predicate = domain_predicate.union(&arrived);
-            let stated = node.level_statement();
-            let extent = tiling.values_at(level).domain_extent();
-            let Some(parent) = level.enclosing() else {
-                if covers_domain(&stated, extent.as_ref()) {
-                    let end = Predicate::True.minus(&stated);
-                    let Tile::DataFunction {
-                        domain_predicate, ..
-                    } = cache
-                    else {
-                        unreachable!()
-                    };
-                    *domain_predicate = Predicate::True;
-                    return publish.union(&Projection::keys_at(level, end));
-                }
-                return publish;
-            };
-            let already_closed = cache.completion_at(parent);
-            let mut closed = Vec::new();
-            let mut ends = Vec::new();
-            for path in rows.take().unwrap_or_else(|| cache.paths_at(parent)) {
-                if already_closed.contains_path(&path) || arrived.within(&path, 0).is_false() {
-                    continue;
-                }
-                let known = stated.within(&path, 0);
-                if covers_domain(&known, extent.as_ref()) {
-                    closed.push(Predicate::exactly(&path));
-                    ends.push(Predicate::True.minus(&known).beneath(&path, 0));
-                }
-            }
-            if closed.is_empty() {
-                return publish;
-            }
-            publish = publish.union(&Projection::keys_at(level, Predicate::union_all(ends)));
-            level = parent;
-            arrived = Predicate::union_all(closed);
-        }
-    }
-}
-
-fn covers_domain(keys: &Predicate, extent: Option<&Extent>) -> bool {
-    match extent {
-        Some(Extent::UIntRange(positions)) => keys.covers_positions(positions),
-        Some(Extent::Base(crate::interpreter::BaseType::Unit)) => {
-            keys.unqualified_arms().contains(&Value::Unit)
-        }
-        _ => keys.is_true(),
-    }
-}
-
-/// State `tile` complete where it states every key of its outermost collection, a finite range
-/// of positions (`Extent::UIntRange`), without stating `True`.
-///
-/// A pull at some keys states completeness of those keys alone, so a cache merging the answers
-/// to pulls at every key states each of them and not the whole. A reader holding the collection
-/// beneath a level of its own states that level complete only where the collection states
-/// `True`, so the cache states it once it can.
-fn position_closure(tile: &Tile, tiling: &Tiling) -> Option<Predicate> {
-    let Tile::DataFunction {
-        domain,
-        codomain,
-        domain_predicate,
-        ..
-    } = tile
-    else {
-        return None;
-    };
-    if domain_predicate.is_true() {
-        return None;
-    }
-    let whole_rows = matches!(codomain.as_ref(), Tile::DataFunction { domain_predicate, .. } if domain_predicate.is_true())
-        .then(|| domain_predicate.union(&Predicate::from_column_value(domain)));
-    if covers_domain(
-        whole_rows.as_ref().unwrap_or(domain_predicate),
-        tiling.domain_extent().as_ref(),
-    ) {
-        Some(Predicate::True)
-    } else {
-        whole_rows.filter(|rows| rows != domain_predicate)
-    }
 }
 
 impl Breaker for MemoProducer {
