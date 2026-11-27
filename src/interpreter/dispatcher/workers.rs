@@ -477,23 +477,8 @@ impl WorkerPool {
             WorkerPipeline::Scope(action) => return action.consume(dispatcher, package, reach),
             WorkerPipeline::Breaker(spec) => spec,
         };
-        let consume = |breaker: &dyn Breaker| {
-            debug_assert!(
-                package
-                    .guard
-                    .check_from(&breaker.input_tiling(InputId::ONLY)),
-                "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
-                pipeline.0,
-                package.guard
-            );
-            breaker.consume_impl(InputId::ONLY, package.guard.clone());
-        };
-        let publish = |producer: &dyn BreakingProducer| {
-            let mut pushes = dispatcher.pushes(pipeline);
-            pushes.push_final(producer);
-            pushes
-        };
-        let pushes = if spec.concurrent {
+        let mut pushes = dispatcher.pushes(pipeline);
+        if spec.concurrent {
             debug_assert!(
                 Projection::of(&package.guard).is_ok(),
                 "pipeline {} runs a package beside others that names no projection: {:?}",
@@ -502,33 +487,33 @@ impl WorkerPool {
             );
             match &spec.target {
                 WorkerBreaker::Sink(sink) => {
-                    consume(&*sink.read().unwrap_or_else(PoisonError::into_inner));
-                    None
+                    package.consume(
+                        &*sink.read().unwrap_or_else(PoisonError::into_inner),
+                        InputId::ONLY,
+                        &mut pushes,
+                    );
                 }
                 WorkerBreaker::Chain(handle) => {
-                    let publishes = {
+                    let needs_snapshot = {
                         let breaker = handle.read().unwrap_or_else(PoisonError::into_inner);
-                        consume(&*breaker);
-                        breaker.pushes_while_consuming()
+                        package
+                            .consume(&*breaker, InputId::ONLY, &mut pushes)
+                            .is_some()
                     };
-                    publishes.then(|| {
-                        // A reader may act on this push immediately. Take a snapshot between
-                        // consumes, after each consume has both merged and released its input.
+                    if needs_snapshot {
                         let breaker = handle.write().unwrap_or_else(PoisonError::into_inner);
-                        publish(&*breaker)
-                    })
+                        pushes.push_final(&*breaker);
+                    }
                 }
             }
         } else {
             spec.target.write(|breaker| {
-                consume(breaker);
-                breaker
-                    .as_producer()
-                    .filter(|p| p.pushes_while_consuming())
-                    .map(publish)
-            })
-        };
-        if let Some(pushes) = pushes {
+                if let Some(producer) = package.consume(breaker, InputId::ONLY, &mut pushes) {
+                    pushes.push_final(producer);
+                }
+            });
+        }
+        if !pushes.pending.is_empty() {
             dispatcher.land(pushes);
         }
         // Before the acknowledgement that can leave the body quiescent: the round's step waits
@@ -645,6 +630,7 @@ mod tests {
         context::{GlobalContext, compile_program},
         load::LoadedProgram,
     };
+    use crate::interpreter::{Tile, TileGuard, Tiling};
 
     fn evaluate(source: &str, dop: usize) -> super::super::Run {
         let mut context = GlobalContext::default();
@@ -652,19 +638,42 @@ mod tests {
             compile_program(&mut context, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
         run_program_with_workers(&mut program, 8, dop).unwrap()
     }
+    enum TestBreaker {
+        Sink,
+        MapAggregate,
+        FlatMemo,
+        NestedMemo,
+        NestedMemoReleasing,
+        NestedMemoClosingEmpty,
+        NestedMemoClosingAncestors,
+        RecordMemoReleasing,
+        RecordMemoDiscarded,
+    }
+
     #[rstest_log::rstest]
-    #[case::sink(false)]
-    #[case::map_aggregate(true)]
-    fn acknowledges_while_a_peer_is_still_pulling(#[case] aggregate: bool) {
+    #[case::sink(TestBreaker::Sink)]
+    #[case::map_aggregate(TestBreaker::MapAggregate)]
+    #[case::flat_memo(TestBreaker::FlatMemo)]
+    #[case::nested_memo(TestBreaker::NestedMemo)]
+    #[case::nested_memo_releasing(TestBreaker::NestedMemoReleasing)]
+    #[case::close_without_payload_while_peer_releases(TestBreaker::NestedMemoClosingEmpty)]
+    #[case::absent_leaf_closes_two_ancestors_before_peer_releases(
+        TestBreaker::NestedMemoClosingAncestors
+    )]
+    #[case::record_memo_releasing(TestBreaker::RecordMemoReleasing)]
+    #[case::release_output_while_input_release_is_paused(TestBreaker::RecordMemoDiscarded)]
+    fn acknowledges_while_a_peer_is_still_consuming(#[case] target: TestBreaker) {
         use super::*;
         use crate::ccl::AggregateKind;
         use crate::interpreter::{
             DataSink, Tile,
             tile_operators::{
-                ProducerBase, SinkBreaker, TileProducer,
-                growing::{KEYS, NestedInput, source},
-                map_aggregate_over,
-                test_helpers::keys_between,
+                MemoProducer, ProducerBase, SinkBreaker, TileProducer,
+                growing::{Input, KEYS, NestedInput, source},
+                guard_covers, map_aggregate_over,
+                test_helpers::{
+                    ProjectionSpy, int_entries, keys_between, paths_guard, two_levels_of_ints,
+                },
             },
             types::BaseType,
         };
@@ -672,9 +681,23 @@ mod tests {
         use std::time::Duration;
 
         struct PausedInput {
-            inner: NestedInput,
+            inner: Box<dyn TileProducer>,
+            paused: TileGuard,
+            pause_on_release: bool,
             entered: mpsc::Sender<()>,
             resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl PausedInput {
+            fn pause(&self, guard: &TileGuard, releasing: bool) {
+                if releasing == self.pause_on_release && *guard == self.paused {
+                    self.entered.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
+                        .unwrap();
+                }
+            }
         }
         impl TileProducer for PausedInput {
             fn base(&self) -> &ProducerBase {
@@ -683,18 +706,15 @@ mod tests {
             fn base_mut(&mut self) -> &mut ProducerBase {
                 self.inner.base_mut()
             }
+            fn restates(&self) -> crate::interpreter::Restates {
+                self.inner.restates()
+            }
             fn get_impl(&self, guard: TileGuard) -> Tile {
-                if guard == keys_between(0, 0) {
-                    self.entered.send(()).unwrap();
-                    self.resume
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(15))
-                        .unwrap();
-                }
+                self.pause(&guard, false);
                 self.inner.get_impl(guard)
             }
             fn release_impl(&self, guard: TileGuard) {
+                self.pause(&guard, true);
                 self.inner.release_impl(guard);
             }
         }
@@ -705,33 +725,152 @@ mod tests {
             }
         }
 
+        // Both nested claims contribute to row 0 of a two-row collection. Finishing
+        // the merge closes only row 0, leaving row 1 open.
+        let discard_output = matches!(target, TestBreaker::RecordMemoDiscarded);
+        let record = matches!(target, TestBreaker::RecordMemoReleasing) || discard_output;
+        let field = |key| if key == 0 { "left" } else { "right" };
+        let record_tiling = Tiling::Record(
+            [
+                ("left".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                ("right".into(), two_levels_of_ints().1),
+            ]
+            .into(),
+        );
+        let ancestors = matches!(target, TestBreaker::NestedMemoClosingAncestors);
+        let empty_close = matches!(target, TestBreaker::NestedMemoClosingEmpty) || ancestors;
+        let releasing = matches!(target, TestBreaker::NestedMemoReleasing) || empty_close;
+        let nested = matches!(target, TestBreaker::NestedMemo) || releasing;
+        let point = |key| Predicate::point(Value::UInt(key));
+        let claim = |key| {
+            if record {
+                let part = if key == 0 {
+                    Projection::Everything
+                } else {
+                    Projection::keys_at(
+                        crate::interpreter::CurryLevel::new(1),
+                        Predicate::qualified(point(1), point(2)),
+                    )
+                };
+                Projection::of_field(field(key), part).guard(&record_tiling)
+            } else if nested {
+                let inner = if key == 0 {
+                    point(0).union(&point(1))
+                } else {
+                    point(2)
+                };
+                if ancestors {
+                    crate::interpreter::CurryLevel::new(2).wrap_guard(TileGuard::Function(
+                        FunctionGuard::Domain(Predicate::qualified(
+                            Predicate::exactly(&[Value::UInt(0), Value::UInt(0)]),
+                            inner,
+                        )),
+                    ))
+                } else {
+                    paths_guard(Predicate::qualified(point(0), inner))
+                }
+            } else {
+                keys_between(key, key)
+            }
+        };
         let (entered, pulling) = mpsc::channel();
         let (release, resume) = mpsc::channel();
         let input = Box::new(PausedInput {
-            inner: NestedInput::over(&source(0..2)),
+            inner: match target {
+                TestBreaker::RecordMemoReleasing | TestBreaker::RecordMemoDiscarded => {
+                    let tile = Tile::record(
+                        [
+                            (
+                                "left".into(),
+                                Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![11])),
+                            ),
+                            ("right".into(), two_levels_of_ints().0),
+                        ]
+                        .into(),
+                    );
+                    Box::new(ProjectionSpy::new(tile, record_tiling.clone()).0)
+                }
+                TestBreaker::NestedMemoClosingAncestors => {
+                    // Row 0 has one group and row 1 is still open in the memo. The
+                    // second worker learns only that the group's third item is absent.
+                    let (mut tile, ty) = two_levels_of_ints();
+                    let Tile::DataFunction { codomain, .. } = &mut tile else {
+                        unreachable!()
+                    };
+                    **codomain = Tile::grouped(
+                        vec![0, 1],
+                        crate::interpreter::ColumnValue::UInts(vec![0, 0]),
+                        codomain.clone(),
+                        Predicate::True,
+                        Default::default(),
+                    );
+                    let ty = Tiling::data_function(
+                        Extent::uint_range(2),
+                        Tiling::data_function(
+                            Extent::uint_range(1),
+                            ty.values_at(crate::interpreter::CurryLevel::new(1)).clone(),
+                        ),
+                    );
+                    tile.remove_guarded(claim(1));
+                    tile.compact();
+                    Box::new(ProjectionSpy::new(tile, ty).0)
+                }
+                TestBreaker::FlatMemo => Box::new(Input::over(&source(0..2))),
+                TestBreaker::NestedMemo
+                | TestBreaker::NestedMemoReleasing
+                | TestBreaker::NestedMemoClosingEmpty => {
+                    let (mut tile, tiling) = two_levels_of_ints();
+                    if empty_close {
+                        tile.remove_guarded(claim(1));
+                        tile.compact();
+                    }
+                    Box::new(ProjectionSpy::new(tile, tiling).0)
+                }
+                _ => Box::new(NestedInput::over(&source(0..2))),
+            },
+            paused: claim(0),
+            pause_on_release: releasing || record,
             entered,
             resume: Mutex::new(resume),
         });
         let (delivered, tiles) = mpsc::channel();
         let reader = PipelineId(1);
-        let handle = if aggregate {
-            let output = Tiling::data_function(
-                Extent::uint_range(KEYS),
-                Tiling::Aggregation {
-                    kind: AggregateKind::Sum,
-                    accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-                },
-            );
-            let chain = map_aggregate_over(input, &output, AggregateKind::Sum);
-            chain.write().unwrap().base_mut().downstream =
-                Some(Arc::new(Entry::new(reader, output)));
-            WorkerBreaker::Chain(chain)
-        } else {
-            let sink = SinkBreaker::new(
-                Arc::new(RwLock::new(Some(input))),
-                Arc::new(Sink(delivered)),
-            );
-            WorkerBreaker::Sink(Arc::new(RwLock::new(sink)))
+        let mut memo = None;
+        let handle = match target {
+            TestBreaker::FlatMemo
+            | TestBreaker::NestedMemo
+            | TestBreaker::NestedMemoReleasing
+            | TestBreaker::NestedMemoClosingEmpty
+            | TestBreaker::NestedMemoClosingAncestors
+            | TestBreaker::RecordMemoReleasing
+            | TestBreaker::RecordMemoDiscarded => {
+                let tiling = input.tiling().clone();
+                let mut producer = MemoProducer::over(input, &tiling);
+                producer.base_mut().downstream = Some(Arc::new(Entry::new(reader, tiling)));
+                let chain: BreakerHandle = Arc::new(RwLock::new(producer));
+                memo = Some(chain.clone());
+                WorkerBreaker::Chain(chain)
+            }
+            TestBreaker::MapAggregate => {
+                let output = Tiling::data_function(
+                    Extent::uint_range(KEYS),
+                    Tiling::Aggregation {
+                        kind: AggregateKind::Sum,
+                        accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+                    },
+                );
+                let chain = map_aggregate_over(input, &output, AggregateKind::Sum);
+                chain.write().unwrap().base_mut().downstream =
+                    Some(Arc::new(Entry::new(reader, output)));
+                WorkerBreaker::Chain(chain)
+            }
+            TestBreaker::Sink => {
+                let sink = SinkBreaker::new(
+                    Arc::new(RwLock::new(Some(input))),
+                    Arc::new(Sink(delivered)),
+                );
+                WorkerBreaker::Sink(Arc::new(RwLock::new(sink)))
+            }
         };
         let workers = WorkerPool::new(
             2,
@@ -747,7 +886,7 @@ mod tests {
             ScopeSteps::default(),
         );
         let dispatcher = Dispatcher::new(
-            if aggregate {
+            if !matches!(target, TestBreaker::Sink) {
                 vec![vec![], vec![0]]
             } else {
                 vec![vec![], vec![]]
@@ -756,7 +895,7 @@ mod tests {
         );
         let pipeline = PipelineId(0);
         for key in 0..2 {
-            dispatcher.queue_for(pipeline, &keys_between(key, key));
+            dispatcher.queue_for(pipeline, &claim(key));
         }
         dispatcher.close(pipeline);
         let consume = || {
@@ -764,6 +903,58 @@ mod tests {
                 panic!("expected a disjoint package");
             };
             workers.consume(&dispatcher, package, &mut |_, _| unreachable!());
+        };
+        let read_key = |memo: &BreakerHandle, key: u64| {
+            let Next::Package(package) = dispatcher.try_claim(Some(reader)) else {
+                panic!("the reader must receive key {key}");
+            };
+            assert_eq!(package.pipeline, reader);
+            let memo = memo.read().unwrap();
+            let tile = in_a_run(|| memo.get(package.guard.clone()));
+            if record {
+                assert_eq!(package.guard, claim(key));
+                let Tile::Record { fields, .. } = tile else {
+                    panic!("expected a record")
+                };
+                assert_eq!(
+                    fields[field(key)].deepest_values(),
+                    &Tile::Scalar(crate::interpreter::ColumnValue::Ints(vec![if key == 0 {
+                        11
+                    } else {
+                        12
+                    }])),
+                );
+                assert!(fields[field(1 - key)].is_empty());
+            } else if nested {
+                let row = keys_between(0, 0);
+                let closing_claim = if releasing { 1 } else { 0 };
+                let expected = if key == closing_claim {
+                    guard_minus(&row, &claim(1 - key))
+                } else {
+                    claim(key)
+                };
+                assert!(
+                    guard_covers(&expected, &package.guard)
+                        && guard_covers(&package.guard, &expected)
+                );
+                assert_eq!(guard_covers(&memo.complete(), &row), key == 0 || releasing);
+                assert!(!guard_covers(&memo.complete(), &keys_between(1, 1)));
+                let values = if key == 0 {
+                    vec![0, 1]
+                } else if empty_close {
+                    vec![]
+                } else {
+                    vec![2]
+                };
+                assert_eq!(
+                    tile.deepest_values(),
+                    &Tile::Scalar(crate::interpreter::ColumnValue::Ints(values))
+                );
+            } else {
+                assert_eq!(package.guard, claim(key));
+                assert_eq!(int_entries(&tile), vec![(key, key as i64 * 10)]);
+            }
+            dispatcher.acknowledge(package);
         };
         let timeout = Duration::from_secs(5);
         thread::scope(|threads| {
@@ -775,26 +966,686 @@ mod tests {
                 let _ = done.send(());
             });
             let completed = acknowledged.recv_timeout(timeout);
+            if completed.is_ok()
+                && let Some(memo) = &memo
+            {
+                read_key(memo, 1);
+            }
             let outstanding = dispatcher.outstanding(pipeline);
             let waiting = matches!(dispatcher.try_claim(None), Next::Wait(_));
+            if discard_output {
+                let memo = memo.as_ref().unwrap();
+                threads.spawn(|| {
+                    memo.read()
+                        .unwrap()
+                        .release(record_tiling.universal_guard())
+                });
+                // The reader can abandon its subscription while the writer releases its
+                // input. Its release promise is recorded before physical reclamation waits.
+                let deadline = std::time::Instant::now() + timeout;
+                while !memo.read().unwrap().obsolete_guard().is_universal() {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
             release.send(()).unwrap();
-            completed.expect("the second package can acknowledge before the first pull returns");
+            completed.expect("the second package can acknowledge while its peer is paused");
             assert_eq!(outstanding, 1);
             assert!(waiting, "finish still waits for the first package");
         });
-        assert_eq!(dispatcher.outstanding(reader), 0, "no incremental push");
+        if !discard_output && let Some(memo) = &memo {
+            read_key(memo, 0);
+        }
+        assert_eq!(dispatcher.outstanding(reader), 0, "no extra packages");
         let Next::Finish { pipeline } = dispatcher.try_claim(None) else {
             panic!("both packages acknowledged");
         };
         workers.finish(&dispatcher, pipeline, &mut |_, _| unreachable!());
-        if aggregate {
+        if nested {
+            while let Next::Package(package) = dispatcher.try_claim(Some(reader)) {
+                assert!(
+                    package.guard.intersect(&keys_between(0, 0)).is_empty(),
+                    "finish must not publish any of row 0 again: {:?}",
+                    package.guard
+                );
+                dispatcher.acknowledge(package);
+            }
+        }
+        if matches!(target, TestBreaker::MapAggregate) {
             assert!(
                 dispatcher.outstanding(reader) > 0,
                 "finish publishes the held groups"
             );
-        } else {
+        } else if matches!(target, TestBreaker::Sink) {
             assert_eq!(tiles.try_iter().count(), 2, "one delivery per key");
         }
+    }
+
+    /// Both packages read row 7. Pause A during its pull or during release after its merge. B must
+    /// publish, reach the sink and release just its field before A can return.
+    #[rstest_log::rstest]
+    #[case::during_read(false)]
+    #[case::during_release(true)]
+    fn cached_memo_delivers_a_sibling_field_while_the_first_worker_is_paused(
+        #[case] on_release: bool,
+    ) {
+        use super::*;
+        use crate::interpreter::{ColumnValue, CurryLevel, Tile, types::BaseType};
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record([("a".into(), scalar.clone()), ("b".into(), scalar)].into()),
+        );
+        let record = Tile::record(
+            [
+                ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![17]))),
+                ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![29]))),
+            ]
+            .into(),
+        );
+        let row = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(record),
+            Predicate::False,
+            Default::default(),
+        );
+        let field = |name| {
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(7)),
+                Projection::of_field(name, Projection::Everything),
+            )
+            .guard(&tiling)
+        };
+        let (mut first, second, remaining) =
+            deliver_sibling_packages(&row, &tiling, [field("a"), field("b")], on_release);
+        first.merge(second);
+        assert_eq!(first, row);
+        assert!(
+            remaining.is_empty(),
+            "releasing both fields reclaims the row"
+        );
+    }
+
+    #[rstest_log::rstest]
+    #[case::during_read(false)]
+    #[case::during_release(true)]
+    fn cached_memo_delivers_item_four_while_item_two_is_paused(#[case] on_release: bool) {
+        use super::*;
+        use crate::interpreter::{ColumnValue, CurryLevel, Tile};
+        let tiling = customer_tiling();
+        let customers = customers_with_history();
+        let field = |item| customer_history_item(&tiling, item);
+        let (first, second, remaining) =
+            deliver_sibling_packages(&customers, &tiling, [field(2), field(4)], on_release);
+        for (tile, item, value) in [(first, 4, 74), (second, 2, 72)] {
+            assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
+            let Tile::Record { fields, .. } = tile.deepest_values() else {
+                panic!("expected customer record")
+            };
+            assert!(fields["id"].is_empty());
+            assert_eq!(fields["profile"].cell_count(), 0);
+            assert_eq!(
+                fields["history"].paths_at(CurryLevel::new(1)),
+                [vec![Value::UInt(3), Value::UInt(item)]]
+            );
+            assert_eq!(
+                fields["history"].deepest_values(),
+                &Tile::Scalar(ColumnValue::Ints(vec![value]))
+            );
+        }
+        assert!(!remaining.contains_guarded(&field(2)));
+        assert!(!remaining.contains_guarded(&field(4)));
+    }
+
+    #[rstest_log::rstest]
+    #[case::during_read(false)]
+    #[case::during_release(true)]
+    fn cached_memo_delivers_the_nested_profile_while_a_history_item_is_paused(
+        #[case] on_release: bool,
+    ) {
+        use super::*;
+        use crate::interpreter::{ColumnValue, CurryLevel, Tile};
+        let tiling = customer_tiling();
+        let profile = Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(7)),
+            Projection::of_field("profile", Projection::Everything),
+        )
+        .guard(&tiling);
+        let (first, _, _) = deliver_sibling_packages(
+            &customers_with_history(),
+            &tiling,
+            [customer_history_item(&tiling, 2), profile],
+            on_release,
+        );
+        let Tile::Record { fields, .. } = first.deepest_values() else {
+            panic!("customer")
+        };
+        let Tile::Record {
+            fields: profile, ..
+        } = &fields["profile"]
+        else {
+            panic!("profile")
+        };
+        assert_eq!(profile["rank"], Tile::Scalar(ColumnValue::Ints(vec![1])));
+        assert_eq!(
+            profile["visits"].deepest_values(),
+            &Tile::Scalar(ColumnValue::Ints(vec![1]))
+        );
+        assert!(fields["history"].is_empty());
+    }
+
+    #[test]
+    fn a_mixed_memo_package_keeps_each_customers_projection() {
+        use super::*;
+        use crate::interpreter::CurryLevel;
+        let tiling = customer_tiling();
+        let customer_eight = Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(8)),
+            Projection::of_field(
+                "profile",
+                Projection::of_field("rank", Projection::Everything),
+            ),
+        )
+        .guard(&tiling);
+        let mixed = customer_eight.union(&customer_history_item(&tiling, 4));
+        let (first, _, _) = deliver_sibling_packages(
+            &customers_with_history(),
+            &tiling,
+            [customer_history_item(&tiling, 2), mixed.clone()],
+            false,
+        );
+        assert_eq!(first.to_guard(), mixed);
+        assert_eq!(
+            first.cell_count(),
+            6,
+            "two customer keys, a rank and one day/item/value"
+        );
+    }
+
+    // Two independently seeded stores and two snapshots of running sums, one per customer.
+    fn customers_with_state(finished: [bool; 2], totals: [i64; 2]) -> (Tiling, Tile) {
+        use super::*;
+        use crate::{
+            ccl::AggregateKind,
+            interpreter::{ColumnValue, StoreClosures, types::BaseType},
+        };
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let store = Tiling::Store {
+            domain: Extent::uint_range(16),
+            codomain: Box::new(Tiling::Record([("balance".into(), int.clone())].into())),
+        };
+        let one = |value, terminal| {
+            let mut t = store.empty_tile();
+            let Tile::Store { seed, closures, .. } = &mut t else {
+                unreachable!()
+            };
+            **seed = Tile::record(
+                [(
+                    "balance".into(),
+                    Tile::Scalar(ColumnValue::Ints(vec![value])),
+                )]
+                .into(),
+            );
+            *closures = StoreClosures::uniform(terminal);
+            t
+        };
+        let mut accounts = one(13, finished[0]);
+        accounts.merge_rows(one(29, finished[1]));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record(
+                [
+                    ("account".into(), store),
+                    (
+                        "total".into(),
+                        Tiling::Aggregation {
+                            kind: AggregateKind::Sum,
+                            accumulator: Box::new(int.clone()),
+                        },
+                    ),
+                    ("id".into(), int),
+                ]
+                .into(),
+            ),
+        );
+        let rows = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![7, 8]),
+            Box::new(Tile::record(
+                [
+                    ("account".into(), accounts),
+                    (
+                        "total".into(),
+                        Tile::Aggregation {
+                            kind: AggregateKind::Sum,
+                            accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(totals.into()))),
+                            terminal: ColumnValue::Bools(finished.into()),
+                        },
+                    ),
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            Default::default(),
+        );
+        (tiling, rows)
+    }
+
+    fn state_field(tiling: &Tiling, row: u64, name: &str) -> TileGuard {
+        use super::*;
+        use crate::interpreter::CurryLevel;
+        Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(row)),
+            Projection::of_field(name, Projection::Everything),
+        )
+        .guard(tiling)
+    }
+
+    #[rstest_log::rstest]
+    fn a_finished_store_and_sum_reach_the_sink_independently(
+        #[values(false, true)] on_release: bool,
+    ) {
+        use crate::interpreter::ColumnValue;
+        let (ty, rows) = customers_with_state([true, true], [3, 9]);
+        let (first, second, _) = deliver_sibling_packages(
+            &rows,
+            &ty,
+            [state_field(&ty, 7, "total"), state_field(&ty, 7, "account")],
+            on_release,
+        );
+        let Tile::Record { fields, .. } = first.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Store { seed, closures, .. } = &fields["account"] else {
+            unreachable!()
+        };
+        assert!(closures.at(0).terminal);
+        let Tile::Record { fields, .. } = &**seed else {
+            unreachable!()
+        };
+        assert_eq!(fields["balance"], Tile::Scalar(ColumnValue::Ints(vec![13])));
+        let Tile::Record { fields, .. } = second.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Aggregation { accumulator, .. } = &fields["total"] else {
+            unreachable!()
+        };
+        assert_eq!(**accumulator, Tile::Scalar(ColumnValue::Ints(vec![3])));
+    }
+
+    #[test]
+    fn a_memo_retains_unfinished_state_at_the_input_until_its_customer_closes() {
+        use super::*;
+        use crate::interpreter::{
+            ColumnValue,
+            tile_operators::{
+                MemoProducer, TileProducer,
+                test_helpers::{ConsumeInPipeline, ProjectionSpy},
+            },
+        };
+        let (ty, rows) = customers_with_state([true, false], [3, 4]);
+        let (spy, script) = ProjectionSpy::scripted(rows, ty.clone());
+        let releases = spy.released.clone();
+        let mut memo = MemoProducer::over(Box::new(spy), &ty);
+        memo.consume_in_pipeline(InputId::ONLY, ty.universal_guard());
+        let sum = state_field(&ty, 8, "total");
+        let account = state_field(&ty, 8, "account");
+        let first = releases.read().unwrap()[0].clone();
+        assert!(first.subsumes(&state_field(&ty, 7, "total")));
+        assert!(first.subsumes(&state_field(&ty, 7, "account")));
+        assert!(first.intersect(&sum.union(&account)).is_empty());
+        let absent = in_a_run(|| memo.get(sum.clone()));
+        assert!(absent.to_guard().is_empty());
+        *script.write().unwrap() = customers_with_state([true, true], [3, 11]).1;
+        memo.consume_in_pipeline(InputId::ONLY, ty.universal_guard());
+        let last = releases.read().unwrap().last().unwrap().clone();
+        assert!(last.subsumes(&sum.union(&account)));
+        assert!(last.intersect(&first).is_empty());
+        let ready = in_a_run(|| memo.get(sum));
+        let Tile::Record { fields, .. } = ready.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Aggregation { accumulator, .. } = &fields["total"] else {
+            unreachable!()
+        };
+        assert_eq!(**accumulator, Tile::Scalar(ColumnValue::Ints(vec![11])));
+        let store = in_a_run(|| memo.get(account));
+        let Tile::Record { fields, .. } = store.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Store { seed, .. } = &fields["account"] else {
+            unreachable!()
+        };
+        let Tile::Record { fields, .. } = &**seed else {
+            unreachable!()
+        };
+        assert_eq!(fields["balance"], Tile::Scalar(ColumnValue::Ints(vec![29])));
+    }
+
+    fn customers_with_history() -> Tile {
+        use crate::interpreter::{ColumnValue, Predicate, Tile};
+        // The same item keys occur on another day and under another customer.
+        let group = |starts, keys, values| {
+            Tile::grouped(
+                starts,
+                ColumnValue::UInts(keys),
+                Box::new(values),
+                Predicate::False,
+                Default::default(),
+            )
+        };
+        let history = group(
+            vec![0, 2],
+            vec![3, 5, 3],
+            group(
+                vec![0, 2, 3],
+                vec![2, 4, 4, 4],
+                Tile::Scalar(ColumnValue::Ints(vec![72, 74, 75, 84])),
+            ),
+        );
+        let mut customers = group(
+            vec![0],
+            vec![7, 8],
+            Tile::record(
+                [
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                    (
+                        "profile".into(),
+                        Tile::record(
+                            [
+                                ("rank".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+                                (
+                                    "visits".into(),
+                                    group(
+                                        vec![0, 1],
+                                        vec![0, 1],
+                                        Tile::Scalar(ColumnValue::Ints(vec![1, 3])),
+                                    ),
+                                ),
+                            ]
+                            .into(),
+                        ),
+                    ),
+                    ("history".into(), history),
+                ]
+                .into(),
+            ),
+        );
+        // A closed cache must only restate the requested leaf.
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut customers
+        {
+            *domain_predicate = Predicate::True;
+        }
+        customers
+    }
+
+    fn customer_tiling() -> Tiling {
+        use super::*;
+        use crate::interpreter::types::BaseType;
+        let collection = |values| Tiling::data_function(Extent::uint_range(16), values);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        collection(Tiling::Record(
+            [
+                ("id".into(), scalar.clone()),
+                (
+                    "profile".into(),
+                    Tiling::Record(
+                        [
+                            ("rank".into(), scalar.clone()),
+                            ("visits".into(), collection(scalar.clone())),
+                        ]
+                        .into(),
+                    ),
+                ),
+                ("history".into(), collection(collection(scalar))),
+            ]
+            .into(),
+        ))
+    }
+
+    fn customer_history_item(tiling: &Tiling, item: u64) -> TileGuard {
+        use super::*;
+        use crate::interpreter::CurryLevel;
+        Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(7)),
+            Projection::of_field(
+                "history",
+                Projection::of_path(&[Value::UInt(3), Value::UInt(item)]),
+            ),
+        )
+        .guard(tiling)
+    }
+
+    #[test]
+    fn a_whole_customer_read_serializes_with_each_history_item() {
+        use super::*;
+        let tiling = customer_tiling();
+        let whole = Projection::admitting(Predicate::point(Value::UInt(7))).guard(&tiling);
+        let two = customer_history_item(&tiling, 2);
+        let four = customer_history_item(&tiling, 4);
+        let queue = Queue::new();
+        queue.append(&[
+            two.clone(),
+            four.clone(),
+            whole.clone(),
+            whole.clone(),
+            two.clone(),
+        ]);
+        let claim = || {
+            queue
+                .claim(0, false, || Some(()))
+                .map(|(package, ())| package)
+        };
+        let a = claim().unwrap();
+        let b = claim().unwrap();
+        assert_eq!((&a.guard, &b.guard), (&two, &four));
+        assert!(claim().is_none());
+        queue.acknowledge(&b, || {}).unwrap();
+        assert!(claim().is_none());
+        queue.acknowledge(&a, || {}).unwrap();
+        let first_row = claim().unwrap();
+        assert_eq!(first_row.guard, whole);
+        assert!(claim().is_none(), "two whole-row reads must serialize");
+        queue.acknowledge(&first_row, || {}).unwrap();
+        let second_row = claim().unwrap();
+        assert_eq!(second_row.guard, whole);
+        assert!(
+            claim().is_none(),
+            "a leaf also waits behind a whole-row read"
+        );
+        queue.acknowledge(&second_row, || {}).unwrap();
+        let leaf = claim().unwrap();
+        assert_eq!(leaf.guard, two);
+        queue.acknowledge(&leaf, || {}).unwrap();
+    }
+
+    fn deliver_sibling_packages(
+        row: &Tile,
+        tiling: &Tiling,
+        [paused_field, ready_field]: [TileGuard; 2],
+        on_release: bool,
+    ) -> (Tile, Tile, Tile) {
+        use super::*;
+        use crate::interpreter::{
+            DataSink, Tile,
+            tile_operators::{
+                MemoProducer, ProducerBase, SinkBreaker, TileProducer, share_breaker,
+                test_helpers::{ConsumeInPipeline, ProjectionSpy, first_breaker},
+            },
+        };
+        use std::{sync::mpsc, time::Duration};
+
+        struct PausedField {
+            input: Box<dyn TileProducer>,
+            field: TileGuard,
+            on_release: bool,
+            paused: mpsc::Sender<()>,
+            resume: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl PausedField {
+            fn pause(&self, guard: &TileGuard, releasing: bool) {
+                if self.on_release == releasing
+                    && *guard == self.field
+                    && let Some(resume) = self.resume.lock().unwrap().take()
+                {
+                    self.paused.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(15)).unwrap();
+                }
+            }
+        }
+        impl TileProducer for PausedField {
+            fn base(&self) -> &ProducerBase {
+                self.input.base()
+            }
+            fn base_mut(&mut self) -> &mut ProducerBase {
+                self.input.base_mut()
+            }
+            fn get(&self, guard: TileGuard) -> Tile {
+                let answer = self.input.get(guard.clone());
+                self.pause(&guard, false);
+                answer
+            }
+            fn get_impl(&self, _: TileGuard) -> Tile {
+                unreachable!()
+            }
+            fn release_impl(&self, guard: TileGuard) {
+                self.pause(&guard, true);
+                self.input.release_impl(guard);
+            }
+        }
+        struct Output(mpsc::Sender<Tile>);
+        impl DataSink for Output {
+            fn process(&self, tile: &Tile) {
+                self.0.send(tile.clone()).unwrap();
+            }
+        }
+
+        let (spy, _, _) = ProjectionSpy::new(row.clone(), tiling.clone());
+        let mut cache = MemoProducer::over(Box::new(spy), tiling);
+        cache.consume_in_pipeline(InputId::ONLY, tiling.universal_guard());
+        let (paused, entered) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        let cached_reader = share_breaker(cache);
+        let original = first_breaker(&*cached_reader).unwrap();
+        let input = PausedField {
+            input: cached_reader,
+            field: paused_field.clone(),
+            on_release,
+            paused,
+            resume: Mutex::new(Some(resume_rx)),
+        };
+        let (source, sink) = (PipelineId(0), PipelineId(1));
+        let mut memo = MemoProducer::over(Box::new(input), tiling);
+        memo.base_mut().downstream = Some(Arc::new(Entry::new(sink, tiling.clone())));
+        let reader = share_breaker(memo);
+        let chain = first_breaker(&*reader).unwrap();
+        let (sent, tiles) = mpsc::channel();
+        let output = Arc::new(RwLock::new(SinkBreaker::new(
+            Arc::new(RwLock::new(Some(reader))),
+            Arc::new(Output(sent)),
+        )));
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 16);
+        let execution = plan::Execution::new(&[None, None], &mut dispatcher);
+        let workers = execution.worker_pool(&mut dispatcher, 2, |id| {
+            Some(if id == source.0 {
+                WorkerBreaker::Chain(chain.clone())
+            } else {
+                WorkerBreaker::Sink(output.clone())
+            })
+        });
+        for guard in [&paused_field, &ready_field] {
+            dispatcher.queue_for(source, guard);
+        }
+        let consume = |pipeline, expected: TileGuard| {
+            let package = dispatcher
+                .claim_of(pipeline)
+                .expect("independent field ready");
+            assert_eq!(package.guard, expected);
+            workers.consume(&dispatcher, package, &mut |_, _| unreachable!());
+        };
+        let timeout = Duration::from_secs(5);
+        let delivered = thread::scope(|threads| {
+            let worker_a = threads.spawn(|| consume(source, paused_field.clone()));
+            entered.recv_timeout(timeout).expect("first worker paused");
+            threads.spawn(|| {
+                consume(source, ready_field.clone());
+                consume(sink, ready_field.clone());
+            });
+            let first = tiles.recv_timeout(timeout);
+            let released = chain.read().unwrap().obsolete_guard();
+            resume.send(()).unwrap();
+            worker_a.join().unwrap();
+            let first =
+                first.expect("the ready package reached the sink while its sibling was paused");
+            assert_eq!(released, ready_field);
+            assert_eq!(first.to_guard(), ready_field);
+            consume(sink, paused_field.clone());
+            let second = tiles.recv_timeout(timeout).unwrap();
+            assert_eq!(second.to_guard(), paused_field);
+            (first, second)
+        });
+        assert_eq!(dispatcher.outstanding(sink), 0);
+        assert!(tiles.try_recv().is_err());
+        let remaining = in_a_run(|| chain.read().unwrap().get(tiling.universal_guard()));
+        // Check physical reclamation in the original memo too. The other day and
+        // customer have the same item key and must retain their cells.
+        let mut expected = row.clone();
+        expected.remove_guarded(paused_field.union(&ready_field));
+        expected.compact();
+        let cached = in_a_run(|| original.read().unwrap().get(tiling.universal_guard()));
+        assert_eq!(cached, expected);
+        (delivered.0, delivered.1, remaining)
+    }
+
+    #[test]
+    fn flat_memo_publishes_partial_answers_and_later_absences_once() {
+        use super::*;
+        use crate::interpreter::tile_operators::{
+            MemoProducer,
+            growing::{Input, growing_source, ints},
+            test_helpers::{keys_between, push_to},
+        };
+
+        let source = growing_source([0, 2, 4]);
+        let mut memo = MemoProducer::over(Box::new(Input::over(&source)), &ints());
+        push_to(&mut memo, &[1]);
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
+        let requested = keys_between(0, 5);
+        let consume = |guard| {
+            let mut pushes = dispatcher.pushes(PipelineId(0));
+            let snapshot = memo.consume_for_dispatch(InputId::ONLY, guard, &mut pushes);
+            assert!(
+                snapshot.is_none(),
+                "each package publishes its own completion"
+            );
+            dispatcher.land(pushes);
+            let mut received = Vec::new();
+            while let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(1))) {
+                received.push(package.guard.clone());
+                dispatcher.acknowledge(package);
+            }
+            received
+        };
+        let point = |k| keys_between(k, k);
+        assert_eq!(
+            consume(requested.clone()),
+            vec![point(0).union(&point(2)), point(4)]
+        );
+        assert!(consume(requested.clone()).is_empty());
+        source.write().unwrap().closed = true;
+        let absent = point(1).union(&point(3)).union(&point(5));
+        assert_eq!(consume(requested.clone()), vec![absent]);
+        // Completing the remaining positions closes the whole finite collection.
+        let rest = guard_minus(&ints().universal_guard(), &requested);
+        assert_eq!(consume(keys_between(6, 11)), vec![rest]);
     }
 
     /// The first handler holds its schedule and its store until a distinct worker enters the
