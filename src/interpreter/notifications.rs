@@ -515,6 +515,8 @@ struct Pairing {
 /// Each arm's record grows only on a delivery ([`Landing::is_delivery`]).
 pub(crate) struct AlignedDelivered {
     arms: Vec<crate::interpreter::Predicate>,
+    /// Only a zip pairing at the outer row level distinguishes individual field arrivals.
+    zip: Option<Box<ZipDeliveries>>,
 }
 
 /// [`AlignedDelivered`], shared by the consumers in front of one operator's arms.
@@ -559,8 +561,27 @@ impl AlignedInputs {
             .collect();
         Self {
             at,
-            delivered: Arc::new(Mutex::new(AlignedDelivered { arms })),
+            delivered: Arc::new(Mutex::new(AlignedDelivered { arms, zip: None })),
         }
+    }
+
+    /// A zip arm maps later item arrivals to its own field of already joined rows.
+    pub(crate) fn zip_field(
+        &self,
+        arm: usize,
+        name: smol_str::SmolStr,
+        consumer: Box<dyn Consumer>,
+    ) -> Box<dyn Consumer> {
+        Box::new(Aligned {
+            arm,
+            at: self.at,
+            delivered: self.delivered.clone(),
+            field: Some(FieldBeneathRows {
+                name,
+                rows: self.at,
+            }),
+            consumer,
+        })
     }
 
     /// `consumer` behind the consumer of input `arm`, which passes on a delivery only under the
@@ -576,6 +597,7 @@ impl AlignedInputs {
             arm,
             at: self.at,
             delivered: self.delivered.clone(),
+            field: None,
             consumer,
         });
         match rows {
@@ -589,6 +611,7 @@ struct Aligned {
     arm: usize,
     at: CurryLevel,
     delivered: SharedAligned,
+    field: Option<FieldBeneathRows>,
     consumer: Box<dyn Consumer>,
 }
 
@@ -619,14 +642,16 @@ fn rows_reached(region: &Projection, at: CurryLevel) -> Option<crate::interprete
 
 impl Consumer for Aligned {
     fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        // A landing that queues nothing states what is decided rather than what arrived, so it is
-        // cut by nothing.
+        let rows = |r: &Projection| match &self.field {
+            Some(field) => field.restated(r).rows(),
+            None => r.clone(),
+        };
         if !landing.is_delivery() {
-            self.consumer.notify(region, landing);
+            self.consumer.notify(&rows(region), landing);
             return;
         }
         let Some(delta) = rows_reached(region, self.at) else {
-            self.consumer.notify(region, landing);
+            self.consumer.notify(&rows(region), landing);
             return;
         };
         // The other arms are read and the delta recorded under one lock, so of two deliveries on
@@ -645,11 +670,25 @@ impl Consumer for Aligned {
             });
         let own = &mut delivered.arms[self.arm];
         *own = own.union(&delta);
-        drop(delivered);
-        let restated = match others.is_true() {
-            true => region.clone(),
-            false => region.intersect(&Projection::keys_at(self.at, others)),
+        let arrived = if others.is_true() {
+            region.clone()
+        } else {
+            region.intersect(&Projection::keys_at(self.at, others.clone()))
         };
+        let restated = match &self.field {
+            Some(field) if self.at == CurryLevel::OUTERMOST => {
+                let zip = delivered.zip.get_or_insert_with(|| {
+                    Box::new(ZipDeliveries {
+                        announced: crate::interpreter::Predicate::False,
+                        items: HashMap::new(),
+                    })
+                });
+                zip.arrival(self.arm, field, region, &arrived, &delta.intersect(&others))
+            }
+            Some(field) => field.restated(&arrived).rows(),
+            None => arrived,
+        };
+        drop(delivered);
         if restated == Projection::Nothing {
             return;
         }
@@ -745,30 +784,49 @@ impl Consumer for SelectingFieldBeneathKeys {
     }
 }
 
-/// `consumer` behind a consumer that forwards a region of a record's field `name`, the record
-/// standing at `level` beneath rows, as that field of the rows it reaches: the rows a region of the
-/// field's keys runs through, within the field `name`'s part, and nothing of the other fields.
-/// `Zip` passes this to each arm, whose rows are the pair's and whose values are one field of it,
-/// so a push on one arm names no part of another arm's field.
-pub fn field_beneath_rows(
-    name: smol_str::SmolStr,
-    level: CurryLevel,
-    consumer: Box<dyn Consumer>,
-) -> Box<dyn Consumer> {
-    let rows = level
-        .enclosing()
-        .expect("a field beneath rows stands beneath a level of rows");
-    Box::new(FieldBeneathRows {
-        name,
-        rows,
-        consumer,
-    })
+/// The first delivery to match a row announces all its fields. Subsequent item deliveries
+/// announce their field alone until the accumulated items cover the field's entire domain.
+struct ZipDeliveries {
+    announced: crate::interpreter::Predicate,
+    items: HashMap<usize, Projection>,
+}
+
+impl ZipDeliveries {
+    fn arrival(
+        &mut self,
+        arm: usize,
+        field: &FieldBeneathRows,
+        region: &Projection,
+        arrived: &Projection,
+        matched: &crate::interpreter::Predicate,
+    ) -> Projection {
+        let first = matched.minus(&self.announced);
+        self.announced = self.announced.union(matched);
+        let Projection::Keys { level, .. } = region else {
+            return field.restated(arrived).rows();
+        };
+        if *level == field.rows {
+            return field.restated(arrived).rows();
+        }
+        // Keep even arrivals before the other arm reaches the row. The last item or an
+        // empty remainder can complete the field without a row-level notification.
+        let seen = self.items.entry(arm).or_insert(Projection::Nothing);
+        *seen = seen.union(region);
+        let closed = match &*seen {
+            Projection::Everything => crate::interpreter::Predicate::True,
+            Projection::Keys { level, keys } => {
+                (0..level.index()).fold(keys.clone(), |keys, _| keys.rows_whole_beneath())
+            }
+            _ => unreachable!("the union of nonempty key deliveries is keys or everything"),
+        };
+        let whole = Projection::keys_at(field.rows, first.union(&matched.intersect(&closed)));
+        whole.union(&field.restated(&arrived.minus(&whole)))
+    }
 }
 
 struct FieldBeneathRows {
     name: smol_str::SmolStr,
     rows: CurryLevel,
-    consumer: Box<dyn Consumer>,
 }
 
 impl FieldBeneathRows {
@@ -837,23 +895,6 @@ impl FieldBeneathRows {
             }
             other => panic!("{other:?} names a part this field's rows have no spelling for"),
         }
-    }
-}
-
-impl FieldBeneathRows {}
-
-impl Consumer for FieldBeneathRows {
-    /// A notification names keys, and what of each row's value is final is stated in the tiles
-    /// the row's reader pulls. A change of one field names the rows it runs through. A complete
-    /// region names the rows whose field it completes whole, which says this arm's part of those
-    /// rows is final; the reader joins it with the other inputs it reads.
-    fn notify(&self, region: &Projection, landing: &mut Landing<'_>) {
-        let restated = self.restated(region);
-        let rows = restated.rows();
-        if rows == Projection::Nothing && landing.is_delivery() {
-            return;
-        }
-        self.consumer.notify(&rows, landing);
     }
 }
 
