@@ -1863,6 +1863,18 @@ impl Pushes<'_> {
         region: &TileGuard,
         cut: impl FnOnce(&TileGuard, usize) -> Vec<TileGuard>,
     ) {
+        let new = self.reserve_region(breaker, region);
+        self.cut(&new, cut);
+    }
+
+    /// Reserve the new output for this package. A memo reserves under its cache
+    /// lock so another writer cannot claim the same output from the merged cache.
+    /// The owner cuts the reservation and lands it after releasing its input.
+    pub(crate) fn reserve_region<B: BreakingProducer + ?Sized>(
+        &mut self,
+        breaker: &B,
+        region: &TileGuard,
+    ) -> TileGuard {
         let to = breaker.base().downstream.clone();
         self.dispatcher.ensure(to.is_some(), || {
             format!(
@@ -1872,11 +1884,10 @@ impl Pushes<'_> {
             )
         });
         self.to = to;
-        let guard = self.record(|pushed| match pushed {
+        self.record(|pushed| match pushed {
             Some(pushed) => guard_minus(region, pushed),
             None => region.clone(),
-        });
-        self.cut(&guard, cut);
+        })
     }
 
     /// Add the region `next` computes from the region pushed so far to that region, under its
@@ -1921,7 +1932,11 @@ impl Pushes<'_> {
     }
 
     /// Cut `guard`, recorded as pushed, into the morsels it lands as.
-    fn cut(&mut self, guard: &TileGuard, cut: impl FnOnce(&TileGuard, usize) -> Vec<TileGuard>) {
+    pub(crate) fn cut(
+        &mut self,
+        guard: &TileGuard,
+        cut: impl FnOnce(&TileGuard, usize) -> Vec<TileGuard>,
+    ) {
         if guard.is_empty() {
             return;
         }

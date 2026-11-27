@@ -9,7 +9,7 @@ impl Tile {
         #[cfg(test)]
         self.check_memo_row(&incoming, Some(0), 0, &mut Vec::new(), false);
 
-        if self.insert_memo_items(&incoming, projection).is_some() {
+        if self.insert_memo_items(&mut incoming, projection).is_some() {
             return;
         }
         if let (
@@ -140,9 +140,9 @@ impl Tile {
         }
     }
 
-    /// Insert complete plain items into a single collection field of an existing outer row.
+    /// Append complete items to a collection field of existing outer rows.
     /// The projection guarantees that no sibling field contributed data or completeness.
-    fn insert_memo_items(&mut self, incoming: &Tile, projection: &Projection) -> Option<()> {
+    fn insert_memo_items(&mut self, incoming: &mut Tile, projection: &Projection) -> Option<()> {
         let Projection::Within {
             level: CurryLevel::OUTERMOST,
             values,
@@ -168,7 +168,7 @@ impl Tile {
             return None;
         };
         let Tile::DataFunction {
-            domain,
+            domain: added_parents,
             codomain: added_record,
             keys_follow_beneath: added_follow,
             domain_predicate: added_complete,
@@ -177,18 +177,16 @@ impl Tile {
         else {
             return None;
         };
-        let parent = domain.as_single()?;
         if !added_complete.is_false() || follow != added_follow {
             return None;
         }
-        let row = (0..parents.len()).find(|i| parents.index_at(*i) == parent)?;
         let (
             Tile::Record { fields, .. },
             Tile::Record {
                 fields: added_fields,
                 ..
             },
-        ) = (codomain.as_mut(), added_record.as_ref())
+        ) = (codomain.as_mut(), added_record.as_mut())
         else {
             return None;
         };
@@ -205,12 +203,13 @@ impl Tile {
             return None;
         };
         let Tile::DataFunction {
+            row_starts: added_starts,
             domain: keys,
             codomain: values,
             domain_predicate: stated,
             keys_follow_beneath: new_follow,
             ..
-        } = added_fields.get(name)?
+        } = added_fields.get_mut(name)?
         else {
             return None;
         };
@@ -223,12 +222,57 @@ impl Tile {
         {
             return None;
         }
-        if !keys.is_empty() {
-            let end = row_starts.get(row + 1).copied().unwrap_or(domain.len());
-            domain.insert_column(end, keys.clone());
-            codomain.insert_plain_rows(end, values);
-            for offset in &mut row_starts[row + 1..] {
-                *offset += keys.len();
+        if row_starts.len() != parents.len() || added_starts.len() != added_parents.len() {
+            return None;
+        }
+        if parents == added_parents && domain.is_empty() {
+            // The previous items have been released. The new columns already have
+            // exactly the cache's row order, including empty runs.
+            std::mem::swap(row_starts, added_starts);
+            std::mem::swap(domain, keys);
+            std::mem::swap(codomain, values);
+        } else if let Some(parent) = added_parents.as_single() {
+            let row = (0..parents.len()).find(|i| parents.index_at(*i) == parent)?;
+            if !keys.is_empty() {
+                let end = row_starts.get(row + 1).copied().unwrap_or(domain.len());
+                domain.insert_column(end, keys.clone());
+                codomain.insert_plain_rows(end, values);
+                for offset in &mut row_starts[row + 1..] {
+                    *offset += keys.len();
+                }
+            }
+        } else {
+            // Resolve every parent before changing any column: a new parent needs
+            // the record merge to align its sibling fields as well.
+            let mut incoming: HashMap<_, _> = (0..added_parents.len())
+                .map(|r| {
+                    (
+                        added_parents.index_at(r),
+                        level_run(added_starts, r, keys.len()),
+                    )
+                })
+                .collect();
+            let runs: Vec<_> = (0..parents.len())
+                .map(|r| incoming.remove(&parents.index_at(r)).unwrap_or_default())
+                .collect();
+            if !incoming.is_empty() {
+                return None;
+            }
+            if !keys.is_empty() {
+                // Gather the old run followed by the new run for each parent. Moving
+                // each suffix separately would copy the same later rows repeatedly.
+                let old_len = domain.len();
+                let mut order = Vec::with_capacity(old_len + keys.len());
+                for (r, (from, to)) in runs.into_iter().enumerate() {
+                    let (start, end) = level_run(row_starts, r, old_len);
+                    row_starts[r] = order.len();
+                    order.extend(start..end);
+                    order.extend(old_len + from..old_len + to);
+                }
+                domain.extend_from(keys);
+                codomain.insert_plain_rows(old_len, values);
+                *domain = domain.select_indices(order.iter().copied(), order.len());
+                **codomain = codomain.select_rows(&order);
             }
         }
         *domain_predicate = domain_predicate.union(stated);
@@ -377,8 +421,12 @@ mod tests {
             )
         };
         for key in [4, 2] {
-            let delivery = orders(&[7], &[0], &[key], &[key as i64 * 10]);
-            assert!(cache.insert_memo_items(&delivery, &order(key)).is_some());
+            let mut delivery = orders(&[7], &[0], &[key], &[key as i64 * 10]);
+            assert!(
+                cache
+                    .insert_memo_items(&mut delivery, &order(key))
+                    .is_some()
+            );
         }
         assert_eq!(
             cache,
@@ -387,6 +435,64 @@ mod tests {
         let update = orders(&[7], &[0], &[4], &[99]);
         rejects_update(&mut cache, update.clone(), &order(4));
         rejects_update(&mut cache, update, &Projection::Everything);
+    }
+
+    fn histories() -> Projection {
+        Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(7)).union(&Predicate::point(Value::UInt(9))),
+            Projection::of_field("history", Projection::Everything),
+        )
+    }
+
+    #[test]
+    fn batched_items_follow_the_cached_parent_order_and_preserve_siblings() {
+        let mut cache = customers(&[7, 8, 9], &[0, 1, 2], &[1, 1, 1], &[71, 81, 91]);
+        // Same item key under different parents; the producer enumerates the parents
+        // in the opposite order. Row 8 has no delivery.
+        let mut batch = customers(&[9, 7], &[0, 2], &[4, 2, 4], &[94, 92, 74]);
+        let mut reference = cache.clone();
+        reference.merge(batch.clone());
+        assert!(cache.insert_memo_items(&mut batch, &histories()).is_some());
+        assert_eq!(cache, reference);
+        assert_eq!(
+            cache,
+            customers(
+                &[7, 8, 9],
+                &[0, 2, 3],
+                &[1, 4, 1, 1, 4, 2],
+                &[71, 74, 81, 91, 94, 92]
+            )
+        );
+
+        // Closure without an item must survive even if no column is moved.
+        let mut close = customers(&[9, 7], &[0, 0], &[], &[]);
+        let Tile::Record { fields, .. } = close.deepest_values_mut() else {
+            unreachable!()
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = fields.get_mut("history").unwrap()
+        else {
+            unreachable!()
+        };
+        *domain_predicate = Predicate::qualified(Predicate::point(Value::UInt(9)), Predicate::True);
+        reference.merge(close.clone());
+        assert!(cache.insert_memo_items(&mut close, &histories()).is_some());
+        assert_eq!(cache, reference);
+    }
+
+    #[test]
+    fn a_new_parent_falls_back_before_any_cached_parent_is_changed() {
+        let mut cache = customers(&[7], &[0], &[1], &[71]);
+        let before = cache.clone();
+        let mut batch = customers(&[7, 9], &[0, 1], &[2, 1], &[72, 91]);
+        assert!(cache.insert_memo_items(&mut batch, &histories()).is_none());
+        assert_eq!(cache, before);
+        let mut reference = before;
+        reference.merge(batch.clone());
+        cache.append(batch, &histories());
+        assert_eq!(cache, reference);
     }
 
     #[test]

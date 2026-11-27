@@ -645,6 +645,7 @@ mod tests {
         NestedMemo,
         NestedMemoReleasing,
         RecordMemoReleasing,
+        RecordMemoDiscarded,
     }
 
     #[rstest_log::rstest]
@@ -654,6 +655,7 @@ mod tests {
     #[case::nested_memo(TestBreaker::NestedMemo)]
     #[case::nested_memo_releasing(TestBreaker::NestedMemoReleasing)]
     #[case::record_memo_releasing(TestBreaker::RecordMemoReleasing)]
+    #[case::release_output_while_input_release_is_paused(TestBreaker::RecordMemoDiscarded)]
     fn acknowledges_while_a_peer_is_still_consuming(#[case] target: TestBreaker) {
         use super::*;
         use crate::ccl::AggregateKind;
@@ -719,7 +721,8 @@ mod tests {
 
         // Both nested claims contribute to row 0 of a two-row collection. Finishing
         // the merge closes only row 0, leaving row 1 open.
-        let record = matches!(target, TestBreaker::RecordMemoReleasing);
+        let discard_output = matches!(target, TestBreaker::RecordMemoDiscarded);
+        let record = matches!(target, TestBreaker::RecordMemoReleasing) || discard_output;
         let field = |key| if key == 0 { "left" } else { "right" };
         let record_tiling = Tiling::Record(
             [
@@ -757,7 +760,7 @@ mod tests {
         let (release, resume) = mpsc::channel();
         let input = Box::new(PausedInput {
             inner: match target {
-                TestBreaker::RecordMemoReleasing => {
+                TestBreaker::RecordMemoReleasing | TestBreaker::RecordMemoDiscarded => {
                     let tile = Tile::record(
                         [
                             (
@@ -789,7 +792,8 @@ mod tests {
             TestBreaker::FlatMemo
             | TestBreaker::NestedMemo
             | TestBreaker::NestedMemoReleasing
-            | TestBreaker::RecordMemoReleasing => {
+            | TestBreaker::RecordMemoReleasing
+            | TestBreaker::RecordMemoDiscarded => {
                 let tiling = input.tiling().clone();
                 let mut producer = MemoProducer::over(input, &tiling);
                 producer.base_mut().downstream = Some(Arc::new(Entry::new(reader, tiling)));
@@ -913,12 +917,27 @@ mod tests {
             }
             let outstanding = dispatcher.outstanding(pipeline);
             let waiting = matches!(dispatcher.try_claim(None), Next::Wait(_));
+            if discard_output {
+                let memo = memo.as_ref().unwrap();
+                threads.spawn(|| {
+                    memo.read()
+                        .unwrap()
+                        .release(record_tiling.universal_guard())
+                });
+                // The reader can abandon its subscription while the writer releases its
+                // input. Its release promise is recorded before physical reclamation waits.
+                let deadline = std::time::Instant::now() + timeout;
+                while !memo.read().unwrap().obsolete_guard().is_universal() {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
             release.send(()).unwrap();
             completed.expect("the second package can acknowledge while its peer is paused");
             assert_eq!(outstanding, 1);
             assert!(waiting, "finish still waits for the first package");
         });
-        if let Some(memo) = &memo {
+        if !discard_output && let Some(memo) = &memo {
             read_key(memo, 0);
         }
         assert_eq!(dispatcher.outstanding(reader), 0, "no extra packages");

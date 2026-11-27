@@ -1610,14 +1610,18 @@ fn held_final_guard<P: BreakingProducer + ?Sized>(producer: &P) -> TileGuard {
 
 /// Keep the still-held output of either a whole snapshot or one consume's contribution.
 fn held_after_release(held: TileGuard, obsolete: &TileGuard, tiling: &Tiling) -> TileGuard {
-    let left = match names_collection_keys(obsolete) {
+    closed_keeping_row_ends(without_obsolete(held, obsolete), tiling)
+}
+
+/// Remove reclaimed output without expanding a package's already-reserved row ends.
+fn without_obsolete(held: TileGuard, obsolete: &TileGuard) -> TileGuard {
+    match names_collection_keys(obsolete) {
         true => match keys_released_whole(obsolete) {
             Some(released) if !held.is_empty() => guard_minus(&held, &released),
             _ => held,
         },
         false => guard_minus(&held, obsolete),
-    };
-    closed_keeping_row_ends(left, tiling)
+    }
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of

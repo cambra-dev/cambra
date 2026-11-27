@@ -1920,7 +1920,7 @@ impl MemoProducer {
         answer.retain_finished_state_fields();
         let released = answer.to_guard();
         answer.compact();
-        let held = {
+        let reserved = {
             let mut cache = self
                 .cached_tile
                 .write()
@@ -1936,12 +1936,15 @@ impl MemoProducer {
             if !held.is_empty() {
                 cache.append(answer, projection);
             }
-            held
+            pushes.filter(|p| p.has_readers()).map(|pushes| {
+                let new = pushes.reserve_region(self, &held);
+                (pushes, new)
+            })
         };
         self.input.release(released);
-        if let Some(pushes) = pushes.filter(|p| p.has_readers()) {
-            let remaining = guard_minus(&held, &self.obsolete_guard());
-            pushes.push_region(self, &remaining, |part, _| vec![part.clone()]);
+        if let Some((pushes, new)) = reserved {
+            let remaining = guard_minus(&new, &self.obsolete_guard());
+            pushes.cut(&remaining, |part, _| vec![part.clone()]);
         }
     }
 
@@ -1991,11 +1994,9 @@ impl MemoProducer {
             .cached_tile
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        // An irregular answer can finish a record field, or widen a previous statement.
-        // Compare both sides of this merge under the same lock so a peer which is
-        // still releasing its input owns the publication of everything it merged.
-        let mut before =
-            (pushes.is_some() && flat.is_none() && nested.is_none()).then(|| cache.to_guard());
+        // An irregular merge can finish a record or widen an earlier statement.
+        // The dispatcher already remembers every region reserved by prior writers.
+        let mut read_merged = flat.is_none() && nested.is_none();
         cache.append(input, &projection);
         let nested = nested.map(|answer| answer.merge_into(&mut cache, self.tiling()));
         for depth in (0..self.tiling().levels()).rev() {
@@ -2003,9 +2004,7 @@ impl MemoProducer {
             if let Some(closed) =
                 position_closure(cache.values_at(level), self.tiling().values_at(level))
             {
-                if pushes.is_some() {
-                    before.get_or_insert_with(|| cache.to_guard());
-                }
+                read_merged = true;
                 let Tile::DataFunction {
                     domain_predicate, ..
                 } = cache.values_at_mut(level)
@@ -2015,24 +2014,35 @@ impl MemoProducer {
                 *domain_predicate = closed;
             }
         }
-        let change = before.map(|previous| (previous, cache.to_guard()));
+
         if let Projection::Keys { level, keys } = &projection {
             let complete = cache.completion_at(*level).intersect(keys);
             released =
                 released.union(&Projection::keys_at(*level, complete).guard(self.input.tiling()));
         }
+        let reserved = pushes.map(|pushes| {
+            let mut region = nested
+                .map(|paths| paths.guard(self.tiling()))
+                .or_else(|| flat.as_ref().map(|(region, _)| region.clone()))
+                .unwrap_or_else(|| self.tiling().empty_guard());
+            if read_merged {
+                region = region.union(&cache.to_guard());
+            }
+            let obsolete = self.obsolete_guard();
+            let region = held_after_release(region, &obsolete, self.tiling());
+            let new = pushes.reserve_region(self, &region);
+            (pushes, new, obsolete)
+        });
         drop(cache);
         self.input.release(released);
-        let Some(pushes) = pushes else { return };
-        let mut region = nested
-            .map(|paths| paths.guard(self.tiling()))
-            .or_else(|| flat.as_ref().map(|(region, _)| region.clone()))
-            .unwrap_or_else(|| self.tiling().empty_guard());
-        if let Some((before, after)) = change {
-            region = region.union(&guard_minus(&after, &before));
+        let Some((pushes, mut region, previous_release)) = reserved else {
+            return;
+        };
+        let obsolete = self.obsolete_guard();
+        if obsolete != previous_release {
+            region = without_obsolete(region, &obsolete);
         }
-        let region = held_after_release(region, &self.obsolete_guard(), self.tiling());
-        pushes.push_region(self, &region, |new, rows| match flat {
+        pushes.cut(&region, |new, rows| match flat {
             Some((_, None)) => vec![new.clone()],
             Some((_, Some(keys))) => cut_at_keys(
                 new,
