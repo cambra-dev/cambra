@@ -5,7 +5,8 @@ use std::mem::take as take_buffers;
 
 use smol_str::SmolStr;
 
-use super::case::{Captured, CaseBuffers, PAYLOAD};
+use super::case::{Captured, CaseBuffers, PAYLOAD, Rows};
+use super::junction::JunctionBuffers;
 use super::{Instr, ScalarProgram};
 use crate::ccl::TagMap;
 use crate::interpreter::RowIndex;
@@ -54,6 +55,9 @@ pub(super) struct Buffers {
     slots: Vec<Option<ColumnValue>>,
     /// The buffers of the `Case` in each slot. A slot holding no `Case` keeps the empty default.
     cases: Vec<RefCell<CaseBuffers>>,
+    /// The buffers of the `Predicate` in each slot. A slot holding no `Predicate` keeps the empty
+    /// default.
+    junctions: Vec<RefCell<JunctionBuffers>>,
 }
 
 impl Buffers {
@@ -67,6 +71,9 @@ impl Buffers {
         self.empties = program.empties(input, captures);
         self.slots = vec![None; program.instrs.len()];
         self.cases = (0..program.instrs.len())
+            .map(|_| RefCell::default())
+            .collect();
+        self.junctions = (0..program.instrs.len())
             .map(|_| RefCell::default())
             .collect();
     }
@@ -133,11 +140,13 @@ impl Scratch<'_> {
                 .unwrap_or_else(|| panic!("the input at {path:?} is a column of a base type"))
                 .range(self.start..self.start + self.len),
             Instr::Const(value) => const_view(value, self.len),
-            Instr::Bin(..) | Instr::Un(..) | Instr::Case { .. } => self.buffers.slots[slot]
-                .as_ref()
-                .unwrap_or_else(|| panic!("s{slot} is written before an instruction reads it"))
-                .view()
-                .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
+            Instr::Bin(..) | Instr::Un(..) | Instr::Case { .. } | Instr::Predicate { .. } => {
+                self.buffers.slots[slot]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("s{slot} is written before an instruction reads it"))
+                    .view()
+                    .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type"))
+            }
             Instr::Record(_) | Instr::Wrap { .. } => {
                 unreachable!("no instruction views the constructor s{slot}")
             }
@@ -180,7 +189,8 @@ impl Scratch<'_> {
         let instr = &program.instrs[slot];
         if let Instr::Case {
             constructs: false, ..
-        } = instr
+        }
+        | Instr::Predicate { .. } = instr
         {
             let mut column = match self.buffers.slots[slot].take() {
                 Some(mut column) => {
@@ -189,7 +199,10 @@ impl Scratch<'_> {
                 }
                 None => self.buffers.empties[slot].clone(),
             };
-            self.case_block(program, slot, &mut column);
+            match instr {
+                Instr::Predicate { .. } => self.junction_block(program, slot, &mut column),
+                _ => self.case_block(program, slot, &mut column),
+            }
             self.buffers.slots[slot] = Some(column);
             return;
         }
@@ -215,7 +228,8 @@ impl Scratch<'_> {
             | Instr::Const(_)
             | Instr::Record(_)
             | Instr::Wrap { .. }
-            | Instr::Case { .. } => unreachable!("only an operation writes a slot"),
+            | Instr::Case { .. }
+            | Instr::Predicate { .. } => unreachable!("only an operation writes a slot"),
         }
     }
 
@@ -256,6 +270,7 @@ impl Scratch<'_> {
                 });
             }
             Instr::Case { .. } => self.append_case_block(program, slot, out),
+            Instr::Predicate { .. } => self.junction_block(program, slot, out),
             // An arm's body may answer with a value it reads: `else x`.
             Instr::Input { .. } | Instr::Const(_) => self.append(program, slot, out),
         }
@@ -295,6 +310,44 @@ impl Scratch<'_> {
         }
     }
 
+    /// Append the current block of the `Predicate` in `slot` to `out`, a `Bool` column: `true` at
+    /// the rows where its junction holds.
+    fn junction_block(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
+        let ColumnValue::Bools(out) = out else {
+            unreachable!("a `Predicate` writes a `Bool` column, got {out:?}")
+        };
+        if self.len == 0 {
+            return;
+        }
+        let mut rows = std::mem::take(&mut self.buffers.junctions[slot].borrow_mut().rows);
+        rows.set_block();
+        self.junction_rows(program, slot, &mut rows);
+        let start = out.len();
+        match rows.positions() {
+            None => out.resize(start + self.len, true),
+            Some(positions) => {
+                out.resize(start + self.len, false);
+                for &p in positions {
+                    out[start + p] = true;
+                }
+            }
+        }
+        self.buffers.junctions[slot].borrow_mut().rows = rows;
+    }
+
+    /// Narrow `rows`, rows of the current block, to those where the `Predicate` in `slot` holds.
+    fn junction_rows(&self, program: &ScalarProgram, slot: usize, rows: &mut Rows) {
+        let Instr::Predicate { junction, captures } = &program.instrs[slot] else {
+            unreachable!("s{slot} is a `Predicate`")
+        };
+        let captured: Vec<(SmolStr, Captured)> = captures
+            .iter()
+            .map(|(name, capture)| (name.clone(), self.captured(program, *capture as usize)))
+            .collect();
+        let mut buffers = self.buffers.junctions[slot].borrow_mut();
+        junction.holds(&captured, self.len, &mut buffers, rows);
+    }
+
     /// The current block of `slot` as a capture: a view of a column with one, the input's own
     /// column with the block's offset, or a column built for the block.
     fn captured<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> Captured<'s> {
@@ -311,6 +364,7 @@ impl Scratch<'_> {
             }
             Instr::Bin(..)
             | Instr::Un(..)
+            | Instr::Predicate { .. }
             | Instr::Case {
                 constructs: false, ..
             } => Captured::View(self.view(program, slot)),
@@ -341,6 +395,38 @@ impl ScalarProgram {
         self.eval_into(input, Captures::NONE, &mut buffers, &mut out);
         out.debug_assert_union_invariants();
         out
+    }
+
+    /// Set `rows` to the rows of `input`, one block, where this program holds, for a program whose
+    /// last instruction is a `Predicate`: the predicate answers its rows without writing a column.
+    pub(super) fn select_root(
+        &self,
+        input: &ColumnValue,
+        captures: Captures,
+        buffers: &mut Buffers,
+        rows: &mut Rows,
+    ) {
+        let last = self.instrs.len() - 1;
+        debug_assert!(
+            matches!(self.instrs[last], Instr::Predicate { .. }),
+            "a program selected through its root ends in a `Predicate`, got {self}"
+        );
+        buffers.prepare(self, input, captures);
+        let len = input.len();
+        debug_assert!(len <= BLOCK_ROWS, "a selected program reads one block");
+        let mut scratch = Scratch {
+            input,
+            captures,
+            buffers: take_buffers(buffers),
+            start: 0,
+            len,
+        };
+        for slot in 0..last {
+            scratch.run_into_slot(self, slot);
+        }
+        rows.set_block();
+        scratch.junction_rows(self, last, rows);
+        *buffers = scratch.buffers;
     }
 
     /// The empty column of the result's type, sizing `buffers` for an input with the columns of
@@ -430,6 +516,7 @@ impl ScalarProgram {
                     UnionArm::new(Vec::new(), empties[*payload as usize].clone()),
                 )])),
                 Instr::Case { shape, .. } => shape.0.clone(),
+                Instr::Predicate { .. } => ColumnValue::Bools(Vec::new()),
             };
             empties.push(empty);
         }

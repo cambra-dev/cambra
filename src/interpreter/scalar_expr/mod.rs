@@ -9,6 +9,7 @@
 
 mod case;
 mod eval;
+mod junction;
 mod parse;
 mod split;
 #[cfg(test)]
@@ -22,6 +23,7 @@ use crate::ccl::FieldKey;
 
 use super::{BaseType, BinOpKind as InterpreterBinOp, Extent, UnaryOpKind, Value};
 use case::{CaseFn, CaseGate, PAYLOAD, Shape};
+use junction::JunctionFn;
 
 /// The index of an instruction, which is also the slot it writes.
 type Slot = u32;
@@ -68,6 +70,13 @@ enum Instr {
         constructs: bool,
         shape: Shape,
     },
+    /// The short-circuit `and` or `or` of a [`JunctionFn`]'s `Bool` operands, applied to the
+    /// record of `captures` as a `Case` is: a `Bool` column, `true` at the rows where it holds. An
+    /// operation: it writes a scratch column.
+    Predicate {
+        junction: Box<JunctionFn>,
+        captures: Vec<(SmolStr, Slot)>,
+    },
 }
 
 impl Instr {
@@ -83,6 +92,61 @@ impl Instr {
                     ..
                 }
         )
+    }
+
+    /// The slots this instruction reads, in the order [`Instr::with_operands`] visits them.
+    fn operands(&self) -> Vec<Slot> {
+        match self {
+            Instr::Input { .. } | Instr::Const(_) => Vec::new(),
+            Instr::Bin(_, a, b) => vec![*a, *b],
+            Instr::Un(_, a) => vec![*a],
+            Instr::Wrap { payload, .. } => vec![*payload],
+            Instr::Record(fields)
+            | Instr::Case {
+                captures: fields, ..
+            }
+            | Instr::Predicate {
+                captures: fields, ..
+            } => fields.iter().map(|(_, slot)| *slot).collect(),
+        }
+    }
+
+    /// This instruction with each slot it reads replaced by `map` of it, visited in order.
+    fn with_operands(&self, mut map: impl FnMut(Slot) -> Slot) -> Instr {
+        let fields = |fields: &[(SmolStr, Slot)], map: &mut dyn FnMut(Slot) -> Slot| {
+            fields
+                .iter()
+                .map(|(name, slot)| (name.clone(), map(*slot)))
+                .collect::<Vec<_>>()
+        };
+        match self {
+            Instr::Input { .. } | Instr::Const(_) => self.clone(),
+            Instr::Bin(op, a, b) => {
+                let [a, b] = [*a, *b].map(&mut map);
+                Instr::Bin(*op, a, b)
+            }
+            Instr::Un(op, a) => Instr::Un(*op, map(*a)),
+            Instr::Wrap { tag, payload } => Instr::Wrap {
+                tag: tag.clone(),
+                payload: map(*payload),
+            },
+            Instr::Record(record) => Instr::Record(fields(record, &mut map)),
+            Instr::Case {
+                case,
+                captures,
+                constructs,
+                shape,
+            } => Instr::Case {
+                case: case.clone(),
+                captures: fields(captures, &mut map),
+                constructs: *constructs,
+                shape: shape.clone(),
+            },
+            Instr::Predicate { junction, captures } => Instr::Predicate {
+                junction: junction.clone(),
+                captures: fields(captures, &mut map),
+            },
+        }
     }
 }
 
@@ -129,10 +193,14 @@ impl ScalarProgram {
         let is_constructor = |slot: &Slot| self.instrs[*slot as usize].is_constructor();
         let last = self.instrs.len() - 1;
         let arms_are_placed = self.instrs.iter().all(|instr| match instr {
+            Instr::Predicate { junction, .. } => junction
+                .operands
+                .iter()
+                .all(|operand| operand.program.constructors_are_placed()),
             Instr::Case { case, .. } => case.arms.iter().all(|arm| {
-                arm.body.constructors_are_placed()
+                arm.body.program.constructors_are_placed()
                     && match &arm.gate {
-                        CaseGate::Holds { program, .. } => program.constructors_are_placed(),
+                        CaseGate::Holds(gate) => gate.program.constructors_are_placed(),
                         CaseGate::Rest | CaseGate::Tag { .. } => true,
                     }
             }),
@@ -177,6 +245,7 @@ impl ScalarProgram {
             Instr::Const(value) => value_extent(value).as_ref().is_some_and(has_view),
             Instr::Bin(..)
             | Instr::Un(..)
+            | Instr::Predicate { .. }
             | Instr::Case {
                 constructs: false, ..
             } => true,
@@ -211,6 +280,27 @@ impl std::fmt::Display for Instr {
                 write!(f, ")")
             }
             Instr::Wrap { tag, payload } => write!(f, "`{tag}(s{payload})"),
+            Instr::Predicate { junction, captures } => {
+                let kind = match junction.junction {
+                    junction::Junction::And => "and",
+                    junction::Junction::Or => "or",
+                };
+                write!(f, "{kind}(")?;
+                for (i, (name, capture)) in captures.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: s{capture}")?;
+                }
+                write!(f, ") [")?;
+                for (i, operand) in junction.operands.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "[{}]", operand.program)?;
+                }
+                write!(f, "]")
+            }
             Instr::Case { case, captures, .. } => {
                 write!(f, "case(")?;
                 for (i, (name, capture)) in captures.iter().enumerate() {
@@ -222,13 +312,13 @@ impl std::fmt::Display for Instr {
                 write!(f, ") {{ ")?;
                 for arm in &case.arms {
                     match &arm.gate {
-                        CaseGate::Holds { program, .. } => write!(f, "[{program}] -> ")?,
+                        CaseGate::Holds(gate) => write!(f, "[{}] -> ", gate.program)?,
                         CaseGate::Rest => write!(f, "else -> ")?,
                         CaseGate::Tag { scrutinee, tag, .. } => {
                             write!(f, "{scrutinee} is `{tag} -> ")?
                         }
                     }
-                    write!(f, "[{}]; ", arm.body)?;
+                    write!(f, "[{}]; ", arm.body.program)?;
                 }
                 write!(f, "}}")
             }

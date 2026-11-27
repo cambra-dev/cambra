@@ -487,36 +487,7 @@ impl Parser<'_> {
             _ if (slot as usize) < start => Instr::Input {
                 path: vec![self.capture(slot, start, captures)],
             },
-            Instr::Bin(op, a, b) => {
-                let a = copy(*a, instrs, captures);
-                let b = copy(*b, instrs, captures);
-                Instr::Bin(*op, a, b)
-            }
-            Instr::Un(op, a) => Instr::Un(*op, copy(*a, instrs, captures)),
-            Instr::Record(fields) => Instr::Record(
-                fields
-                    .iter()
-                    .map(|(name, field)| (name.clone(), copy(*field, instrs, captures)))
-                    .collect(),
-            ),
-            Instr::Wrap { tag, payload } => Instr::Wrap {
-                tag: tag.clone(),
-                payload: copy(*payload, instrs, captures),
-            },
-            Instr::Case {
-                case,
-                captures: inner,
-                constructs,
-                shape,
-            } => Instr::Case {
-                case: case.clone(),
-                captures: inner
-                    .iter()
-                    .map(|(name, capture)| (name.clone(), copy(*capture, instrs, captures)))
-                    .collect(),
-                constructs: *constructs,
-                shape: shape.clone(),
-            },
+            instr => instr.with_operands(|read| copy(read, instrs, captures)),
         };
         instrs.push(instr);
         let new = (instrs.len() - 1) as Slot;
@@ -1408,7 +1379,7 @@ mod tests {
             .arms
             .iter()
             .map(|arm| match &arm.gate {
-                CaseGate::Holds { program, .. } => program.to_string(),
+                CaseGate::Holds(gate) => gate.program.to_string(),
                 CaseGate::Rest => "else".into(),
                 CaseGate::Tag { .. } => "tag".into(),
             })

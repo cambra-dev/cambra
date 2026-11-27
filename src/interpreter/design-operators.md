@@ -1329,7 +1329,7 @@ conditionals nest by recursion.
 
 | Gate | Rows |
 |---|---|
-| `Holds { program }` | Those where the `Bool` program holds |
+| `Holds(SubProgram)` | Those where the `Bool` program holds |
 | `Rest` | Every row left: the final `else` |
 | `Tag { scrutinee, tag }` | Those whose value in the union capture `scrutinee` carries `tag` |
 
@@ -1385,6 +1385,212 @@ s1 = case(c0: s0) {
 
 For a block whose `x` is `[3, -1, 4, 0]`, the first arm takes positions `[0, 2]` and divides
 `[3, 4]`. The second takes `[1, 3]` and negates `[-1, 0]`, and the merge gives `[1, 1, 2, 0]`.
+
+#### Predicates
+
+A predicate is a `Bool`-valued instruction of a scalar program whose `and` and `or` short-circuit:
+the right operand is evaluated only on the rows that the left operand leaves undecided. A selective
+left operand shrinks the right operand's work, and the right operand is never evaluated on a row
+where the left one settles the result ([3.5 Short-circuit `not`, `and`,
+`or`](../../docs/chl-spec.md#35-short-circuit-not-and-or)). Predicates carry no per-row error masks:
+operands are tested in source order, and a failure in an operand that is evaluated traps.
+
+A predicate and a `Case` are separate instructions. A predicate selects rows and writes `true` or
+`false`; a `Case` computes a value per arm and merges the arms. They compose only through programs:
+a `Case` gate is a `Bool` program, and that program may hold a predicate.
+
+##### Sub-programs
+
+A sub-program is a program outlined from an enclosing one, together with the captures it reads,
+evaluated at a set of rows:
+
+```rust
+struct SubProgram {
+    program: ScalarProgram,
+    reads: Vec<SmolStr>,
+}
+```
+
+A `Holds` gate's program, an arm's body and a predicate's operands are `SubProgram`s. Evaluating a
+sub-program at `Rows` gathers the captures that have no view, reads the others through selection
+views, and runs the program once per block ([Conditional programs](#conditional-programs)).
+
+An operand has to be outlined because a program is straight-line: every instruction runs on every
+row of the block. In `x != 0 and 10 // x > 1`, an instruction `10 // x` of the enclosing program
+would divide at `x = 0` before the conjunction is evaluated.
+
+##### The instruction
+
+```rust
+enum Instr {
+    // ...
+    /// A `Bool` column: `true` at the rows where `junction` holds.
+    Predicate {
+        junction: Box<JunctionFn>,
+        captures: Vec<(SmolStr, Slot)>,
+    },
+}
+
+/// The short-circuit `and` or `or` of `operands`, in source order.
+struct JunctionFn {
+    junction: Junction,
+    operands: Vec<SubProgram>,
+}
+
+enum Junction {
+    /// Holds where every operand holds. Each operand is tested on the rows the previous ones kept.
+    And,
+    /// Holds where some operand holds. Each operand is tested on the rows the previous ones rejected.
+    Or,
+}
+```
+
+Each operand is a `Bool` sub-program of ordinary instructions. An operand that is itself an `and` or
+an `or` is a sub-program whose root instruction is a predicate, so predicates nest through programs,
+as a `Case` does. A junction is n-ary, since the spec flattens chains of `and` and of `or`. An
+operand is a maximal part of the expression that contains no short-circuit operator, so a strict `&`
+or `|` stays a `Bin` instruction inside it. `not` stays the `Un(Not)` instruction: it has one
+operand and nothing to short-circuit. A predicate's captures are read as a `Case`'s are. Like a
+`Case` of a base type, the instruction is an operation and writes a scratch slot.
+
+`x != 0 and (x > 5 or 100 // x > 30)` is one predicate whose second operand holds another. The
+program prints as follows, broken across lines:
+
+```
+s0 = _; s1 = 0; s2 = ≠(s0, s1);
+s3 = and(c0: s2, c1: s0) [
+  [s0 = _.c0; => s0],
+  [s0 = 5; s1 = _.c1; s2 = >(s1, s0);
+   s3 = or(c0: s2, c1: s1) [
+     [s0 = _.c0; => s0],
+     [s0 = 100; s1 = _.c1; s2 = //(s0, s1); s3 = 30; s4 = >(s2, s3); => s4]
+   ]; => s3]
+]; => s3
+```
+
+A `Case` keeps its gate kinds: `Holds(SubProgram)`, `Rest` and `Tag`. A `Tag` gate stays a `Case`
+gate because it hands the arm its payloads, which no predicate needs.
+
+##### Which conjunctions short-circuit
+
+| Source | Lowered to | Short-circuits |
+|---|---|---|
+| `𝑝 and 𝑞`, `𝑝 or 𝑞` | `LogicKind::And`, `LogicKind::Or` | yes ([3.5](../../docs/chl-spec.md#35-short-circuit-not-and-or)) |
+| `𝑎 < 𝑏 < 𝑐` | `𝑎 < 𝑏 and 𝑏 < 𝑐` | yes ([3.4 Comparisons](../../docs/chl-spec.md#34-comparisons)) |
+| `𝑝 & 𝑞`, `𝑝 \| 𝑞`, `𝑝 ^ 𝑞` | `LogicKind::And`, `LogicKind::Or`, `LogicKind::Xor` | no: both operands must be defined |
+| an arm's first-match gate | `synthesize_arm_predicate`: `𝑔ᵢ and not 𝑔₀ and …` | no predicate: a fused conditional reads the guards, and its `Case` tests arm `𝑖` only on rows no earlier arm took ([3.6 Ternary](../../docs/chl-spec.md#36-ternary)) |
+| comprehension guards `if 𝑝 if 𝑞` | the `and` of the guards (`comprehension.rs`) | open |
+
+Lowering emits `LogicKind::And` for both `and` and `&`, so the IR does not yet distinguish a
+short-circuit conjunction from a strict one. Until it does, recognition treats every `and` and `or`
+instruction of a fused program as short-circuit, including `&`, `|` and joined comprehension
+guards. A program outside a fused chain evaluates both operands at every row.
+
+##### Recognition
+
+`fuse_prefix` passes the finished program through `short_circuit` (`parse/short_circuit.rs`).
+In the program and in every program it holds, an `and` or `or` instruction whose right operand the
+left operand does not read becomes a predicate. The instructions the right operand reads, apart
+from inputs and the instructions the left operand reads, are copied into an operand sub-program.
+The left operand is computed at every row of the junction, so an instruction it reads is read as a
+capture. An instruction that only the operand reads leaves the enclosing program. The fusion parser
+gives equal instructions one slot, so two operands can read one instruction, such as the division
+in `x == 0 or 10 // x > 4 or 10 // x > 1`. Each operand then computes it on its own rows, and no
+row divides by zero. A right operand that is an input or a constant stays a strict operand: it is
+evaluated at every row either way. Recognition runs after a conditional's gates are read as their
+guards, so it does not change which conditionals fuse.
+
+A chain of one junction is one predicate. Before recognition, `𝑎 and (𝑏 and 𝑐)` is rewritten to
+`(𝑎 and 𝑏) and 𝑐` when only the outer `and` reads the inner one, and likewise for `or`. Both forms
+test `𝑏` only on the rows `𝑎` leaves undecided, and `𝑐` only on the rows `𝑎` and `𝑏` leave
+undecided. The inner instruction's slot takes `𝑎 and 𝑏`, so the rewrite needs `𝑎`'s slot before
+it. The parser emits `𝑎` first unless an equal instruction was emitted earlier. A right-nested
+chain that the rewrite skips stays correct and nests one predicate in another's operand. When the
+outer junction's left operand is a predicate of the same junction that only it reads, the outer
+predicate takes that predicate's operands and captures in place of a capture of its result. So
+`𝑎 and 𝑏 and 𝑐` is `and [𝑎, 𝑏, 𝑐]` in either nesting the parser emits. A chain that mixes `and`
+and `or`, such as `(𝑎 or 𝑏) and 𝑐`, stays two predicates: the outer one reads the inner one's result
+as a capture.
+
+##### Evaluation
+
+`select(𝑠, 𝑟)` answers the rows of `𝑟` where the `Bool` sub-program `𝑠` yields `true`, as a `Rows`:
+the whole block or ascending positions. A `Case` gate and a predicate's operands are evaluated
+through `select`. When the root instruction of `𝑠` is a predicate, `select` evaluates the junction
+on `𝑟` and answers its rows without writing a `Bool` column. Otherwise it runs `𝑠` at `𝑟` and
+splits `𝑟` by the result.
+
+| Junction | Rows of `𝑟` where it holds |
+|---|---|
+| `And(𝑠₀, …)` | `𝑟₀ = 𝑟`, then `𝑟ₖ₊₁ = select(𝑠ₖ, 𝑟ₖ)`; it stops when a set is empty |
+| `Or(𝑠₀, …)` | `𝑢₀ = 𝑟`, then `𝑢ₖ₊₁` is the rows of `𝑢ₖ` where `𝑠ₖ` fails; the answer is `𝑟` without the last `𝑢`; it stops when a set is empty |
+
+A `Bool` result that is `true` at every row of `𝑟` answers `𝑟` itself, and one that is `true` at no
+row answers the empty set, so a block that no operand splits lists no position. A split writes only
+the sides its caller reads (`Keep`): an `And` operand the rows it holds on, an `Or` operand the rows
+it fails on, and a `Case` gate both. Each predicate keeps its operands' buffers across blocks, as
+`CaseBuffers` does.
+
+`x != 0 and 10 // x > 1` over a block `x = [0, 1, 5, 20]`:
+
+```
+predicate and [x != 0, 10 // x > 1]
+  x != 0       at {0, 1, 2, 3} → {1, 2, 3}
+  10 // x > 1  at {1, 2, 3}    → {1, 2}       10 // 1 = 10, 10 // 5 = 2, 10 // 20 = 0
+  column: [false, true, true, false]
+```
+
+Row 0 never divides.
+
+##### Order and definedness
+
+Operands are tested in source order, each on the rows the operands before it left undecided. An
+operand moved earlier, or evaluated on more rows than that, could run on a row where an earlier
+operand settles the result, and a failure there would trap a program that the spec defines. So
+reordering operands and evaluating one densely over its junction's rows wait for per-row error
+masks. With masks, any operand may run on any row, and a failure resolves in source order: a row is
+undefined only if every operand before the failing one held on it.
+
+A fused `and` or `or` evaluates no operand on a row that an earlier operand decides, with one
+exception. An instruction that an operand reads stays in the enclosing program, and runs at every
+row, when a part of that program evaluated at every row also reads it. The fusion parser gives equal
+instructions one slot, and a conditional reads a slot emitted before it as a capture. So in
+`(x != 0 and 10 // x > 1, 10 // x if x != 0 else 0)` the conditional captures the division, which
+then runs at `x = 0` and traps. Outside a fused chain, a short-circuit conjunction evaluates both
+operands at every row.
+
+##### Cost
+
+An operand costs a split of its result into rows, where a strict operand costs one dense pass over
+the block. The split saves work only on the rows the operand removes, so an operand that removes few
+rows costs more than its dense pass would. The whole-block answers avoid the split for a block that
+an operand does not divide.
+
+A measurement from a benchmark outside the test suite, which nothing in the repository reproduces:
+over 100 million integers in `0..3000`, with one predicate of two or three operands in a
+conditional's gate or a comprehension guard, against the same programs with strict `and` and
+`or`:
+
+- Where the left operand decides every row of a block, as in sorted data, a predicate takes 0.46 to
+  0.6 of the strict time.
+- Where the rows a left operand decides are spread at random over a block, a predicate takes 1.0
+  to 1.5 times the strict time. An operand of comparisons, which costs less than its split, loses
+  most.
+
+##### Open questions
+
+- Whether comprehension guards short-circuit in clause order.
+  [3.12 Comprehensions](../../docs/chl-spec.md#312-comprehensions) states that each guard filters
+  the tuples, and states nothing about a guard that is undefined where an earlier one fails. The
+  predicate design does not depend on the answer.
+- How lowering marks a short-circuit conjunction: separate `LogicKind` variants, or a flag on
+  `BoolLogic`.
+- Whether recognition leaves a cheap operand strict when the operand cannot fail. An operand of
+  comparisons, constants and inputs is defined at every row, so evaluating it at every row changes
+  no program's result, and it costs less than its split ([Cost](#cost)).
+- The instruction's name. `Predicate` already names the domain predicate of a tiling
+  (`tiling::Predicate`). `Junction` names what the instruction computes, the short-circuit `and` or
+  `or` of its operands.
 
 #### Column views
 

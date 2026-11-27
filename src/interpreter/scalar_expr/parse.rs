@@ -1,6 +1,7 @@
 //! Recognize an element-wise chain as a [`ScalarProgram`]: [`fuse_prefix`].
 
 mod join;
+mod short_circuit;
 
 use std::collections::HashMap;
 
@@ -495,9 +496,9 @@ pub fn fuse_prefix(
     let (_, codomain) = parser
         .root_of(&root)
         .expect("the root is read from the state it was chosen in");
-    let program = ScalarProgram {
+    let program = short_circuit::short_circuit(ScalarProgram {
         instrs: parser.instrs,
-    };
+    });
     debug_assert!(
         program.constructors_build_only_the_result(),
         "a constructor is the last instruction or a field or payload of a later one, and no \

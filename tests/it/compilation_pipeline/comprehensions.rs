@@ -2045,3 +2045,48 @@ fn a_bound_fused_product_is_read_by_field() {
         Tile::Scalar(ColumnValue::Ints(vec![21])),
     );
 }
+
+/// A fused `and` or `or` evaluates its right operand only where the left one leaves the result
+/// open (`docs/chl-spec.md`, "3.5 Short-circuit `not`, `and`, `or`"), so none of these divides by
+/// zero at `x = 0`. `two_guards` pins the current lowering, which joins guards with `and`; whether
+/// guards short-circuit is open (`src/interpreter/design-operators.md`, "Open questions").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::and_in_a_filter("sum([x for x in [0, 1, 5] if x != 0 and 10 // x > 1])", 6)]
+#[case::or_in_a_map("sum([1 if (x == 0 or 10 // x > 1) else 0 for x in [0, 1, 5, 20]])", 3)]
+#[case::and_in_a_gate(
+    "sum([x // 2 if x != 0 and 10 // x > 1 else 0 for x in [0, 3, 20]])",
+    1
+)]
+#[case::a_gate_holding_at_every_row(
+    "sum([x // 2 if x != 0 and 10 // x > 1 else 0 for x in [2, 3, 4]])",
+    4
+)]
+#[case::a_gate_holding_at_no_row(
+    "sum([x // 2 if x != 0 and 10 // x > 1 else 0 for x in [0, 20]])",
+    0
+)]
+#[case::two_guards("sum([x for x in [0, 1, 5] if x != 0 if 10 // x > 1])", 6)]
+#[case::and_of_three(
+    "sum([x for x in [0, 1, 5, 20] if x != 0 and 10 // x > 1 and 20 // x > 3])",
+    6
+)]
+#[case::and_in_a_later_gate(
+    "sum([x if x > 10 else (1 if x != 0 and 10 // x > 1 else 0) for x in [0, 3, 20, 7]])",
+    21
+)]
+#[case::a_shared_division_in_a_later_gate(
+    "sum([x if x > 10 else (1 if x == 0 or 10 // x > 4 or 10 // x > 1 else 0) for x in [0, 3, 20, 7]])",
+    22
+)]
+#[case::an_or_of_an_and_in_a_later_gate(
+    "sum([x if x > 10 else (1 if x == 0 or (x > 2 and 10 // x > 1) else 0) for x in [0, 3, 20, 7, -1]])",
+    22
+)]
+#[case::or_of_three_in_a_later_gate(
+    "sum([x if x > 10 else (1 if x == 0 or 10 // x > 4 or 20 // x > 2 else 0) for x in [0, 3, 20, 7]])",
+    22
+)]
+fn a_fused_junction_short_circuits(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}

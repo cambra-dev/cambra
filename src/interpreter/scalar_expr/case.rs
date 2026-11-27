@@ -11,11 +11,12 @@ use smol_str::SmolStr;
 
 use std::collections::HashMap;
 
-use super::ScalarProgram;
 use super::eval::{Buffers, Captures};
+use super::{Instr, ScalarProgram};
 use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::RowIndex;
 use crate::interpreter::{ColumnValue, ColumnView, UnionArm};
+use crate::view::View;
 
 /// The field of an arm's input holding the payloads of a `Tag` gate's rows.
 pub(super) const PAYLOAD: &str = "~payload";
@@ -39,7 +40,7 @@ pub(super) struct CaseBuffers {
     pub(super) merged: Option<ColumnValue>,
 }
 
-/// One arm's buffers: its gate's input, program buffers and result, then its body's.
+/// One arm's buffers: its rows, then its gate's and its body's.
 #[derive(Default)]
 struct ArmBuffers {
     /// The rows of the block this arm took.
@@ -48,35 +49,59 @@ struct ArmBuffers {
     slots: Vec<RowIndex>,
     /// Whether this arm took a row of the current block.
     ran: bool,
-    gate_input: Option<ColumnValue>,
-    gate: Buffers,
-    holds: Option<ColumnValue>,
-    input: Option<ColumnValue>,
-    body: Buffers,
-    result: Option<ColumnValue>,
+    gate: SubBuffers,
+    body: SubBuffers,
 }
 
-/// A set of rows of a block: every row, without listing them, or the positions listed. A `Holds`
-/// gate that selects every row of a set moves the whole set, and one that selects none leaves it,
-/// so a block that no gate splits lists no position unless a `Tag` gate reads it.
+/// The buffers a [`SubProgram`] reuses across blocks: its input record, its program's scratch
+/// columns, and its result.
 #[derive(Default)]
-struct Rows {
-    block: bool,
-    positions: Vec<RowIndex>,
+pub(super) struct SubBuffers {
+    input: Option<ColumnValue>,
+    program: Buffers,
+    result: Option<ColumnValue>,
+    /// For a program whose root is a `Predicate`, the rows of its input where it holds.
+    holds: Rows,
+    /// Scratch for [`without`], one flag per row of a block.
+    marks: Vec<bool>,
+}
+
+/// The sides of a [`Split`] its caller reads: the rows taken, the rows left in `rest`, or both.
+#[derive(PartialEq)]
+pub(super) enum Keep {
+    Taken,
+    Rest,
+    Both,
+}
+
+/// A set of rows of a block: every row, without listing them, or the positions listed. A [`Split`]
+/// by a result that holds at every row of a set moves the whole set, and one by a result that holds
+/// at none leaves it, so a block that no gate or predicate operand splits lists no position unless
+/// a `Tag` gate reads it.
+#[derive(Default)]
+pub(super) struct Rows {
+    pub(super) block: bool,
+    pub(super) positions: Vec<RowIndex>,
 }
 
 impl Rows {
     /// The positions, or `None` for every row of the block.
-    fn positions(&self) -> Option<&[RowIndex]> {
+    pub(super) fn positions(&self) -> Option<&[RowIndex]> {
         (!self.block).then_some(self.positions.as_slice())
     }
 
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         !self.block && self.positions.is_empty()
     }
 
-    fn set_empty(&mut self) {
+    pub(super) fn set_empty(&mut self) {
         self.block = false;
+        self.positions.clear();
+    }
+
+    /// Every row of the block.
+    pub(super) fn set_block(&mut self) {
+        self.block = true;
         self.positions.clear();
     }
 
@@ -109,30 +134,350 @@ pub(super) struct CaseFn {
     pub(super) arms: Vec<CaseArm>,
 }
 
-/// One arm of a [`CaseFn`]: its gate and its body. The body reads the captures it names in
-/// `reads`, narrowed to the arm's rows, with the payloads of a `Tag` gate at [`PAYLOAD`].
+/// A program outlined from an enclosing one, with the captures it reads: `reads`, its input
+/// fields other than [`PAYLOAD`]. It runs at a set of rows of a block, reading a capture with a
+/// view through a selection of it and any other capture gathered into its input record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct SubProgram {
+    pub(super) program: ScalarProgram,
+    pub(super) reads: Vec<SmolStr>,
+}
+
+/// The payloads a `Tag` arm's body reads at [`PAYLOAD`]: none, a view at the arm's rows, or a
+/// column copied for them.
+enum ArmPayload<'a> {
+    None,
+    View(ColumnView<'a>),
+    Copied(ColumnValue),
+}
+
+impl SubProgram {
+    pub(super) fn new(program: ScalarProgram) -> Self {
+        let reads = program.input_fields();
+        SubProgram { program, reads }
+    }
+
+    /// Write this program's result at `positions` of a block of `len` rows, or at every row with
+    /// none, to the result column kept in `buffers`, and return that column.
+    fn run<'b>(
+        &self,
+        captures: &[(SmolStr, Captured)],
+        positions: Option<&[RowIndex]>,
+        len: usize,
+        payload: ArmPayload,
+        buffers: &'b mut SubBuffers,
+    ) -> &'b ColumnValue {
+        let SubBuffers {
+            input,
+            program,
+            result,
+            ..
+        } = buffers;
+        let input = gather_into(captures, &self.reads, positions, len, input);
+        let payload = match payload {
+            ArmPayload::None => None,
+            ArmPayload::View(view) => Some(view),
+            ArmPayload::Copied(copied) => {
+                let ColumnValue::Records(fields) = &mut *input else {
+                    unreachable!("a sub-program's input is a record column")
+                };
+                fields.insert(PAYLOAD.into(), copied);
+                None
+            }
+        };
+        let selection = Captures {
+            captures,
+            positions,
+            payload,
+        };
+        let result = cleared(result, || {
+            self.program.empty_result(input, selection, program)
+        });
+        self.program.eval_into(input, selection, program, result);
+        result
+    }
+
+    /// Write this program's result at every row of a block of `len` rows to `out`, an empty
+    /// column of the result's type.
+    fn run_into(
+        &self,
+        captures: &[(SmolStr, Captured)],
+        len: usize,
+        buffers: &mut SubBuffers,
+        out: &mut ColumnValue,
+    ) {
+        let input = gather_into(captures, &self.reads, None, len, &mut buffers.input);
+        let selection = Captures {
+            captures,
+            positions: None,
+            payload: None,
+        };
+        self.program
+            .eval_into(input, selection, &mut buffers.program, out);
+    }
+
+    /// Split `split.rest`, rows of a block of `len` rows, by where this `Bool` program yields
+    /// `true`.
+    pub(super) fn select(
+        &self,
+        captures: &[(SmolStr, Captured)],
+        len: usize,
+        mut split: Split,
+        buffers: &mut SubBuffers,
+    ) {
+        if split.rest.is_empty() {
+            return;
+        }
+        let n = split.rows(len);
+        // A program that only reads a `Bool` capture with a view splits by that view.
+        if let [Instr::Input { path }] = self.program.instrs.as_slice()
+            && let [name] = path.as_slice()
+            && let Some((_, Captured::View(ColumnView::Bools(view)))) =
+                captures.iter().find(|(n, _)| n == name)
+        {
+            match *view {
+                View::Constant { value, .. } => {
+                    split.by_flags(len, if *value { n } else { 0 }, |_, _| *value)
+                }
+                View::Slice(values) => {
+                    let count = match split.rest.positions() {
+                        None => values[..len].iter().filter(|&&h| h).count(),
+                        Some(positions) => positions.iter().filter(|&&p| values[p]).count(),
+                    };
+                    split.by_flags(len, count, |_, p| values[p])
+                }
+                View::Selected { values, positions } => {
+                    let at = |p: RowIndex| values[positions[p]];
+                    let count = match split.rest.positions() {
+                        None => (0..len).filter(|&p| at(p)).count(),
+                        Some(rows) => rows.iter().filter(|&&p| at(p)).count(),
+                    };
+                    split.by_flags(len, count, |_, p| at(p))
+                }
+            }
+            return;
+        }
+        // A program whose root is a predicate answers its rows without writing a column. They are
+        // rows of its input, which holds `rest`'s rows in order: the input's row `k` is `rest`'s
+        // `k`th row.
+        if let Some(Instr::Predicate { .. }) = self.program.instrs.last() {
+            let SubBuffers {
+                input,
+                program,
+                holds,
+                marks,
+                ..
+            } = buffers;
+            let positions = split.rest.positions();
+            let input = gather_into(captures, &self.reads, positions, len, input);
+            let selection = Captures {
+                captures,
+                positions,
+                payload: None,
+            };
+            self.program.select_root(input, selection, program, holds);
+            match holds.positions() {
+                None => split.by_flags(len, n, |_, _| true),
+                Some(_) => split.by_rows(len, &mut holds.positions, marks),
+            }
+            return;
+        }
+        let holds = self.run(
+            captures,
+            split.rest.positions(),
+            len,
+            ArmPayload::None,
+            buffers,
+        );
+        let ColumnValue::Bools(holds) = holds else {
+            unreachable!("a selecting program yields a `Bool` column, got {holds:?}")
+        };
+        debug_assert_eq!(
+            holds.len(),
+            n,
+            "a selecting program yields one value per row it reads"
+        );
+        let count = holds.iter().filter(|&&h| h).count();
+        split.by_flags(len, count, |k, _| holds[k]);
+    }
+}
+
+/// A split of `rest`, rows of a block, by a `Bool` result: the rows where it holds move to
+/// `taken`, which is empty, and `rest` keeps the others. `left` is scratch for the rows `rest`
+/// keeps. A side that `keep` does not name is not written: `rest` keeps its rows under `Taken`,
+/// and `taken` stays empty under `Rest`.
+pub(super) struct Split<'r> {
+    pub(super) rest: &'r mut Rows,
+    pub(super) taken: &'r mut Rows,
+    pub(super) left: &'r mut Vec<RowIndex>,
+    pub(super) keep: Keep,
+}
+
+impl Split<'_> {
+    /// The number of rows of `rest`, in a block of `len` rows.
+    fn rows(&self, len: usize) -> usize {
+        self.rest.positions().map_or(len, <[RowIndex]>::len)
+    }
+
+    /// Split by `holds`, which answers for the row `k` of `rest`, at block position `p`, in
+    /// ascending order, and is true at `count` rows. When it holds at every row or at none, the
+    /// whole set moves or stays without reading `holds`. Otherwise each row is written to each
+    /// side `keep` names, and only the side it belongs to advances, so the split takes no branch
+    /// per row.
+    fn by_flags(&mut self, len: usize, count: usize, holds: impl FnMut(usize, RowIndex) -> bool) {
+        debug_assert!(self.taken.is_empty(), "a split fills an empty set of rows");
+        let n = self.rows(len);
+        if count == n {
+            if self.keep != Keep::Rest {
+                std::mem::swap(self.taken, self.rest);
+            }
+            self.rest.set_empty();
+            return;
+        }
+        if count == 0 {
+            return;
+        }
+        match self.keep {
+            Keep::Taken => self.partition::<true, false>(n, count, holds),
+            Keep::Rest => self.partition::<false, true>(n, count, holds),
+            Keep::Both => self.partition::<true, true>(n, count, holds),
+        }
+    }
+
+    /// Split by `held`, the ascending indices `k` of the rows of `rest` where the result holds.
+    /// `held` is left unspecified, and `marks` is scratch.
+    fn by_rows(&mut self, len: usize, held: &mut Vec<RowIndex>, marks: &mut Vec<bool>) {
+        debug_assert!(self.taken.is_empty(), "a split fills an empty set of rows");
+        let n = self.rows(len);
+        let count = held.len();
+        if count == n || count == 0 {
+            self.by_flags(len, count, |_, _| count == n);
+            return;
+        }
+        // `taken` lists the held rows by block position, also as scratch under `Rest`.
+        match self.rest.positions() {
+            None => std::mem::swap(&mut self.taken.positions, held),
+            Some(positions) => self
+                .taken
+                .positions
+                .extend(held.iter().map(|&k| positions[k])),
+        }
+        if self.keep != Keep::Taken {
+            without(self.rest, len, &self.taken.positions, marks, self.left);
+            self.rest.block = false;
+            std::mem::swap(&mut self.rest.positions, self.left);
+        }
+        if self.keep == Keep::Rest {
+            self.taken.positions.clear();
+        }
+    }
+
+    /// The mixed case of [`Split::by_flags`] over the `n` rows of `rest`: the rows where `holds`
+    /// is true to `taken` if `TAKEN`, and the others to `rest` if `LEFT`.
+    fn partition<const TAKEN: bool, const LEFT: bool>(
+        &mut self,
+        n: usize,
+        count: usize,
+        mut holds: impl FnMut(usize, RowIndex) -> bool,
+    ) {
+        let Split {
+            rest, taken, left, ..
+        } = self;
+        if TAKEN {
+            taken.positions.resize(n, 0);
+        }
+        if LEFT {
+            left.clear();
+            left.resize(n, 0);
+        }
+        let (mut t, mut l) = (0, 0);
+        let mut place = |k: usize, p: RowIndex| {
+            let h = holds(k, p);
+            if TAKEN {
+                taken.positions[t] = p;
+                t += usize::from(h);
+            }
+            if LEFT {
+                left[l] = p;
+                l += usize::from(!h);
+            }
+        };
+        match rest.positions() {
+            None => (0..n).for_each(|p| place(p, p)),
+            Some(positions) => positions.iter().enumerate().for_each(|(k, &p)| place(k, p)),
+        }
+        if TAKEN {
+            taken.positions.truncate(t);
+            debug_assert_eq!(
+                t, count,
+                "`count` is the number of rows where `holds` is true"
+            );
+        }
+        if LEFT {
+            left.truncate(l);
+            debug_assert_eq!(
+                l,
+                n - count,
+                "`count` is the number of rows where `holds` is true"
+            );
+            rest.block = false;
+            std::mem::swap(&mut rest.positions, *left);
+        }
+    }
+}
+
+/// Set `out` to the rows of `rows`, rows of a block of `len` rows, that are not in `minus`, a
+/// subset of `rows`. `marks` is scratch.
+pub(super) fn without(
+    rows: &Rows,
+    len: usize,
+    minus: &[RowIndex],
+    marks: &mut Vec<bool>,
+    out: &mut Vec<RowIndex>,
+) {
+    marks.clear();
+    marks.resize(len, false);
+    for &p in minus {
+        marks[p] = true;
+    }
+    let n = rows.positions().map_or(len, <[RowIndex]>::len);
+    out.clear();
+    out.resize(n, 0);
+    let mut o = 0;
+    let mut place = |p: RowIndex| {
+        out[o] = p;
+        o += usize::from(!marks[p]);
+    };
+    match rows.positions() {
+        None => (0..len).for_each(&mut place),
+        Some(positions) => positions.iter().copied().for_each(&mut place),
+    }
+    out.truncate(o);
+    debug_assert_eq!(o + minus.len(), n, "`minus` is a subset of `rows`");
+}
+
+/// One arm of a [`CaseFn`]: its gate and its body. The body reads its captures narrowed to the
+/// arm's rows, with the payloads of a `Tag` gate at [`PAYLOAD`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct CaseArm {
     pub(super) gate: CaseGate,
-    pub(super) body: ScalarProgram,
-    reads: Vec<SmolStr>,
+    pub(super) body: SubProgram,
 }
 
 impl CaseArm {
     pub(super) fn new(gate: CaseGate, body: ScalarProgram) -> Self {
-        let reads = body.input_fields();
-        CaseArm { gate, body, reads }
+        CaseArm {
+            gate,
+            body: SubProgram::new(body),
+        }
     }
 }
 
 /// The rows an arm takes, among the rows no earlier arm took.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum CaseGate {
-    /// The rows where `program`, a `Bool` function of the captures it names in `reads`, holds.
-    Holds {
-        program: ScalarProgram,
-        reads: Vec<SmolStr>,
-    },
+    /// The rows where the `Bool` sub-program yields `true`.
+    Holds(SubProgram),
     /// Every row: the final `else`.
     Rest,
     /// The rows whose value in the union field `scrutinee` carries `tag`.
@@ -142,8 +487,7 @@ pub(super) enum CaseGate {
 impl CaseGate {
     /// A `Holds` gate of `program`.
     pub(super) fn holds(program: ScalarProgram) -> Self {
-        let reads = program.input_fields();
-        CaseGate::Holds { program, reads }
+        CaseGate::Holds(SubProgram::new(program))
     }
 }
 
@@ -164,9 +508,9 @@ impl CaseFn {
     pub(super) fn reads_only<T>(&self, captures: &[(SmolStr, T)]) -> bool {
         let named = |name: &SmolStr| captures.iter().any(|(n, _)| n == name);
         self.arms.iter().all(|arm| {
-            arm.reads.iter().all(named)
+            arm.body.reads.iter().all(named)
                 && match &arm.gate {
-                    CaseGate::Holds { reads, .. } => reads.iter().all(named),
+                    CaseGate::Holds(gate) => gate.reads.iter().all(named),
                     CaseGate::Rest => true,
                     CaseGate::Tag { scrutinee, .. } => named(scrutinee),
                 }
@@ -198,9 +542,7 @@ impl CaseFn {
                 taken,
                 slots,
                 ran,
-                input,
                 body,
-                result,
                 ..
             } = buffers;
             *ran = !taken.is_empty();
@@ -210,51 +552,39 @@ impl CaseFn {
             // One arm taking every row answers the whole block, so its result is not merged.
             // Listed positions that hold every row are `0..len`, so the arm reads the block whole.
             if (taken.block || taken.positions.len() == len) && payload.is_none() {
-                let input = gather_into(captures, &arm.reads, None, len, input);
-                let selection = Captures {
-                    captures,
-                    positions: None,
-                    payload: None,
-                };
-                arm.body.eval_into(input, selection, body, out);
+                arm.body.run_into(captures, len, body, out);
                 return;
             }
             taken.list(len);
             let taken = &taken.positions;
-            let input = gather_into(captures, &arm.reads, Some(taken), len, input);
             // A payload with a view is read in place at its slots; any other is copied into the
             // arm's input.
             let payload = match payload {
-                None => None,
+                None => ArmPayload::None,
                 Some(values) => {
                     debug_assert_eq!(slots.len(), taken.len(), "one slot per row taken");
                     match values.view() {
-                        Some(view) => Some(view.select(slots).expect("a column's view is a slice")),
-                        None => {
-                            let copied = values.select_indices(slots.iter().copied(), slots.len());
-                            let ColumnValue::Records(fields) = &mut *input else {
-                                unreachable!("a `CaseFn`'s input is a record column")
-                            };
-                            fields.insert(PAYLOAD.into(), copied);
-                            None
-                        }
+                        Some(view) => ArmPayload::View(
+                            view.select(slots).expect("a column's view is a slice"),
+                        ),
+                        None => ArmPayload::Copied(
+                            values.select_indices(slots.iter().copied(), slots.len()),
+                        ),
                     }
                 }
             };
-            let selection = Captures {
-                captures,
-                positions: Some(taken),
-                payload,
-            };
-            let result = cleared(result, || arm.body.empty_result(input, selection, body));
-            arm.body.eval_into(input, selection, body, result);
+            arm.body.run(captures, Some(taken), len, payload, body);
         }
         debug_assert!(rest.is_empty(), "the arms' gates split the rows");
         let parts: Vec<(&ColumnValue, &[RowIndex])> = arms
             .iter()
             .filter(|arm| arm.ran)
             .map(|arm| {
-                let result = arm.result.as_ref().expect("an arm that ran has a result");
+                let result = arm
+                    .body
+                    .result
+                    .as_ref()
+                    .expect("an arm that ran has a result");
                 (result, arm.taken.positions.as_slice())
             })
             .collect();
@@ -291,12 +621,7 @@ impl CaseArm {
         buffers: &mut ArmBuffers,
     ) -> Option<&'a ColumnValue> {
         let ArmBuffers {
-            taken,
-            slots,
-            gate_input,
-            gate,
-            holds,
-            ..
+            taken, slots, gate, ..
         } = buffers;
         taken.set_empty();
         left.clear();
@@ -309,39 +634,14 @@ impl CaseArm {
                 rest.set_empty();
                 None
             }
-            CaseGate::Holds { program, reads } => {
-                let positions = rest.positions();
-                let input = gather_into(captures, reads, positions, len, gate_input);
-                let selection = Captures {
-                    captures,
-                    positions,
-                    payload: None,
+            CaseGate::Holds(program) => {
+                let split = Split {
+                    rest,
+                    taken,
+                    left,
+                    keep: Keep::Both,
                 };
-                let holds = cleared(holds, || program.empty_result(input, selection, gate));
-                program.eval_into(input, selection, gate, holds);
-                let ColumnValue::Bools(holds) = holds else {
-                    unreachable!("a gate yields a `Bool` column, got {holds:?}")
-                };
-                debug_assert_eq!(
-                    holds.len(),
-                    rest.positions().map_or(len, <[RowIndex]>::len),
-                    "a gate yields one value per row left"
-                );
-                let selected = holds.iter().filter(|&&holds| holds).count();
-                if selected == holds.len() {
-                    std::mem::swap(taken, rest);
-                    rest.set_empty();
-                } else if selected > 0 {
-                    rest.list(len);
-                    for (&p, &holds) in rest.positions.iter().zip(holds.iter()) {
-                        if holds {
-                            taken.positions.push(p);
-                        } else {
-                            left.push(p);
-                        }
-                    }
-                    std::mem::swap(&mut rest.positions, left);
-                }
+                program.select(captures, len, split, gate);
                 None
             }
             CaseGate::Tag { scrutinee, tag } => {
