@@ -1598,16 +1598,9 @@ impl TileProducer for FanOutProducer {
             },
         };
 
-        // Filter by the stored obsolete guard. Because upstream retains data according to the
-        // intersection of all obsolete guards, it may have more data than this specific consumer
-        // is interested in.
-        let guard = shared_rc
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .release_guards[self.index()]
-        .clone();
-        trace!("{} removing {guard:?} from {result:?}", self.name());
-        result.remove_guarded(guard);
+        // The slot's own release is visible before shared reclamation acquires its lock.
+        // A current-value slot also withholds the frontier advanced by its store.
+        result.remove_guarded(self.withheld_guard());
         result.restrict_to(&projection, self.tiling());
         result
     }
@@ -3600,6 +3593,31 @@ mod projection_tests {
                 .clone()
                 .subscribe(ints().empty_guard(), Box::new(|| {}), &mut cx);
         (first, second, pulled)
+    }
+
+    #[test]
+    fn a_slot_withholds_its_release_while_shared_reclamation_is_pending() {
+        let (mut first, mut second, _) = two_slots();
+        let released = keys_between(1, 2);
+        // Pause release after accumulate_release publishes this reader's guard,
+        // before release_impl can acquire the shared fan-out and reclaim the rows.
+        *first
+            .base()
+            .obsolete_guard
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = released.clone();
+        let mut own = first.read_in_pipeline(ints().universal_guard());
+        own.compact();
+        assert!(
+            int_entries(&own)
+                .iter()
+                .all(|(key, _)| *key != 1 && *key != 2)
+        );
+        assert_eq!(
+            int_entries(&second.read_in_pipeline(released.clone())),
+            [(1, 1), (2, 2)]
+        );
+        first.release_impl(released);
     }
 
     /// `xs ▷ map(c)` fans a stream into two consumers that each read their own morsels. Each
