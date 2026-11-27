@@ -473,6 +473,68 @@ mod tests {
         );
     }
 
+    // Selecting a collection from a grouped record exposes its item keys as the
+    // Product's paired level. Either the group row or its item can arrive first.
+    #[rstest::rstest]
+    fn a_nested_group_item_announces_only_its_pair(#[values(false, true)] item_first: bool) {
+        use crate::interpreter::dispatcher::notify_for_test;
+        use crate::interpreter::{Predicate, Value};
+        let at = CurryLevel::new(2);
+        let group_path = [Value::Bool(true), Value::Bool(false)];
+        let group = Projection::of_path(&group_path);
+        let item = Projection::within(
+            CurryLevel::new(1),
+            Predicate::exactly(&group_path),
+            Projection::of_field(
+                "_0",
+                Projection::of_field(
+                    "_0",
+                    Projection::admitting(Predicate::point(Value::UInt(3))),
+                ),
+            ),
+        );
+        let delivered = nothing_delivered(true, true);
+        let (log, received) = RegionLog::new();
+        let log = shared_consumer(Box::new(log));
+        let rows = pairing(
+            PairingSide::Rows(Partners::Paths),
+            at,
+            delivered.clone(),
+            forwarding_consumer_keeping_keys(&log),
+        );
+        let items = selecting_field_beneath_keys(
+            "_0".into(),
+            selecting_field_beneath_keys(
+                "_0".into(),
+                pairing(
+                    PairingSide::Paths,
+                    at,
+                    delivered,
+                    forwarding_consumer_keeping_keys(&log),
+                ),
+            ),
+        );
+        let row = (&*rows, &group);
+        let item = (&*items, &item);
+        let [first, second] = if item_first { [item, row] } else { [row, item] };
+        notify_for_test(first.0, first.1);
+        assert!(
+            received
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+        notify_for_test(second.0, second.1);
+        assert_eq!(
+            *received.read().unwrap_or_else(PoisonError::into_inner),
+            [Projection::of_path(&[
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::UInt(3)
+            ]),]
+        );
+    }
+
     #[test]
     fn forwarding_preserves_each_region_and_widening_names_the_whole_input() {
         let (log, received) = RegionLog::new();
@@ -1049,12 +1111,27 @@ fn region_arms(region: &Projection) -> Vec<Projection> {
 }
 
 /// `region`'s keys as a predicate over the paths of level `to`, `None` where the region names
-/// keys beneath it. A region above `to` admits every path beneath its keys.
+/// only part of a value there. A region above `to` admits every path beneath its keys;
+/// a collection selected within a group qualifies its item paths by that group.
 fn paths_at(region: &Projection, to: CurryLevel) -> Option<crate::interpreter::Predicate> {
     use crate::interpreter::Predicate;
     let (mut level, mut keys) = match region {
-        part @ (Projection::Within { .. } | Projection::Or(_)) => {
-            Projection::refuse_part_of_values("paths_at", part)
+        Projection::Within {
+            level,
+            keys,
+            values,
+        } if *level < to => {
+            let below = to.index() - level.index() - 1;
+            let paths = paths_at(values, CurryLevel::new(below))?;
+            return Some(crate::interpreter::tiling::beneath_keys(
+                &paths, keys, below,
+            ));
+        }
+        Projection::Within { .. } => return None,
+        Projection::Or(arms) => {
+            return arms.iter().try_fold(Predicate::False, |paths, arm| {
+                Some(paths.union(&paths_at(arm, to)?))
+            });
         }
         Projection::Everything => return Some(Predicate::True),
         Projection::Nothing => return Some(Predicate::False),
@@ -1166,6 +1243,14 @@ impl Consumer for Pairing {
             let mut restated = Vec::new();
             for arm in region_arms(region) {
                 let (keys_only, values) = match &arm {
+                    // A selected collection's keys can be expressed relative to an enclosing
+                    // group. At the paired level these name the pairs themselves.
+                    Projection::Within { .. }
+                        if matches!(self.side, PairingSide::Paths)
+                            && let Some(paths) = paths_at(&arm, self.at) =>
+                    {
+                        (Projection::keys_at(self.at, paths), None)
+                    }
                     Projection::Within {
                         level,
                         keys,
