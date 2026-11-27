@@ -1,6 +1,8 @@
 //! The [`Tile`] type: the materialized data exchanged between operators, plus
 //! [`validate_tile`] for dev-build structural checks.
 
+mod memo;
+
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 
