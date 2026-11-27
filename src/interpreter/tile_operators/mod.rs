@@ -3006,6 +3006,7 @@ pub(crate) mod test_helpers {
     /// An operator over a fixed tile that keeps the consumer it is subscribed with, so a test
     /// notifies an operator above it from where the operator's input would.
     pub(crate) struct NotifyingOp {
+        pub(crate) pushed_keys: bool,
         tile: Tile,
         tiling: Tiling,
         consumer: InputConsumer,
@@ -3018,6 +3019,7 @@ pub(crate) mod test_helpers {
             let consumer = InputConsumer::default();
             (
                 Self {
+                    pushed_keys: false,
                     tile,
                     tiling,
                     consumer: consumer.clone(),
@@ -3054,6 +3056,10 @@ pub(crate) mod test_helpers {
 
         fn tiling(&self) -> &Tiling {
             &self.tiling
+        }
+
+        fn keys_arrive_by_push(&self) -> bool {
+            self.pushed_keys
         }
 
         fn subscribe(

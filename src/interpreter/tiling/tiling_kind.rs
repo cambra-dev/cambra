@@ -207,7 +207,7 @@ impl Tiling {
     /// one row it does not have.
     ///
     /// Every collection level is `Predicate::False`: nothing here has been delivered.
-    fn empty_at_rows(&self, rows: usize) -> Tile {
+    pub(crate) fn empty_at_rows(&self, rows: usize) -> Tile {
         match self {
             Tiling::Scalar(e) => Tile::Scalar(ColumnValue::from_values(Vec::new(), e)),
             Tiling::Record(m) => {
