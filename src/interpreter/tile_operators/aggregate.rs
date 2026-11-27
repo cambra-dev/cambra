@@ -3246,6 +3246,10 @@ mod aggregate_consuming_tests {
         aggregate.begin_run();
         aggregate.consume_in_pipeline(InputId::ONLY, keys_between(2, 5));
         assert_eq!(held(&aggregate), (sum_of(2..=5), false));
+        assert!(
+            aggregate.final_guard().is_empty(),
+            "a running sum has no result to publish"
+        );
         assert_eq!(
             source.read().unwrap_or_else(PoisonError::into_inner).pulled,
             vec![keys_between(2, 5)]
