@@ -497,7 +497,8 @@ and two or more read slots of a memoized `FanOut`, so a single reader pays for n
 the `Memo`. A leaf arm (a store read) is a source over its own domain and reads none. Without the
 `Memo`, the lone arm sees the input's deleted rows and releases the input only when its own consumer
 does, so an arm chain that does not hand back what it consumes holds the producer upstream. A
-`Transact` writer body therefore reads the driver's slot through a `Memo`.
+`Transact` writer body reads the driver's slot directly: its consumer, the writer, releases the
+attempts it supersedes and the items it finishes, and the body passes both releases down.
 
 ### A product value is a record of tiles
 
@@ -1592,22 +1593,27 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision),
   "Reading an induction accumulator in a commit decision".
 
-  **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots — the body
-  and the writer — and releases its source item on what they both release. A body releases a row as
-  soon as it has consumed it, which says nothing about commitment. The writer releases its newest
-  row when the store commits the row's proposal (`CommitProducer::commit_ready`), and the rows below
-  it when it decides a newer one. The intersection's release of the newest row therefore means the
-  item's decision committed, and the drive releases the item from its source then ([Ready
-  transaction decisions](#ready-transaction-decisions)). The writer holds a driver slot it barely
-  reads because that slot is the ack channel.
+  **The ack is a release intersection.** The driver sits behind a `FanOut` with two slots, the body
+  and the writer, and releases its source item on what they both release. The writer makes both
+  halves of that release: each time, it releases the same domain prefix on its own slot and on the
+  body. It releases the positions below the one it decides when it supersedes them
+  (`TransactWriterProducer::consume_impl`), and the item's attempts through the newest one when the
+  store commits that attempt's proposal (`CommitProducer::commit_ready`). It releases both whole
+  once the driver is terminal and no proposal is in flight. The intersection's release of the
+  newest row therefore means the item's decision committed, and the drive releases the item from
+  its source then ([Ready transaction decisions](#ready-transaction-decisions)). A body that fans
+  its input through a `Memo` also releases a row as soon as it consumes it. That release says
+  nothing about commitment, and the writer's own slot holds the row until the ack. The writer holds
+  a driver slot it barely reads because that slot is the ack channel.
 
-  Both slots of that intersection are load-bearing, including the body's. A compiled body
-  fans its input through a `Memo`, which releases each row as it *consumes* it — and it is
-  that eager half which lets a superseded row be reclaimed before its item finishes. A body
-  chain that released only when its own output was released would leave the intersection
-  standing at the writer's ack, and the window below would grow one row per retry with the
-  supersession release still in place. So this is an obligation on the body chain, alongside
-  forwarding `domain_predicate`.
+  The body chain forwards a domain-prefix release of its output to its input exactly, alongside
+  forwarding `domain_predicate`. Both of the writer's releases on the body reach the driver only
+  that way. A chain that dropped the supersession release would leave a superseded row in the
+  window until its item finished, so the window below would grow one row per retry. A chain that
+  dropped the commit-ack would never finish the item. The tests
+  `a_superseded_attempt_is_released_on_the_writers_body` and
+  `a_commit_ack_reaches_the_drive_through_the_writers_body` in `commit_operator.rs` check that the
+  writer issues both releases on its body.
 
   **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the store has the item's decision": only the release of its newest live row is the ack, as a release from the body alone is not one.
 - **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it, in the tiling of `V` (`Tiling::from_extent`), so a collection-valued key arrives as a level, as every store read hands it out. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_read`, an induction accumulator's trailing read. It samples through `store_current` at the store's closure, so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. It reads the store whole and cuts the settled value and its completeness to the requested output keys. Without enclosing rows, a partial output release hides those keys while retaining the store slot. A universal release retires it and releases the store slot; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
