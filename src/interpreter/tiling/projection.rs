@@ -1,7 +1,7 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use smol_str::SmolStr;
 
@@ -761,9 +761,7 @@ impl Projection {
         }
     }
 
-    /// The keys holding what this projection names: each arm within some values as its keys
-    /// whole. A pull of part of some values pulls these keys and is answered with more than it
-    /// names, which is sound for a `get`.
+    /// The enclosing keys a whole-value kernel may pull before cutting its answer.
     pub fn rows(&self) -> Projection {
         Projection::any_of(self.arms().into_iter().map(|arm| match arm {
             Projection::Within { level, keys, .. } => Projection::keys_at(level, keys),
@@ -1050,7 +1048,7 @@ pub(crate) fn skeleton(guards: &[&TileGuard]) -> Option<Tiling> {
             },
             TileGuard::Record(parts) => {
                 let mut fields = match shape {
-                    None => std::collections::HashMap::new(),
+                    None => HashMap::new(),
                     Some(Tiling::Record(fields)) => fields,
                     Some(_) => return None,
                 };
@@ -1084,7 +1082,14 @@ pub(crate) fn skeleton(guards: &[&TileGuard]) -> Option<Tiling> {
                 Some(Tiling::Union(arms))
             }
             TileGuard::Scalar(_) => Some(shape.unwrap_or_else(placeholder)),
-            TileGuard::Aggregation(_) => return None,
+            TileGuard::Aggregation(_) => match shape {
+                None => Some(Tiling::Aggregation {
+                    kind: crate::ccl::AggregateKind::Sum,
+                    accumulator: Box::new(placeholder()),
+                }),
+                Some(Tiling::Aggregation { .. }) => shape,
+                Some(_) => return None,
+            },
         })
     }
     let mut shape = None;
@@ -1190,6 +1195,9 @@ fn spell(level: CurryLevel, keys: &Predicate) -> TileGuard {
 /// at level `from`, beneath `to`; an unqualified arm runs through every key above it.
 fn through_at(keys: &Predicate, from: CurryLevel, to: CurryLevel) -> Predicate {
     fn up(keys: &Predicate, levels: usize) -> Predicate {
+        if keys.is_false() {
+            return Predicate::False;
+        }
         match levels {
             0 => keys.clone(),
             _ => arms_of(keys)
@@ -1260,6 +1268,38 @@ fn within_paths(stated: &Predicate, keys: &Predicate, level: usize, depth: usize
 }
 
 impl TileGuard {
+    /// Adapt a partial-value pull for operator kernels that read complete values.
+    pub(crate) fn enclosing_rows(&self) -> Option<Self> {
+        match self {
+            TileGuard::Function(FunctionGuard::Codomain(_)) => {
+                let asked = Projection::of(self).ok()?;
+                asked
+                    .names_part_of_values()
+                    .then(|| asked.rows().collection_guard())
+            }
+            TileGuard::Record(fields) => {
+                let mut wide = None;
+                for (name, field) in fields {
+                    if let Some(rows) = field.enclosing_rows() {
+                        wide.get_or_insert_with(|| fields.clone())
+                            .insert(name.clone(), rows);
+                    }
+                }
+                wide.map(TileGuard::Record)
+            }
+            TileGuard::Or(arms) => {
+                let mut wide = None;
+                for (i, arm) in arms.iter().enumerate() {
+                    if let Some(rows) = arm.enclosing_rows() {
+                        wide.get_or_insert_with(|| arms.clone())[i] = rows;
+                    }
+                }
+                wide.map(TileGuard::flatten_or)
+            }
+            _ => None,
+        }
+    }
+
     /// The projection this guard names, for a producer that restates the outermost keys only
     /// ([`Restates::Outermost`]), or a panic naming `producer` and the guard.
     pub fn projection(&self, producer: &str) -> Projection {
@@ -1391,15 +1431,66 @@ impl Tile {
     /// only where it names a key of the tiling's domain. A union's domain carries its tags, so a
     /// statement of the arms past them names no key.
     pub fn within_over(&self, projection: &Projection, tiling: &Tiling) -> Result<(), String> {
+        if projection.names_part_of_values() || matches!(projection, Projection::Or(_)) {
+            return self.within_part(projection, tiling);
+        }
+        if matches!(projection, Projection::Fields { .. })
+            && let Tiling::Record(types) = tiling
+        {
+            let Tile::Record { fields, .. } = self else {
+                return Err("it has no fields to project".into());
+            };
+            return fields.iter().try_for_each(|(name, field)| {
+                field
+                    .within_over(&projection.field(name), &types[name])
+                    .map_err(|why| format!("its field {name}: {why}"))
+            });
+        }
         self.cells_within(projection)?;
         self.statements_within(projection, Some(tiling))
     }
 
-    /// [`within`](Self::within) for the keys and cells the tile holds.
+    /// A partial-value answer is unchanged by cutting its cells and statements to the request.
+    fn within_part(&self, projection: &Projection, tiling: &Tiling) -> Result<(), String> {
+        let mut live = self.clone();
+        live.compact();
+        let mut cut = live.clone();
+        cut.restrict_to(projection, tiling);
+        if live == cut {
+            Ok(())
+        } else {
+            Err(format!("the answer extends beyond {projection:?}"))
+        }
+    }
+
     fn cells_within(&self, projection: &Projection) -> Result<(), String> {
         match projection {
             part @ (Projection::Within { .. } | Projection::Or(_)) => {
-                Projection::refuse_part_of_values("Tile::cells_within", part)
+                // Standalone validation has no declared extents. Spelling a projection guard
+                // needs just the layout of collections, record fields, and leaves.
+                fn layout(tile: &Tile) -> Tiling {
+                    let extent = || Extent::Base(crate::interpreter::BaseType::Int);
+                    match tile {
+                        Tile::Scalar(_) => Tiling::Scalar(extent()),
+                        Tile::Record { fields, .. } => Tiling::Record(
+                            fields.iter().map(|(n, f)| (n.clone(), layout(f))).collect(),
+                        ),
+                        Tile::DataFunction { codomain, .. } => {
+                            Tiling::data_function(extent(), layout(codomain))
+                        }
+                        Tile::Aggregation {
+                            kind, accumulator, ..
+                        } => Tiling::Aggregation {
+                            kind: *kind,
+                            accumulator: Box::new(layout(accumulator)),
+                        },
+                        Tile::Store { seed, .. } => Tiling::Store {
+                            domain: extent(),
+                            codomain: Box::new(layout(seed)),
+                        },
+                    }
+                }
+                self.within_part(part, &layout(self))
             }
             Projection::Everything => Ok(()),
             Projection::Fields { .. } => self.each_field_within(projection, Tile::cells_within),
@@ -1435,17 +1526,17 @@ impl Tile {
                 }
                 let mut live = self.clone();
                 live.compact();
+                // A collection field has one group per enclosing record. Its projection
+                // names paths relative to each of those groups.
+                let mut paths = vec![Vec::new(); live.rows()];
                 for depth in 0..=level.index() {
                     let at = CurryLevel::new(depth);
+                    paths = live.values_at(at).key_paths(&paths);
                     let admits = match at == *level {
                         true => keys.clone(),
                         false => through_at(keys, *level, at),
                     };
-                    if let Some(path) = live
-                        .paths_at(at)
-                        .into_iter()
-                        .find(|path| !admits.contains_path(path))
-                    {
+                    if let Some(path) = paths.iter().find(|path| !admits.contains_path(path)) {
                         return Err(format!(
                             "it holds the path {path:?}, which {admits:?} omits"
                         ));
@@ -1470,9 +1561,8 @@ impl Tile {
         }
         let stated = self.stated_completeness();
         let allowed = match projection {
-            part @ (Projection::Within { .. } | Projection::Or(_)) => {
-                Projection::refuse_part_of_values("Tile::statements_within", part)
-            }
+            // cells_within checked the complete cut, including every statement, for partial values.
+            Projection::Within { .. } | Projection::Or(_) => return Ok(()),
             Projection::Everything => return Ok(()),
             Projection::Fields { .. } => unreachable!("a projection of fields returned above"),
             Projection::Nothing => vec![Predicate::False; stated.len()],
@@ -1555,13 +1645,121 @@ impl Tile {
         }
     }
 
-    /// Cut this tile to `projection`.
-    ///
-    /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
+    /// A partial record can select different leaves in different rows. Walk one guard over the
+    /// columns, keeping the parent paths and pushing ancestor completeness only into selected leaves.
+    fn cut_guard(
+        &mut self,
+        guard: Option<&TileGuard>,
+        tiling: &Tiling,
+        rows: &[Vec<Value>],
+        whole: &Predicate,
+        closed: &Predicate,
+    ) -> Vec<bool> {
+        use super::guard::Parts;
+        let parts = Parts::of(guard);
+        match (self, tiling) {
+            (
+                tile @ Tile::DataFunction { .. },
+                Tiling::DataFunction {
+                    codomain: values, ..
+                },
+            ) => {
+                let paths = tile.key_paths(rows);
+                let Tile::DataFunction {
+                    codomain,
+                    domain_predicate,
+                    ..
+                } = tile
+                else {
+                    unreachable!()
+                };
+                let complete = domain_predicate.union(&closed.descend(1));
+                let selected = parts.domain.union(&whole.descend(1));
+                *domain_predicate = complete.intersect(&selected);
+                let child = codomain.cut_guard(
+                    parts.codomain.as_ref(),
+                    values,
+                    &paths,
+                    &selected,
+                    &complete.minus(&selected),
+                );
+                let keep: Vec<_> = paths
+                    .iter()
+                    .zip(child)
+                    .map(|(path, child)| selected.contains_path(path) || child)
+                    .collect();
+                if keep.contains(&false) {
+                    tile.retain_keys(&keep);
+                }
+                // An existing parent still holds the selected collection if its group is empty.
+                let addressed = guard.map_or(Predicate::False, TileGuard::touched_keys);
+                let parents =
+                    through_at(&addressed, CurryLevel::new(1), CurryLevel::OUTERMOST).union(whole);
+                rows.iter()
+                    .map(|path| parents.contains_path(path))
+                    .collect()
+            }
+            (Tile::Record { fields, absent }, Tiling::Record(types)) => {
+                let mut held = vec![false; rows.len()];
+                for (name, field) in fields {
+                    let part = parts.record.as_ref().and_then(|fields| fields.get(name));
+                    if field.is_row_field() {
+                        let named = part
+                            .and_then(TileGuard::field_rows)
+                            .unwrap_or(&Predicate::False);
+                        let selected = whole.union(named);
+                        let mask: Vec<_> = rows.iter().map(|p| selected.contains_path(p)).collect();
+                        let missing = absent.entry(name.clone()).or_default();
+                        if let Tile::Store { closures, .. } = field
+                            && !closed.is_false()
+                        {
+                            let settled: Vec<_> = rows
+                                .iter()
+                                .enumerate()
+                                .filter(|(row, _)| !missing.contains(*row))
+                                .map(|(_, path)| closed.contains_path(path))
+                                .collect();
+                            closures.close_rows(&settled);
+                        }
+                        let present = field.retain_field_rows(missing, &mask);
+                        for (held, present) in held.iter_mut().zip(present) {
+                            *held |= present;
+                        }
+                        if missing.is_empty() {
+                            absent.remove(name);
+                        }
+                    } else {
+                        let present = field.cut_guard(part, &types[name], rows, whole, closed);
+                        for (held, present) in held.iter_mut().zip(present) {
+                            *held |= present;
+                        }
+                    }
+                }
+                held
+            }
+            (Tile::Scalar(_), Tiling::Scalar(_)) => {
+                let selected = whole.union(TileGuard::leaf_rows(&parts.scalar));
+                rows.iter().map(|p| selected.contains_path(p)).collect()
+            }
+            (_, Tiling::Aggregation { .. } | Tiling::Store { .. }) => {
+                rows.iter().map(|p| whole.contains_path(p)).collect()
+            }
+            _ => unreachable!("a projected tile conforms to its producer's tiling"),
+        }
+    }
+
+    /// Cut this tile to the requested values and the completeness it can restate there.
     pub fn restrict_to(&mut self, projection: &Projection, tiling: &Tiling) {
         match projection {
-            part @ (Projection::Within { .. } | Projection::Or(_)) => {
-                Projection::refuse_part_of_values("Tile::restrict_to", part)
+            Projection::Within { .. } | Projection::Or(_) => {
+                self.state_derived();
+                self.cut_guard(
+                    Some(&projection.guard(tiling)),
+                    tiling,
+                    &[Vec::new()],
+                    &Predicate::False,
+                    &Predicate::False,
+                );
             }
             Projection::Everything => {}
             Projection::Nothing => *self = tiling.empty_tile(),
@@ -1886,6 +2084,129 @@ mod tests {
             assert_eq!(decoded, selection);
             assert_eq!(decoded.guard(&customers), guard);
         }
+    }
+
+    #[test]
+    fn omitting_a_nested_record_keeps_the_release_at_the_selected_scalar() {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record(
+                [
+                    ("id".into(), scalar.clone()),
+                    (
+                        "profile".into(),
+                        Tiling::Record([("rank".into(), scalar)].into()),
+                    ),
+                ]
+                .into(),
+            ),
+        );
+        let column = |n| Tile::Scalar(ColumnValue::Ints(vec![n]));
+        let row = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), column(7)),
+                    (
+                        "profile".into(),
+                        Tile::record([("rank".into(), column(1))].into()),
+                    ),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let projection = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field("id", Projection::Everything),
+        );
+        let mut id = row.clone();
+        id.restrict_to(&projection, &tiling);
+        assert_eq!(id.to_guard(), projection.guard(&tiling));
+        let mut rest = row.clone();
+        rest.remove_guarded(id.to_guard());
+        id.merge(rest);
+        assert_eq!(id, row);
+    }
+
+    #[test]
+    fn a_closed_empty_collection_field_keeps_its_parent_and_states_only_the_requested_path() {
+        let collection = |values| Tiling::data_function(Extent::uint_range(16), values);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let history = collection(collection(scalar.clone()));
+        let tiling = collection(Tiling::Record(
+            [("id".into(), scalar), ("history".into(), history.clone())].into(),
+        ));
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::record(
+                [
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    ("history".into(), history.empty_tile()),
+                ]
+                .into(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let asked = Projection::within(
+            CurryLevel::OUTERMOST,
+            key(7),
+            Projection::of_field(
+                "history",
+                Projection::of_path(&[Value::UInt(3), Value::UInt(2)]),
+            ),
+        );
+        tile.restrict_to(&asked, &tiling);
+        assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
+        assert_eq!(tile.to_guard(), asked.guard(&tiling));
+        assert!(tile.within_over(&asked, &tiling).is_ok());
+    }
+
+    #[test]
+    fn a_partial_pull_in_a_record_field_claims_just_that_fields_row() {
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let rows = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record([("a".into(), int.clone()), ("b".into(), int.clone())].into()),
+        );
+        let root = Tiling::Record([("items".into(), rows), ("total".into(), int)].into());
+        let items = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::record(
+                [
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 11]))),
+                    ("b".into(), Tile::Scalar(ColumnValue::Ints(vec![20, 21]))),
+                ]
+                .into(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tile = Tile::record(
+            [
+                ("items".into(), items),
+                ("total".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
+            ]
+            .into(),
+        );
+        let (producer, pulled, _) = ProjectionSpy::new(tile, root.clone());
+        let part = Projection::of_field(
+            "items",
+            Projection::within(
+                CurryLevel::OUTERMOST,
+                key(1),
+                Projection::of_field("a", Projection::Everything),
+            ),
+        );
+        let requested = part.guard(&root);
+        let row = Projection::of_field("items", Projection::admitting(key(1))).guard(&root);
+        let answer = producer.get(requested.clone());
+        assert_eq!(*pulled.read().unwrap(), [row]);
+        assert_eq!(answer.to_guard(), requested);
     }
 
     /// A record of two collection fields `a` and `b`, and the field `c` of plain values.

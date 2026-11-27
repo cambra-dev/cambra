@@ -537,11 +537,21 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 walk(codomain, label, level + 1, &keys, &complete, nodes, entries);
                 nodes.insert((label.to_vec(), level), CompletionNode { complete });
             }
-            Tile::Record { fields, .. } => {
-                for (field, field_tile) in fields {
+            Tile::Record { fields, absent } => {
+                for (name, field) in fields {
                     let mut label = label.to_vec();
-                    label.push(LabelStep::Field(field.clone()));
-                    walk(field_tile, &label, level, rows, above, nodes, entries);
+                    label.push(LabelStep::Field(name.clone()));
+                    if let Some(missing) = absent.get(name) {
+                        let present: Vec<_> = rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(r, _)| !missing.contains(*r))
+                            .map(|(_, path)| path.clone())
+                            .collect();
+                        walk(field, &label, level, &present, above, nodes, entries);
+                    } else {
+                        walk(field, &label, level, rows, above, nodes, entries);
+                    }
                 }
             }
             // A row's tag is an entry of its own, so a row that changes tags is caught, and each
@@ -815,6 +825,9 @@ fn released_cells_at(guard: &TileGuard, label: &[LabelStep]) -> Predicate {
         },
         TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) if label.is_empty() => {
             TileGuard::leaf_rows(pred).clone()
+        }
+        TileGuard::Function(FunctionGuard::Domain(_)) if !label.is_empty() => {
+            guard.field_rows().cloned().unwrap_or(Predicate::False)
         }
         _ => Predicate::False,
     }
@@ -1588,16 +1601,23 @@ pub(crate) fn closed_keeping_row_ends(guard: TileGuard, tiling: &Tiling) -> Tile
 
 /// [`BreakingProducer::final_guard`]'s default.
 fn held_final_guard<P: BreakingProducer + ?Sized>(producer: &P) -> TileGuard {
-    let held = producer.complete();
-    let obsolete = producer.obsolete_guard();
-    let left = match names_collection_keys(&obsolete) {
-        true => match keys_released_whole(&obsolete) {
+    held_after_release(
+        producer.complete(),
+        &producer.obsolete_guard(),
+        producer.tiling(),
+    )
+}
+
+/// Keep the still-held output of either a whole snapshot or one consume's contribution.
+fn held_after_release(held: TileGuard, obsolete: &TileGuard, tiling: &Tiling) -> TileGuard {
+    let left = match names_collection_keys(obsolete) {
+        true => match keys_released_whole(obsolete) {
             Some(released) if !held.is_empty() => guard_minus(&held, &released),
             _ => held,
         },
-        false => guard_minus(&held, &obsolete),
+        false => guard_minus(&held, obsolete),
     };
-    closed_keeping_row_ends(left, producer.tiling())
+    closed_keeping_row_ends(left, tiling)
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -1789,6 +1809,19 @@ pub trait Breaker {
     /// Read the existing input, integrate into synchronized native state, and release
     /// consumed input after dropping the output-state lock.
     fn consume_impl(&self, input: InputId, guard: TileGuard);
+
+    /// Consume a dispatched package and buffer any pushes known from its answer. Return the
+    /// producer when the driver still needs an exclusive snapshot before acknowledging.
+    fn consume_for_dispatch(
+        &self,
+        input: InputId,
+        guard: TileGuard,
+        _pushes: &mut Pushes<'_>,
+    ) -> Option<&dyn BreakingProducer> {
+        self.consume_impl(input, guard);
+        self.as_producer()
+            .filter(|producer| producer.pushes_while_consuming())
+    }
 
     fn finish_parallel_input(&mut self) {}
 
@@ -2071,14 +2104,20 @@ pub trait TileProducer: Send + Sync {
     /// it restates, and the answer is cut to the projection.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&self, projection_guard: TileGuard) -> Tile {
-        // A pull of part of some values, as a record whose collection field is complete through
-        // some rows, pulls the rows holding it: pulling more is sound for a `get`
-        // (`src/interpreter/design-operators.md`, "Projection guards").
-        if let Ok(asked) = Projection::of(&projection_guard)
-            && asked.names_part_of_values()
-        {
-            return self.get(asked.rows().guard(self.tiling()));
-        }
+        self.checked_get(projection_guard, &|guard| {
+            let Some(rows) = guard.enclosing_rows() else {
+                return self.get_impl(guard);
+            };
+            let projection = guard.projection_for(self);
+            let mut answer = self.get_impl(rows);
+            answer.restrict_to(&projection, self.tiling());
+            answer
+        })
+    }
+
+    /// Apply the producer protocol to a read. A memo cuts its cache directly; kernels
+    /// that compute whole values may read enclosing keys and cut their answer once.
+    fn checked_get(&self, projection_guard: TileGuard, read: &dyn Fn(TileGuard) -> Tile) -> Tile {
         // A pull at keys of a level the producer does not restate pulls the keys above them at
         // the nearest level it restates, and the answer is cut to the keys asked for: pulling
         // more is sound for a `get`, so every producer answers a projection at every level.
@@ -2120,10 +2159,10 @@ pub trait TileProducer: Send + Sync {
                 .answers_recorded
                 .load(std::sync::atomic::Ordering::SeqCst)
         });
-        let mut result = self.get_impl(projection_guard);
-        // Released scalar cells are removed while their enclosing rows remain open;
+        let mut result = read(projection_guard);
+        // Released record fields are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
-        if let Some(cells) = self.obsolete_guard().clone().released_cells() {
+        if let Some(cells) = self.obsolete_guard().released_fields(self.tiling()) {
             result.remove_guarded(cells);
         }
         // A duplicate scalar delivery can append cells without identifying the repeated
