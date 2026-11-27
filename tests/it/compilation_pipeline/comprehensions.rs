@@ -1635,6 +1635,9 @@ fn a_conjunction_of_element_wise_arms_compiles_to_one_map() {
 #[case::nested_record("[(a=x + 1, b=(c=x - 1, d=1)) for x in source1()]")]
 #[case::nested_tuple("[(x + 1, (x, x * 2)) for x in source1()]")]
 #[case::read_and_constant("[(x, 1) for x in source1()]")]
+#[case::variant("[`some(x + 1) for x in source1()]")]
+#[case::variant_field("[(a=x * 2, b=`some(x + 1)) for x in source1()]")]
+#[case::variant_constant_field("[(a=x * 2, b=`none) for x in source1()]")]
 fn a_product_of_element_wise_arms_compiles_to_one_map(#[case] code: &str) {
     assert_eq!(
         operator_kinds_over_source1(code),
@@ -1644,6 +1647,180 @@ fn a_product_of_element_wise_arms_compiles_to_one_map(#[case] code: &str) {
             "Constant",
             "MapResult"
         ],
+    );
+}
+
+/// A comparison of records leaves out a field holding `()`, which is equal at every row, so it is
+/// one map and agrees with comparing the other fields.
+#[test]
+fn a_comparison_of_records_holding_unit_compiles_to_one_map() {
+    assert_eq!(
+        operator_kinds_over_source1("[(a=(), b=x) == (a=(), b=2) for x in source1()]"),
+        [
+            "IterateExtent",
+            "MapResultWithSource",
+            "Constant",
+            "MapResult"
+        ],
+    );
+    check_scalar(
+        "sum([x for x in [1, 2, 3] if (a=(), b=x) != (a=(), b=2)])",
+        Value::Int(4),
+    );
+}
+
+/// A collection of records holding a variant is a column, so a chain reading it fuses as well:
+/// the producer and the consumer are one map each, with no `Zip` between the fields.
+#[test]
+fn a_chain_over_records_holding_a_variant_compiles_to_one_map() {
+    let code = indoc! {"
+        rs = [(a=x * 2, b=`some(x)) for x in source1()]
+        [(c=r.b, d=r.a + 1) for r in rs]"};
+    let kinds = operator_kinds_over_source1(code);
+    assert_eq!(
+        kinds.iter().filter(|kind| **kind == "MapResult").count(),
+        2,
+        "one map builds the records and one reads them, got {kinds:?}"
+    );
+    for unfused in ["Zip", "VariantWrap"] {
+        assert!(
+            !kinds.contains(&unfused),
+            "both chains are element-wise, got {unfused} in {kinds:?}"
+        );
+    }
+}
+
+/// A variant field reads back through `match` whatever the union around it holds: one with an
+/// arm that holds a collection, which `VariantWrap` builds
+/// (`a_wrap_into_a_union_of_tiles_keeps_its_operator`), or a union of columns, nested or inside a
+/// record, which the fused map builds (`a_product_of_element_wise_arms_compiles_to_one_map`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_arm_holding_a_collection(
+    indoc! {"
+        type Held:
+            count(Int)
+            items(List(Int))
+
+        rs = [(a=x * 2, b=Held::count(x + 1)) for x in [1, 2, 3]]
+        def payload(o):
+            match o:
+                case Held::count(v):
+                    v
+                case Held::items(xs):
+                    sum(xs)
+        sum([r.a + payload(r.b) for r in rs])"},
+    21
+)]
+#[case::a_constant_beside_an_arm_holding_a_collection(
+    indoc! {"
+        type Held:
+            none
+            items(List(Int))
+
+        rs = [(a=x * 2, b=Held::none) for x in [1, 2, 3]]
+        def payload(o):
+            match o:
+                case Held::none:
+                    100
+                case Held::items(xs):
+                    sum(xs)
+        sum([r.a + payload(r.b) for r in rs])"},
+    312
+)]
+#[case::a_conditional_over_an_arm_holding_a_collection(
+    indoc! {"
+        type Held:
+            count(Int)
+            items(List(Int))
+
+        ys = box([5, 6])
+        rs = [(a=x * 2, b=Held::count(x + 1) if x > 1 else Held::items(ys)) for x in [1, 2, 3]]
+        def payload(o):
+            match o:
+                case Held::count(v):
+                    v
+                case Held::items(xs):
+                    sum(xs)
+        sum([r.a + payload(r.b) for r in rs])"},
+    30
+)]
+#[case::nested_variants_and_records(
+    indoc! {"
+        rs = [(a=x * 2, b=`some(`inner(x + 1)), c=(d=`none, e=x - 1)) for x in [1, 2, 3]]
+        def payload(o):
+            match o:
+                case `some(i):
+                    match i:
+                        case `inner(v):
+                            v
+                case `none:
+                    100
+        def fallback(o):
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    1000
+        sum([r.a + payload(r.b) + fallback(r.c.d) + r.c.e for r in rs])"},
+    3024
+)]
+fn a_variant_field_reads_back_through_match(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A union with an arm that holds a collection is not a column, so its constructor keeps the
+/// `VariantWrap` operator.
+#[test]
+fn a_wrap_into_a_union_of_tiles_keeps_its_operator() {
+    let code = indoc! {"
+        type Held:
+            count(Int)
+            items(List(Int))
+
+        [(a=x * 2, b=Held::count(x + 1)) for x in source1()]"};
+    let kinds = operator_kinds_over_source1(code);
+    assert!(
+        kinds.contains(&"VariantWrap"),
+        "a union of tiles is built by `VariantWrap`, got {kinds:?}"
+    );
+}
+
+/// A fused map's union column holds one arm, and `++` merges it with a column of the other arm:
+/// the merged collection reads back through `match` with each row's own tag.
+#[test]
+fn a_fused_variant_column_merges_with_another_arm() {
+    check_scalar(
+        indoc! {"
+            somes = [`some(x + 1) for x in [1, 2]]
+            nones = [`none for x in [3]]
+            def payload(o):
+                match o:
+                    case `some(v):
+                        v
+                    case `none:
+                        100
+            sum([payload(o) for o in somes ++ nones])"},
+        Value::Int(105),
+    );
+}
+
+/// The variant fields a fused map builds read back through `match`: `b` carries `` `some `` and
+/// `c` carries `` `none `` at every row, and a copied field keeps its tag.
+#[test]
+fn a_fused_variant_field_reads_back_through_match() {
+    check_scalar(
+        indoc! {"
+            rs = [(a=x * 2, b=`some(x + 1), c=`none) for x in [1, 2, 3]]
+            copied = [(b=r.b, c=r.c, a=r.a) for r in rs]
+            def payload(o):
+                match o:
+                    case `some(v):
+                        v
+                    case `none:
+                        100
+            sum([r.a + payload(r.b) + payload(r.c) for r in copied])"},
+        Value::Int(321),
     );
 }
 

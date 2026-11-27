@@ -1266,17 +1266,22 @@ slot 𝑖, and operands refer only to earlier slots. The last instruction produc
 
 | Instruction | Value |
 |---|---|
-| `Input { path }` | Input column, or a field path into it, of type `Int`, `UInt`, `String`, or `Bool` |
-| `Const(value)` | One value of those types, repeated over the input rows |
+| `Input { path }` | Input column, or a field path into it, of type `Unit`, `Int`, `UInt`, `String`, or `Bool`, or of a union |
+| `Const(value)` | One value of type `Unit`, `Int`, `UInt`, `String`, or `Bool`, repeated over the input rows |
 | `Bin(op, a, b)` | Binary operation on slots `a` and `b` |
 | `Un(op, a)` | Unary operation on slot `a` |
 | `Record(fields)` | Record column with a slot per field, sorted by field name |
+| `Wrap { tag, payload }` | Union column whose one arm, `tag`, holds every row, with its payloads in slot `payload` |
 
-Operations consume scalar columns, never `Record` instructions. A `Record` is the last instruction
-or a field of a later `Record`; nested records construct only the result. Record equality and
-inequality are expanded during recognition: `Parser::operation` recursively compares the fields
-selected by `binop::compared_fields`, joining results with `and` for `==` or `or` for `!=`. Operands
-may be input records, constants, or products constructed by `zip`.
+`Record` and `Wrap` are the constructors. Operations consume columns of `Int`, `UInt`, `String` and
+`Bool`, never a constructor or a `Unit` or union column (`ScalarProgram::operands_have_views`). A
+constructor is the last instruction or a field or payload of a later constructor, so constructors
+build only the result (`ScalarProgram::constructors_build_only_the_result`). A variant constant is
+recognized as the `Wrap` of its payload. Record equality and inequality are expanded during
+recognition: `Parser::operation` recursively compares the fields selected by
+`binop::compared_fields`, joining results with `and` for `==` or `or` for `!=`. A field whose
+compared values hold only `unit` is left out, since it is equal at every row. Operands may be input
+records, constants, or products constructed by `zip`.
 
 Repeated reads of an input field path share one `Input` instruction. References to an already
 computed value reuse its slot, including when several `zip` arms read it. The parser does not merge
@@ -1288,12 +1293,16 @@ temporary instructions; field-name sorting makes record instruction order determ
 Its eligible forms, operation-count threshold, and operator-conversion boundaries are specified in
 [Element-wise chains](../ccl/design/optimization.md#element-wise-chains).
 
-`ScalarProgram::eval` processes at most 1024 rows (`BLOCK_ROWS`) per block. Inputs and constants are
-borrowed [column views](#column-views), with no scratch column. Each intermediate operation writes
+`ScalarProgram::eval` processes at most 1024 rows (`BLOCK_ROWS`) per block. Inputs and constants of
+`Int`, `UInt`, `String` and `Bool` are borrowed [column views](#column-views), with no scratch
+column. Each intermediate operation writes
 a scratch column that is cleared and reused for the next block. The last instruction appends
-directly to the output: an operation runs its kernel, and a record copies each field's block,
-recursively for nested records. Output capacity for all input rows is reserved before evaluation.
-Intermediate columns hold at most one block each rather than one column per full input. An empty
+directly to the output: an operation runs its kernel, and a constructor appends each field's or its
+payload's block, recursively for nested constructors. A `Wrap` numbers the block's rows by their
+input positions (`UnionArm::extend_rows`). A `Unit` or union input has no view, so a constructor
+copies its block (`ColumnValue::slice`), and a `Unit` constant adds rows to a `Units` column.
+Output capacity for all input rows is reserved before evaluation, except in a union column, whose
+arms grow block by block. Intermediate columns hold at most one block each rather than one column per full input. An empty
 input still runs one zero-length block and produces a correctly typed empty output.
 
 #### Column views

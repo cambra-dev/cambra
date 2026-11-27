@@ -208,6 +208,24 @@ impl UnionArm {
         self.values.append(other.values);
     }
 
+    /// Append the rows `rows`, each past every row this arm carries, with the payloads that
+    /// `extend` appends to this arm's payload column, one per row. The caller keeps the enclosing
+    /// union a partition: no other arm of it carries a row in `rows`.
+    pub fn extend_rows(&mut self, rows: Range<usize>, extend: impl FnOnce(&mut ColumnValue)) {
+        debug_assert!(
+            self.rows.last().is_none_or(|&last| rows.start > last),
+            "UnionArm::extend_rows: appended rows must stay ascending"
+        );
+        let want = self.values.len() + rows.len();
+        self.rows.extend(rows);
+        extend(&mut self.values);
+        debug_assert_eq!(
+            self.values.len(),
+            want,
+            "UnionArm::extend_rows: one payload per appended row"
+        );
+    }
+
     /// Number of rows this arm carries.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -875,7 +893,8 @@ impl ColumnValue {
                 // carries the *union* of the two tag sets: appending a column that
                 // uses a tag this one lacks grows the arm set rather than failing,
                 // which is what makes concatenation total over width-subtypes.
-                let offset = ColumnValue::Union(sa.clone()).len();
+                let offset: usize = sa.values().map(UnionArm::len).sum();
+                let appended: usize = oa.values().map(UnionArm::len).sum();
                 for (tag, other_arm) in oa {
                     // A tag `self` lacks starts as an empty arm shaped like the
                     // incoming one, so the payload append stays a like-for-like
@@ -884,13 +903,13 @@ impl ColumnValue {
                     sa.get_or_insert_with(tag, || empty)
                         .extend_shifted(other_arm, offset);
                 }
-                debug_assert!(
-                    {
-                        let mut all: Vec<usize> =
-                            sa.values().flat_map(|a| a.rows().to_vec()).collect();
-                        all.sort_unstable();
-                        all.iter().enumerate().all(|(i, &r)| i == r)
-                    },
+                // Each side partitions its own rows, and `other`'s are shifted past every row of
+                // `self`, so the count is what a partition of `0..offset + appended` holds.
+                // Sorting every row here instead would make a column built by repeated appends
+                // quadratic in debug builds.
+                debug_assert_eq!(
+                    sa.values().map(UnionArm::len).sum::<usize>(),
+                    offset + appended,
                     "Union append: the arms must still partition 0..len"
                 );
             }
