@@ -438,6 +438,9 @@ impl TileProducer for VariantWrapProducer {
                 &self.variant_extents,
             )),
         };
+        if matches!(projection, Projection::Arms(_)) {
+            tile.restrict_to(&projection, self.tiling());
+        }
         tile
     }
 
