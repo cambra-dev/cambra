@@ -25,15 +25,10 @@ pub(super) const LOOP_POSITION: &str = "__pos";
 /// Does not recurse into `with`/`try` blocks — those are rejected later by
 /// the "only assignments and function definitions" check in `lower_for_body_stmts`.
 pub(super) fn for_body_has_yield(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(stmt_has_yield)
-}
-
-fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
-    match &stmt.node {
-        ChlStmt::Expr(value) => matches!(&value.node, ChlExpr::Yield(_)),
-        ChlStmt::For { body, .. } => for_body_has_yield(body),
-        node => node.branch_blocks().into_iter().any(for_body_has_yield),
-    }
+    any_stmt_beneath(stmts, &|stmt| match &stmt.node {
+        ChlStmt::Expr(value) => matches!(value.node, ChlExpr::Yield(_)),
+        _ => false,
+    })
 }
 
 /// Return `true` if any statement in `stmts` contains a `<<` feed expression
@@ -45,15 +40,29 @@ fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
 /// as `for x: bump(cnt)`, whose only possible effect is a hidden mutable write
 /// inside a call) is routed to the direct-mirror `For` marker.
 pub(super) fn for_body_has_feed(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(stmt_has_feed)
+    any_stmt_beneath(stmts, &|stmt| match &stmt.node {
+        ChlStmt::Expr(value) => matches!(value.node, ChlExpr::Feed { .. }),
+        _ => false,
+    })
 }
 
-fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
-    match &stmt.node {
-        ChlStmt::Expr(value) => matches!(&value.node, ChlExpr::Feed { .. }),
-        ChlStmt::For { body, .. } => for_body_has_feed(body),
-        node => node.branch_blocks().into_iter().any(for_body_has_feed),
-    }
+/// Whether `p` holds of a statement in `stmts` or of one beneath it: in a `for` body or one of
+/// a statement's [`branch_blocks`](ChlStmt::branch_blocks) (an `if` branch or its `else`, a
+/// `match` arm, a `try` block or an `except` clause). The search enters nothing else: not a
+/// `def` body, a `with` body, an `impl` or instance block, the statement under `pub`, or any
+/// expression, so it misses an `if` or `match` in value position ([`ChlExpr::Block`],
+/// [`block_value_stmt`]).
+fn any_stmt_beneath(stmts: &[Spanned<ChlStmt>], p: &dyn Fn(&Spanned<ChlStmt>) -> bool) -> bool {
+    stmts.iter().any(|stmt| {
+        p(stmt)
+            || match &stmt.node {
+                ChlStmt::For { body, .. } => any_stmt_beneath(body, p),
+                node => node
+                    .branch_blocks()
+                    .into_iter()
+                    .any(|block| any_stmt_beneath(block, p)),
+            }
+    })
 }
 
 /// Whether the loop body contains a `with begin():` transaction block, as one of its
@@ -83,13 +92,8 @@ fn is_with(stmt: &Spanned<ChlStmt>) -> bool {
 /// path, whose body is a statement chain exception elimination rewrites, and which carries the
 /// loop state it adds when an exception escapes the body.
 pub(super) fn for_body_has_exceptions(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(|stmt| match &stmt.node {
-        ChlStmt::Raise(_) | ChlStmt::Try { .. } => true,
-        ChlStmt::For { body, .. } => for_body_has_exceptions(body),
-        node => node
-            .branch_blocks()
-            .into_iter()
-            .any(for_body_has_exceptions),
+    any_stmt_beneath(stmts, &|stmt| {
+        matches!(stmt.node, ChlStmt::Raise(_) | ChlStmt::Try { .. })
     })
 }
 
@@ -1145,21 +1149,16 @@ pub(super) struct ForSite<'a> {
 /// routes a loop carrying a transaction. This asks the transitive question an inner
 /// loop needs: a commit site anywhere inside it is one the nested `Transact` cannot key.
 fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(|stmt| match &stmt.node {
-        _ if is_with(stmt) => true,
-        ChlStmt::For { body, .. } => body_has_with(body),
-        node => node.branch_blocks().into_iter().any(body_has_with),
-    })
+    any_stmt_beneath(stmts, &is_with)
 }
 
 /// Whether `body` holds a bare effect statement — a call that may hide a write through a
 /// borrowed parameter ([`for_body_terminal_is_bare_effect`]) — anywhere a write in it would
 /// reach the enclosing loops: in a branch, an arm or a deeper loop.
 fn body_has_bare_call(body: &[Spanned<ChlStmt>]) -> bool {
-    body.iter().any(|stmt| match &stmt.node {
-        ChlStmt::Expr(value) => !matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }),
-        ChlStmt::For { body, .. } => body_has_bare_call(body),
-        node => node.branch_blocks().into_iter().any(body_has_bare_call),
+    any_stmt_beneath(body, &|stmt| match &stmt.node {
+        ChlStmt::Expr(value) => !matches!(value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }),
+        _ => false,
     })
 }
 
@@ -1313,11 +1312,7 @@ fn nested_feed_only_gap(
 
 /// Whether a statement list holds a `match` anywhere beneath it.
 fn body_has_match(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(|stmt| match &stmt.node {
-        ChlStmt::Match { .. } => true,
-        ChlStmt::For { body, .. } => body_has_match(body),
-        node => node.branch_blocks().into_iter().any(body_has_match),
-    })
+    any_stmt_beneath(stmts, &|stmt| matches!(stmt.node, ChlStmt::Match { .. }))
 }
 
 /// Lower an inner `for` in a loop body to the direct-mirror `For` node a top-level
