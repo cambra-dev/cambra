@@ -1735,15 +1735,33 @@ impl MemoProducer {
             self.name(),
             self.cached_tile
         );
-        if wake_on_new_data {
-            let before = self.cached_tile.clone();
-            self.cached_tile.merge(input);
-            if self.cached_tile != before {
-                self.wakeups.request(self.consumer.shared().clone());
-            }
-        } else {
-            self.cached_tile.merge(input);
+        let before = wake_on_new_data.then(|| self.cached_tile.clone());
+        self.cached_tile.merge(input);
+        close_over_positions(&mut self.cached_tile, &self.base.tiling);
+        if before.is_some_and(|before| self.cached_tile != before) {
+            self.wakeups.request(self.consumer.shared().clone());
         }
+    }
+}
+
+/// State `tile` complete where it states every key of its outermost collection, a finite range
+/// of positions (`Extent::UIntRange`), without stating `True`.
+///
+/// A pull at some keys states completeness of those keys alone, so a cache merging the answers
+/// to pulls at every key states each of them and not the whole. A reader holding the collection
+/// beneath a level of its own states that level complete only where the collection states
+/// `True`, so the cache states it once it can.
+fn close_over_positions(tile: &mut Tile, tiling: &Tiling) {
+    if let (
+        Some(Extent::UIntRange(positions)),
+        Tile::DataFunction {
+            domain_predicate, ..
+        },
+    ) = (tiling.domain_extent(), tile)
+        && !domain_predicate.is_true()
+        && domain_predicate.covers_positions(&positions)
+    {
+        *domain_predicate = Predicate::True;
     }
 }
 
