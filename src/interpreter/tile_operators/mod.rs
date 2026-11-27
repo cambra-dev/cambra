@@ -529,11 +529,21 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 walk(codomain, label, level + 1, &keys, &complete, nodes, entries);
                 nodes.insert((label.to_vec(), level), CompletionNode { complete });
             }
-            Tile::Record { fields, .. } => {
-                for (field, field_tile) in fields {
+            Tile::Record { fields, absent } => {
+                for (name, field) in fields {
                     let mut label = label.to_vec();
-                    label.push(field.clone());
-                    walk(field_tile, &label, level, rows, above, nodes, entries);
+                    label.push(name.clone());
+                    if let Some(missing) = absent.get(name) {
+                        let present: Vec<_> = rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(r, _)| !missing.contains(*r))
+                            .map(|(_, path)| path.clone())
+                            .collect();
+                        walk(field, &label, level, &present, above, nodes, entries);
+                    } else {
+                        walk(field, &label, level, rows, above, nodes, entries);
+                    }
                 }
             }
             Tile::Scalar(column) => {
@@ -743,6 +753,9 @@ fn released_cells_at(guard: &TileGuard, label: &[SmolStr]) -> Predicate {
         },
         TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) if label.is_empty() => {
             TileGuard::leaf_rows(pred).clone()
+        }
+        TileGuard::Function(FunctionGuard::Domain(_)) if !label.is_empty() => {
+            guard.field_rows().cloned().unwrap_or(Predicate::False)
         }
         _ => Predicate::False,
     }
@@ -1696,14 +1709,6 @@ impl InputId {
     pub const ONLY: InputId = InputId(0);
 }
 
-/// A pure rule the planner can bind to an input tiling. The queue and the producer
-/// apply the same rule to each requested guard, without locking a live producer.
-pub type ReadRegion = fn(TileGuard, &Tiling) -> TileGuard;
-
-pub(crate) fn enclosing_read_region(requested: TileGuard, _: &Tiling) -> TileGuard {
-    requested.read_region()
-}
-
 /// The end of a pipeline, as the dispatcher drives it: it consumes the pipeline's work packages.
 /// [`consume_impl`] pulls the breaker's input at a guard, merges the answer, and releases the
 /// input at what the answer stated once it has taken delivery of it, so the driver handles no
@@ -1714,11 +1719,6 @@ pub(crate) fn enclosing_read_region(requested: TileGuard, _: &Tiling) -> TileGua
 ///
 /// [`consume_impl`]: Self::consume_impl
 pub trait Breaker {
-    /// Region this breaker's input will read for a dispatched projection.
-    fn input_read_rule(&self) -> ReadRegion {
-        enclosing_read_region
-    }
-
     /// Whether packages naming disjoint regions of the input may run this breaker's consume at
     /// once. The dispatcher runs a package beside others only where the input is also keyed by
     /// ordered keys (`src/interpreter/design-dispatcher.md`, "Shared native pipeline execution").
@@ -1900,15 +1900,6 @@ impl DroppedRows {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer: Send + Sync {
-    /// Resolve a requested guard to the region this producer can actually deliver.
-    fn read_rule(&self) -> ReadRegion {
-        enclosing_read_region
-    }
-
-    fn read_region(&self, requested: TileGuard) -> TileGuard {
-        self.read_rule()(requested, self.tiling())
-    }
-
     /// The entry before `input`, where an enclosing breaker's planner can receive that input's
     /// pushes in its own keys. Unplaced inputs remain read by pull.
     fn input_entry(&self, _input: &str) -> Option<crate::interpreter::dispatcher::Placement> {
@@ -2008,7 +1999,20 @@ pub trait TileProducer: Send + Sync {
     /// it restates, and the answer is cut to the projection.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&self, projection_guard: TileGuard) -> Tile {
-        let projection_guard = self.read_region(projection_guard);
+        self.checked_get(projection_guard, &|guard| {
+            let Some(rows) = guard.enclosing_rows() else {
+                return self.get_impl(guard);
+            };
+            let projection = guard.projection_for(self);
+            let mut answer = self.get_impl(rows);
+            answer.restrict_to(&projection, self.tiling());
+            answer
+        })
+    }
+
+    /// Apply the producer protocol to a read. A memo cuts its cache directly; kernels
+    /// that compute whole values may read enclosing keys and cut their answer once.
+    fn checked_get(&self, projection_guard: TileGuard, read: &dyn Fn(TileGuard) -> Tile) -> Tile {
         // A pull at keys of a level the producer does not restate pulls the keys above them at
         // the nearest level it restates, and the answer is cut to the keys asked for: pulling
         // more is sound for a `get`, so every producer answers a projection at every level.
@@ -2050,10 +2054,10 @@ pub trait TileProducer: Send + Sync {
                 .answers_recorded
                 .load(std::sync::atomic::Ordering::SeqCst)
         });
-        let mut result = self.get_impl(projection_guard);
-        // Released scalar cells are removed while their enclosing rows remain open;
+        let mut result = read(projection_guard);
+        // Released record fields are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
-        if let Some(cells) = self.obsolete_guard().clone().released_cells() {
+        if let Some(cells) = self.obsolete_guard().released_fields(self.tiling()) {
             result.remove_guarded(cells);
         }
         // A duplicate scalar delivery can append cells without identifying the repeated

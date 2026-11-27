@@ -564,7 +564,7 @@ that producer with an intent guard, a consumer notification handle and a `Subscr
 | `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
 
 `get` and `release` are provided `TileProducer` methods around required producer-specific
-`get_impl` and `release_impl` methods. The `get` wrapper removes released scalar record cells,
+`get_impl` and `release_impl` methods. The `get` wrapper removes released record fields,
 checks the returned tile, records a probe observation and returns the result. It does not
 implement projection for the producer.
 
@@ -725,8 +725,9 @@ calling the implementation, so ignoring it does not cancel the promise. Operator
 support whole-value release use `TileGuard::expect_universal_or_empty` to reject partial guards
 at release time, even if no subsequent pull would exercise the `get` postcondition.
 
-A scalar record field can be released at its enclosing row before a sibling collection is
-complete. `Tile::to_guard` names that cell, and `Tile::Record::absent` records its absence
+A scalar, finished accumulator, or closed store field can be released at its enclosing row
+while sibling fields are still live. `Tile::to_guard` names each ready field, and
+`Tile::Record::absent` records its absence
 without removing the row. A producer may reconstruct the row from inputs released only by
 whole key; the `get` wrapper removes those previously released field cells before returning
 it. `Zip` also preserves a row with an absent field when that field's input has already
@@ -759,8 +760,9 @@ For the caching case, see
 
 `Memo` releases everything it merges, with `to_guard`
 ([The release contract](#the-release-contract)). It obtains that guard before compaction,
-then releases the region upstream. Open collection groups and join-combined
-aggregate or store state can remain unreleased. A debug check uses `holds_a_plain_value` to
+then releases the region upstream. An open collection group can grow after the memo releases its completed fields. An unfinished
+accumulator or live store in a keyed record stays with its producer until that field finishes.
+The memo then copies the finished snapshot once. Each store row retains its own closure and seed. A debug check uses `holds_a_plain_value` to
 reject an input whose release would leave ordinary values available for duplicate delivery.
 
 `to_guard` includes complete keys by full path and scalar cells at their enclosing rows, including

@@ -584,7 +584,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             total: 1,
         },
         Tile::Store {
-            frontier, terminal, ..
+            frontier, closures, ..
         } => {
             // One row per key, holding the change events themselves rather than
             // the step function they decide: what a reader asks of a slot is what
@@ -593,7 +593,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             let total = names.len();
             // A terminal store is decided everywhere; a live one through its
             // running row's watermark.
-            let completeness = if *terminal {
+            let completeness = if closures.terminal() {
                 "True".to_string()
             } else {
                 bounded(|out| write!(out, "{:?}", running_frontier(frontier)))
@@ -850,8 +850,7 @@ pub(crate) fn one_key_store(
         frontier: Box::new(one_row_decided(ColumnValue::UInts(
             watermark.into_iter().collect(),
         ))),
-        terminal,
-        closed_keys: Vec::new(),
+        closures: crate::interpreter::StoreClosures::uniform(terminal),
     }
 }
 

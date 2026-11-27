@@ -141,12 +141,6 @@ impl SinkBreaker {
 }
 
 impl Breaker for SinkBreaker {
-    fn input_read_rule(&self) -> ReadRegion {
-        Self::reading(&self.producer)
-            .as_ref()
-            .map_or(enclosing_read_region, |p| p.read_rule())
-    }
-
     /// A consume hands the sink what the answer holds and releases it, so a row is handed once. A
     /// `main` output that merges its answers and hands them once, at its finish, publishes
     /// nothing a read before its finish could bring forward.

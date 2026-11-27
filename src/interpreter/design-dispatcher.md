@@ -504,9 +504,10 @@ removes its entry, even when an earlier package is still running. A package whos
 region of a package in flight is not claimed, and the packages behind it wait with it, until that
 package is acknowledged (`Queue::claim`). A pipeline can be notified of a region again before its
 package for the region is acknowledged, as a reader keyed by one row is at each push of what it
-reads, and two packages naming one region would read it at once. Each queued guard names
-the region the producer can return (`TileGuard::read_region`). A partial-field pull within a
-collection claims its enclosing row. Disjoint inner keys can still run together. Package indices increase for the
+reads, and two packages naming one region would read it at once. The queue reserves the guard it receives. A producer may
+pull enclosing keys internally and cut the answer to the requested fields before delivery and
+release. Disjoint field and item packages can run together, including beneath the same key.
+Package indices increase for the
 run and are never reused. An acknowledgement must match an in-flight index and guard. Ordered
 pipelines permit at most one package in flight. No queue lock is held while an operator executes.
 A delivery takes no lock beyond what each consumer's own state needs

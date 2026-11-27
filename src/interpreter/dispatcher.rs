@@ -167,7 +167,6 @@ const CLOSED: usize = 1 << (usize::BITS - 1);
 
 /// Unclaimed and in-flight packages of one pipeline. Acknowledged packages retain no entry.
 struct Queue {
-    read_region: Box<dyn Fn(TileGuard) -> TileGuard + Send + Sync>,
     // shared-state-ok: package lifecycle and guards naming input regions; never tiles.
     state: Mutex<QueueState>,
     /// Reservations include packages whose append still holds the queue lock. Closing freezes
@@ -186,16 +185,9 @@ struct QueueState {
 impl Queue {
     fn new() -> Self {
         Queue {
-            read_region: Box::new(TileGuard::read_region),
             state: Mutex::new(QueueState::default()),
             reserved: AtomicUsize::new(0),
         }
-    }
-
-    fn plan_reads(&mut self, breaker: &dyn Breaker) {
-        let resolve = breaker.input_read_rule();
-        let tiling = breaker.input_tiling(InputId::ONLY);
-        self.read_region = Box::new(move |guard| resolve(guard, &tiling));
     }
 
     /// Append each of `morsels` as a package. An empty morsel is no package. A closed queue takes
@@ -209,9 +201,7 @@ impl Queue {
             return false;
         };
         for (index, morsel) in (first..).zip(morsels) {
-            state
-                .ready
-                .push_back((index, (self.read_region)(morsel.clone())));
+            state.ready.push_back((index, morsel.clone()));
         }
         true
     }
@@ -3130,7 +3120,7 @@ mod tests {
     }
 
     #[test]
-    fn disjoint_fields_serialize_only_when_they_pull_the_same_row() {
+    fn disjoint_fields_can_be_claimed_on_the_same_row() {
         let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
         let tiling = Tiling::data_function(
             Extent::uint_range(2),
@@ -3149,26 +3139,12 @@ mod tests {
         let same = field(0, "b");
         assert!(first.intersect(&same).is_empty());
         let queue = Queue::new();
-        queue.append(&[first, other, same]);
-        let claim = || {
-            queue
-                .claim(0, false, || Some(()))
-                .map(|(package, ())| package)
-        };
-        let first = claim().unwrap();
-        assert_eq!(
-            first.guard,
-            Projection::admitting(Predicate::point(Value::UInt(0))).guard(&tiling)
-        );
-        let other = claim().expect("independent rows can be read together");
-        assert!(claim().is_none(), "the second field would read row 0 again");
-        assert_eq!(queue.acknowledge(&other, || {}), Some(false));
-        assert_eq!(
-            queue.acknowledge(&first, || {}),
-            Some(true),
-            "wake the waiter for row 0"
-        );
-        assert!(claim().is_some());
+        let guards = [first, other, same];
+        queue.append(&guards);
+        for guard in guards {
+            let (package, ()) = queue.claim(0, false, || Some(())).expect("disjoint field");
+            assert_eq!(package.guard, guard);
+        }
     }
 
     /// The acknowledgement that frees a package waiting on an overlapping one wakes a claimant

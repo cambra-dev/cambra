@@ -999,6 +999,261 @@ mod tests {
         use super::*;
         use crate::interpreter::{ColumnValue, CurryLevel, Tile};
         let tiling = customer_tiling();
+        let customers = customers_with_history();
+        let field = |item| customer_history_item(&tiling, item);
+        let (first, second, remaining) =
+            deliver_sibling_packages(&customers, &tiling, [field(2), field(4)], on_release);
+        for (tile, item, value) in [(first, 4, 74), (second, 2, 72)] {
+            assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
+            let Tile::Record { fields, .. } = tile.deepest_values() else {
+                panic!("expected customer record")
+            };
+            assert!(fields["id"].is_empty());
+            assert_eq!(fields["profile"].cell_count(), 0);
+            assert_eq!(
+                fields["history"].paths_at(CurryLevel::new(1)),
+                [vec![Value::UInt(3), Value::UInt(item)]]
+            );
+            assert_eq!(
+                fields["history"].deepest_values(),
+                &Tile::Scalar(ColumnValue::Ints(vec![value]))
+            );
+        }
+        assert!(!remaining.contains_guarded(&field(2)));
+        assert!(!remaining.contains_guarded(&field(4)));
+    }
+
+    #[rstest_log::rstest]
+    #[case::during_read(false)]
+    #[case::during_release(true)]
+    fn cached_memo_delivers_the_nested_profile_while_a_history_item_is_paused(
+        #[case] on_release: bool,
+    ) {
+        use super::*;
+        use crate::interpreter::{ColumnValue, CurryLevel, Tile};
+        let tiling = customer_tiling();
+        let profile = Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(7)),
+            Projection::of_field("profile", Projection::Everything),
+        )
+        .guard(&tiling);
+        let (first, _, _) = deliver_sibling_packages(
+            &customers_with_history(),
+            &tiling,
+            [customer_history_item(&tiling, 2), profile],
+            on_release,
+        );
+        let Tile::Record { fields, .. } = first.deepest_values() else {
+            panic!("customer")
+        };
+        let Tile::Record {
+            fields: profile, ..
+        } = &fields["profile"]
+        else {
+            panic!("profile")
+        };
+        assert_eq!(profile["rank"], Tile::Scalar(ColumnValue::Ints(vec![1])));
+        assert_eq!(
+            profile["visits"].deepest_values(),
+            &Tile::Scalar(ColumnValue::Ints(vec![1]))
+        );
+        assert!(fields["history"].is_empty());
+    }
+
+    #[test]
+    fn a_mixed_memo_package_keeps_each_customers_projection() {
+        use super::*;
+        use crate::interpreter::CurryLevel;
+        let tiling = customer_tiling();
+        let customer_eight = Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(8)),
+            Projection::of_field(
+                "profile",
+                Projection::of_field("rank", Projection::Everything),
+            ),
+        )
+        .guard(&tiling);
+        let mixed = customer_eight.union(&customer_history_item(&tiling, 4));
+        let (first, _, _) = deliver_sibling_packages(
+            &customers_with_history(),
+            &tiling,
+            [customer_history_item(&tiling, 2), mixed.clone()],
+            false,
+        );
+        assert_eq!(first.to_guard(), mixed);
+        assert_eq!(
+            first.cell_count(),
+            6,
+            "two customer keys, a rank and one day/item/value"
+        );
+    }
+
+    // Two independently seeded stores and two snapshots of running sums, one per customer.
+    fn customers_with_state(finished: [bool; 2], totals: [i64; 2]) -> (Tiling, Tile) {
+        use super::*;
+        use crate::{
+            ccl::AggregateKind,
+            interpreter::{ColumnValue, StoreClosures, types::BaseType},
+        };
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let store = Tiling::Store {
+            domain: Extent::uint_range(16),
+            codomain: Box::new(Tiling::Record([("balance".into(), int.clone())].into())),
+        };
+        let one = |value, terminal| {
+            let mut t = store.empty_tile();
+            let Tile::Store { seed, closures, .. } = &mut t else {
+                unreachable!()
+            };
+            **seed = Tile::record(
+                [(
+                    "balance".into(),
+                    Tile::Scalar(ColumnValue::Ints(vec![value])),
+                )]
+                .into(),
+            );
+            *closures = StoreClosures::uniform(terminal);
+            t
+        };
+        let mut accounts = one(13, finished[0]);
+        accounts.merge_rows(one(29, finished[1]));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(16),
+            Tiling::Record(
+                [
+                    ("account".into(), store),
+                    (
+                        "total".into(),
+                        Tiling::Aggregation {
+                            kind: AggregateKind::Sum,
+                            accumulator: Box::new(int.clone()),
+                        },
+                    ),
+                    ("id".into(), int),
+                ]
+                .into(),
+            ),
+        );
+        let rows = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![7, 8]),
+            Box::new(Tile::record(
+                [
+                    ("account".into(), accounts),
+                    (
+                        "total".into(),
+                        Tile::Aggregation {
+                            kind: AggregateKind::Sum,
+                            accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(totals.into()))),
+                            terminal: ColumnValue::Bools(finished.into()),
+                        },
+                    ),
+                    ("id".into(), Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                ]
+                .into(),
+            )),
+            Predicate::False,
+            Default::default(),
+        );
+        (tiling, rows)
+    }
+
+    fn state_field(tiling: &Tiling, row: u64, name: &str) -> TileGuard {
+        use super::*;
+        use crate::interpreter::CurryLevel;
+        Projection::within(
+            CurryLevel::OUTERMOST,
+            Predicate::point(Value::UInt(row)),
+            Projection::of_field(name, Projection::Everything),
+        )
+        .guard(tiling)
+    }
+
+    #[rstest_log::rstest]
+    fn a_finished_store_and_sum_reach_the_sink_independently(
+        #[values(false, true)] on_release: bool,
+    ) {
+        use crate::interpreter::ColumnValue;
+        let (ty, rows) = customers_with_state([true, true], [3, 9]);
+        let (first, second, _) = deliver_sibling_packages(
+            &rows,
+            &ty,
+            [state_field(&ty, 7, "total"), state_field(&ty, 7, "account")],
+            on_release,
+        );
+        let Tile::Record { fields, .. } = first.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Store { seed, closures, .. } = &fields["account"] else {
+            unreachable!()
+        };
+        assert!(closures.at(0).terminal);
+        let Tile::Record { fields, .. } = &**seed else {
+            unreachable!()
+        };
+        assert_eq!(fields["balance"], Tile::Scalar(ColumnValue::Ints(vec![13])));
+        let Tile::Record { fields, .. } = second.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Aggregation { accumulator, .. } = &fields["total"] else {
+            unreachable!()
+        };
+        assert_eq!(**accumulator, Tile::Scalar(ColumnValue::Ints(vec![3])));
+    }
+
+    #[test]
+    fn a_memo_retains_unfinished_state_at_the_input_until_its_customer_closes() {
+        use super::*;
+        use crate::interpreter::{
+            ColumnValue,
+            tile_operators::{
+                MemoProducer, TileProducer,
+                test_helpers::{ConsumeInPipeline, ProjectionSpy},
+            },
+        };
+        let (ty, rows) = customers_with_state([true, false], [3, 4]);
+        let (spy, script) = ProjectionSpy::scripted(rows, ty.clone());
+        let releases = spy.released.clone();
+        let mut memo = MemoProducer::over(Box::new(spy), &ty);
+        memo.consume_in_pipeline(InputId::ONLY, ty.universal_guard());
+        let sum = state_field(&ty, 8, "total");
+        let account = state_field(&ty, 8, "account");
+        let first = releases.read().unwrap()[0].clone();
+        assert!(first.subsumes(&state_field(&ty, 7, "total")));
+        assert!(first.subsumes(&state_field(&ty, 7, "account")));
+        assert!(first.intersect(&sum.union(&account)).is_empty());
+        let absent = in_a_run(|| memo.get(sum.clone()));
+        assert!(absent.to_guard().is_empty());
+        *script.write().unwrap() = customers_with_state([true, true], [3, 11]).1;
+        memo.consume_in_pipeline(InputId::ONLY, ty.universal_guard());
+        let last = releases.read().unwrap().last().unwrap().clone();
+        assert!(last.subsumes(&sum.union(&account)));
+        assert!(last.intersect(&first).is_empty());
+        let ready = in_a_run(|| memo.get(sum));
+        let Tile::Record { fields, .. } = ready.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Aggregation { accumulator, .. } = &fields["total"] else {
+            unreachable!()
+        };
+        assert_eq!(**accumulator, Tile::Scalar(ColumnValue::Ints(vec![11])));
+        let store = in_a_run(|| memo.get(account));
+        let Tile::Record { fields, .. } = store.deepest_values() else {
+            unreachable!()
+        };
+        let Tile::Store { seed, .. } = &fields["account"] else {
+            unreachable!()
+        };
+        let Tile::Record { fields, .. } = &**seed else {
+            unreachable!()
+        };
+        assert_eq!(fields["balance"], Tile::Scalar(ColumnValue::Ints(vec![29])));
+    }
+
+    fn customers_with_history() -> Tile {
+        use crate::interpreter::{ColumnValue, Predicate, Tile};
         // The same item keys occur on another day and under another customer.
         let group = |starts, keys, values| {
             Tile::grouped(
@@ -1053,27 +1308,7 @@ mod tests {
         {
             *domain_predicate = Predicate::True;
         }
-        let field = |item| customer_history_item(&tiling, item);
-        let (first, second, remaining) =
-            deliver_sibling_packages(&customers, &tiling, [field(2), field(4)], on_release);
-        for (tile, item, value) in [(first, 4, 74), (second, 2, 72)] {
-            assert_eq!(tile.paths_at(CurryLevel::OUTERMOST), [vec![Value::UInt(7)]]);
-            let Tile::Record { fields, .. } = tile.deepest_values() else {
-                panic!("expected customer record")
-            };
-            assert!(fields["id"].is_empty());
-            assert_eq!(fields["profile"].cell_count(), 0);
-            assert_eq!(
-                fields["history"].paths_at(CurryLevel::new(1)),
-                [vec![Value::UInt(3), Value::UInt(item)]]
-            );
-            assert_eq!(
-                fields["history"].deepest_values(),
-                &Tile::Scalar(ColumnValue::Ints(vec![value]))
-            );
-        }
-        assert!(!remaining.contains_guarded(&field(2)));
-        assert!(!remaining.contains_guarded(&field(4)));
+        customers
     }
 
     fn customer_tiling() -> Tiling {
@@ -1117,62 +1352,44 @@ mod tests {
     #[test]
     fn a_whole_customer_read_serializes_with_each_history_item() {
         use super::*;
-        use crate::interpreter::{
-            CurryLevel,
-            tile_operators::{MemoProducer, share_breaker, test_helpers::ProjectionSpy},
-        };
         let tiling = customer_tiling();
-        let (spy, _, _) = ProjectionSpy::new(tiling.empty_tile(), tiling.clone());
-        let cache = share_breaker(MemoProducer::over(Box::new(spy), &tiling));
-        let consumer = MemoProducer::over(cache, &tiling);
-        let customer = Predicate::point(Value::UInt(7));
-        let whole = Projection::admitting(customer.clone()).guard(&tiling);
-        let profile = Projection::within(
-            CurryLevel::OUTERMOST,
-            customer,
-            Projection::of_field("profile", Projection::Everything),
-        )
-        .guard(&tiling);
+        let whole = Projection::admitting(Predicate::point(Value::UInt(7))).guard(&tiling);
         let two = customer_history_item(&tiling, 2);
         let four = customer_history_item(&tiling, 4);
-        // Reading the complete nested record currently also takes a whole-row pull.
-        for request in [whole.clone(), profile] {
-            let mut queue = Queue::new();
-            queue.plan_reads(&consumer);
-            queue.append(&[
-                two.clone(),
-                four.clone(),
-                request,
-                whole.clone(),
-                two.clone(),
-            ]);
-            let claim = || {
-                queue
-                    .claim(0, false, || Some(()))
-                    .map(|(package, ())| package)
-            };
-            let a = claim().unwrap();
-            let b = claim().unwrap();
-            assert_eq!((&a.guard, &b.guard), (&two, &four));
-            assert!(claim().is_none());
-            queue.acknowledge(&b, || {}).unwrap();
-            assert!(claim().is_none());
-            queue.acknowledge(&a, || {}).unwrap();
-            let first_row = claim().unwrap();
-            assert_eq!(first_row.guard, whole);
-            assert!(claim().is_none(), "two whole-row reads must serialize");
-            queue.acknowledge(&first_row, || {}).unwrap();
-            let second_row = claim().unwrap();
-            assert_eq!(second_row.guard, whole);
-            assert!(
-                claim().is_none(),
-                "a leaf also waits behind a whole-row read"
-            );
-            queue.acknowledge(&second_row, || {}).unwrap();
-            let leaf = claim().unwrap();
-            assert_eq!(leaf.guard, two);
-            queue.acknowledge(&leaf, || {}).unwrap();
-        }
+        let queue = Queue::new();
+        queue.append(&[
+            two.clone(),
+            four.clone(),
+            whole.clone(),
+            whole.clone(),
+            two.clone(),
+        ]);
+        let claim = || {
+            queue
+                .claim(0, false, || Some(()))
+                .map(|(package, ())| package)
+        };
+        let a = claim().unwrap();
+        let b = claim().unwrap();
+        assert_eq!((&a.guard, &b.guard), (&two, &four));
+        assert!(claim().is_none());
+        queue.acknowledge(&b, || {}).unwrap();
+        assert!(claim().is_none());
+        queue.acknowledge(&a, || {}).unwrap();
+        let first_row = claim().unwrap();
+        assert_eq!(first_row.guard, whole);
+        assert!(claim().is_none(), "two whole-row reads must serialize");
+        queue.acknowledge(&first_row, || {}).unwrap();
+        let second_row = claim().unwrap();
+        assert_eq!(second_row.guard, whole);
+        assert!(
+            claim().is_none(),
+            "a leaf also waits behind a whole-row read"
+        );
+        queue.acknowledge(&second_row, || {}).unwrap();
+        let leaf = claim().unwrap();
+        assert_eq!(leaf.guard, two);
+        queue.acknowledge(&leaf, || {}).unwrap();
     }
 
     fn deliver_sibling_packages(
@@ -1215,9 +1432,6 @@ mod tests {
             }
             fn base_mut(&mut self) -> &mut ProducerBase {
                 self.input.base_mut()
-            }
-            fn read_rule(&self) -> crate::interpreter::tile_operators::ReadRegion {
-                self.input.read_rule()
             }
             fn get(&self, guard: TileGuard) -> Tile {
                 let answer = self.input.get(guard.clone());

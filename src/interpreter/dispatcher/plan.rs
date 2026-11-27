@@ -1213,12 +1213,10 @@ impl Execution {
                 let concurrent = match &target {
                     WorkerBreaker::Chain(handle) => {
                         let chain = handle.read().unwrap_or_else(PoisonError::into_inner);
-                        dispatcher.states[p].queue.plan_reads(&*chain);
                         chain.as_producer().is_some() && consumes_at_once(&*chain)
                     }
                     WorkerBreaker::Sink(handle) => {
                         let sink = handle.read().unwrap_or_else(PoisonError::into_inner);
-                        dispatcher.states[p].queue.plan_reads(&*sink);
                         consumes_at_once(&*sink)
                     }
                 };

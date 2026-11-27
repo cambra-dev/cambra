@@ -6,7 +6,6 @@ use std::sync::PoisonError;
 /// The breaker retains only a weak reference to its cell.
 pub(crate) fn share_breaker(producer: impl BreakingProducer + 'static) -> Box<dyn TileProducer> {
     let tiling = producer.tiling().clone();
-    let read_region = producer.read_rule();
     let handle: BreakerHandle = Arc::new(RwLock::new(producer));
     handle
         .write()
@@ -16,24 +15,18 @@ pub(crate) fn share_breaker(producer: impl BreakingProducer + 'static) -> Box<dy
     Box::new(BreakerReader {
         base: ProducerBase::unowned(BreakerReader::alloc_id(), &tiling),
         handle,
-        read_region,
     })
 }
 
 /// A downstream reader of a shared breaker. Tile validation and probes belong to the breaker.
 struct BreakerReader {
     base: ProducerBase,
-    read_region: ReadRegion,
     // shared-state-ok: the producer subscription itself, with all values read through get.
     handle: BreakerHandle,
 }
 
 impl TileProducer for BreakerReader {
     impl_producer_base!();
-
-    fn read_rule(&self) -> ReadRegion {
-        self.read_region
-    }
 
     fn get(&self, guard: TileGuard) -> Tile {
         #[cfg(debug_assertions)]
