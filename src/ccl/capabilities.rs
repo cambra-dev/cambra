@@ -50,6 +50,10 @@ pub struct OrderableIfRequiredBy {
     /// Whether this is a use's copy, located at the use rather than at the loop
     /// ([`Requirement::at_use`]).
     pub(crate) at_use: bool,
+    /// Whether the requirement is satisfied, as the run decided it once it ended
+    /// ([`Requirement::closed`]): the capabilities it reads are then a known set, which
+    /// no longer says whether an effect input was open. `None` while the run lasts.
+    pub(crate) decided: Option<bool>,
 }
 
 impl OrderableIfRequiredBy {
@@ -171,6 +175,7 @@ impl Requirement {
                 iter,
                 assumptions: RefCell::new(assumptions),
                 at_use: false,
+                decided: None,
             })),
         )
     }
@@ -222,6 +227,21 @@ impl Requirement {
             .all(|i| stated.states(solver, &i))
     }
 
+    /// This ordering requirement as its run leaves it: `positions` and `capabilities` closed,
+    /// with nothing of the run's left in them, and whether it is satisfied decided by the run.
+    pub(crate) fn closed(
+        &self,
+        positions: crate::ccl::Type,
+        capabilities: Capabilities,
+        satisfied: bool,
+    ) -> Self {
+        let mut order = (**self.ordering().expect("an ordering requirement")).clone();
+        order.positions = positions;
+        order.capabilities = capabilities;
+        order.decided = Some(satisfied);
+        Self(self.0.clone(), Some(Rc::new(order)))
+    }
+
     pub(crate) fn with_ordering(
         &self,
         positions: crate::ccl::Type,
@@ -241,6 +261,9 @@ impl Requirement {
         let Some(r) = &self.1 else { return false };
         if r.satisfied.get() {
             return true;
+        }
+        if let Some(decided) = r.decided {
+            return decided;
         }
         if !matches!(r.capabilities.repr(), Repr::Var(_)) {
             let set = r.capabilities.set_in(solver);
