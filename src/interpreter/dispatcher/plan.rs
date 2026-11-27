@@ -1021,8 +1021,9 @@ enum Handler {
 pub(super) struct Execution {
     handlers: Vec<Handler>,
     roots: usize,
-    /// Each scope's inner pipelines, its step and its own pipeline, as attached.
-    bodies: Vec<(std::ops::Range<usize>, PipelineId, PipelineId)>,
+    /// Each scope's inner pipelines, its step, its own pipeline and its body's follower hold, as
+    /// attached.
+    bodies: Vec<(std::ops::Range<usize>, PipelineId, PipelineId, HoldGroup)>,
 }
 
 impl Execution {
@@ -1076,7 +1077,8 @@ impl Execution {
                 // releases the rows the loop around it gives it.
                 let mut child = induction(child);
                 child.decide_through_drive();
-                child.body_mut().take_rows_from_outer();
+                let input = child.input_tiling(InputId::ONLY);
+                child.body_mut().take_rows_from_outer(input);
             }
         }
         let step = dispatcher.add_pipeline(body.clone());
@@ -1084,7 +1086,8 @@ impl Execution {
         dispatcher.order(pipeline);
         dispatcher.order(step);
         assert_eq!(step.0, self.handlers.len(), "each step has one handler");
-        scope.with_body(|body| body.attach(pipeline, base, step));
+        let hold = dispatcher.add_hold_group(body.iter().copied().chain([step]));
+        scope.with_body(|body| body.attach(pipeline, base, step, hold));
         // The body's entries are placed, and marked the scope's, for the whole run: a push from
         // outside the body that arrives before the scope's first request, as a live source's
         // first poll of the run does, wakes the scope and is read with its next round.
@@ -1094,7 +1097,7 @@ impl Execution {
             }
         });
         self.bodies
-            .push((base..base + members.len(), step, pipeline));
+            .push((base..base + members.len(), step, pipeline, hold));
         self.handlers[pipeline.0] = Handler::Request(Arc::new(scope));
         self.handlers.push(Handler::Step(pipeline));
         step
@@ -1159,22 +1162,17 @@ impl Execution {
         }
     }
 
-    /// Per pipeline, the inner pipelines and step of the scope whose body it is in: a worker that
-    /// consumes a package of the body holds them as followers again before it acknowledges it.
-    fn bodies_by_pipeline(&self) -> Vec<Option<Vec<PipelineId>>> {
+    /// Per pipeline, the follower hold of the scope whose body it is in: a worker that consumes a
+    /// package of the body holds it again before it acknowledges the package.
+    fn bodies_by_pipeline(&self) -> Vec<Option<HoldGroup>> {
         let mut bodies = vec![None; self.handlers.len()];
-        for (pipelines, step, _) in &self.bodies {
-            let group: Vec<PipelineId> = pipelines
-                .clone()
-                .map(PipelineId)
-                .chain(std::iter::once(*step))
-                .collect();
+        for (pipelines, _, _, hold) in &self.bodies {
             for pipeline in pipelines.clone() {
                 debug_assert!(
                     bodies[pipeline].is_none(),
                     "pipeline {pipeline} is in one scope's body"
                 );
-                bodies[pipeline] = Some(group.clone());
+                bodies[pipeline] = Some(*hold);
             }
         }
         bodies
@@ -1195,8 +1193,8 @@ impl Execution {
         let scope_of = |pipeline: usize| {
             self.bodies
                 .iter()
-                .find(|(body, step, _)| body.contains(&pipeline) || step.0 == pipeline)
-                .map(|(_, _, scope)| scope.0)
+                .find(|(body, step, _, _)| body.contains(&pipeline) || step.0 == pipeline)
+                .map(|(_, _, scope, _)| scope.0)
         };
         (0..self.handlers.len())
             .map(|pipeline| {
@@ -1282,10 +1280,9 @@ impl Execution {
     }
 
     fn hold_followers(&self, dispatcher: &Dispatcher) {
-        for (pipelines, step, request) in &self.bodies {
-            let body = pipelines.clone().map(PipelineId).chain([*step]);
-            self.request_scope(*request)
-                .hold_followers(dispatcher, *request, body);
+        for &(_, _, request, hold) in &self.bodies {
+            self.request_scope(request)
+                .hold_followers(dispatcher, request, hold);
         }
     }
 
@@ -1416,8 +1413,28 @@ impl Execution {
                 dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
             }
         }
-        workers.begin_drain(dispatcher, false);
-        loop {
+        match self.claim_until_quiescent(dispatcher, reach, workers, false) {
+            Claimed::Done | Claimed::Failed => {}
+            Claimed::Quiescent => {
+                panic!("an acyclic run with no pending loop has a pipeline that may finish")
+            }
+        }
+    }
+
+    /// Consume and finish what the dispatcher hands out, on the coordinator or through the
+    /// `workers`, until every pipeline has finished, the run has failed, or the run is
+    /// quiescent. A quiet pass has no claimable work, active handlers or pending publication, and
+    /// its generation still matches the claim. [`drive`](Self::drive) runs this once for a batch
+    /// and [`drive_live`] runs it between polls.
+    fn claim_until_quiescent(
+        &self,
+        dispatcher: &Dispatcher,
+        reach: &mut Reach<'_>,
+        workers: &WorkerPool,
+        live: bool,
+    ) -> Claimed {
+        workers.begin_drain(dispatcher, live);
+        let outcome = loop {
             let (next, (mut reserved, _activity)) = workers.next(dispatcher, None, &|_| true);
             let mut claim_reach = |id: PipelineId, call: &mut Call<'_>| {
                 if let Some(seed) = reserved.take() {
@@ -1443,15 +1460,26 @@ impl Execution {
                     dispatcher.wait(generation)
                 }
                 Next::Wait(generation) if workers.drained(dispatcher, &generation) => {
-                    panic!("an acyclic run with no pending loop has a pipeline that may finish")
+                    return Claimed::Quiescent;
                 }
                 Next::Wait(_) => {}
-                // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Done | Next::Failed => break,
+                Next::Done => break Claimed::Done,
+                Next::Failed => break Claimed::Failed,
             }
-        }
+        };
         workers.end_drain();
+        outcome
     }
+}
+
+/// How [`Execution::claim_until_quiescent`] ended.
+enum Claimed {
+    /// Every pipeline has finished.
+    Done,
+    /// The run failed.
+    Failed,
+    /// Nothing is claimable and nothing has changed since the last claim.
+    Quiescent,
 }
 
 /// Whether `pipeline` reads a loop's scope, directly or through the pipelines it reads.
@@ -2856,42 +2884,31 @@ impl Planner {
         let pipelines = self.members(Some(scope));
         let members = self.body_members(&pipelines, morsel_rows, runs);
         let store = self.scopes[scope].store.clone();
-        let kept: Vec<usize> = (0..members.len()).collect();
-        let (inner, planned, reads) = {
-            let reads = reads_of_kept(&pipelines.reads, &kept);
-            // A breaker in no pipeline keeps no entry: an id the planner gave it may be a kept
-            // pipeline's here, and a probe would take it for an arrival there.
-            for placement in pipelines.placements.iter().flatten() {
-                placement.set(None);
-            }
+        let (inner, planned) = {
+            // Each pipeline's entries name its local index while the body is planned, so a probe
+            // takes a push for an arrival at the pipeline it reaches. `ClearsPlacements` unplaces
+            // them once planning is done; execution places them again at their global ids.
             let placed = ClearsPlacements(&pipelines.placements);
-            for (at, &pipeline) in kept.iter().enumerate() {
-                for placement in &pipelines.placements[pipeline] {
-                    placement.set(Some(PipelineId(at)));
+            for (local, placements) in pipelines.placements.iter().enumerate() {
+                for placement in placements {
+                    placement.set(Some(PipelineId(local)));
                 }
             }
             let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-                loop_scope::reach_member(&members[kept[pipeline.0]], call)
+                loop_scope::reach_member(&members[pipeline.0], call)
             };
-            let names: Vec<String> = kept.iter().map(|&at| pipelines.names[at].clone()).collect();
-            let leaves: Vec<_> = kept
-                .iter()
-                .map(|&at| pipelines.leaves[at].clone())
-                .collect();
-            let kinds: Vec<Consumes> = kept.iter().map(|&at| pipelines.kinds[at]).collect();
             // A nested loop's drive records its source's complete pushes at the loop's pipeline,
             // which execution sets once the body is attached (`Execution::attach_store`). The
             // body's route walks pass that record, so it names the loop's pipeline here while they
             // run.
-            let nested: Vec<(usize, StoreCell)> = kept
+            let nested: Vec<&StoreCell> = members
                 .iter()
-                .enumerate()
-                .filter_map(|(at, &member)| match &members[member] {
-                    Member::Scope(scope) => Some((at, scope.clone())),
+                .filter_map(|member| match member {
+                    Member::Scope(scope) => Some(scope),
                     Member::Chain(_) => None,
                 })
                 .collect();
-            for (_, scope) in &nested {
+            for scope in &nested {
                 let mut scope = induction(scope);
                 debug_assert!(
                     !scope.decides_through_drive(),
@@ -2905,37 +2922,33 @@ impl Planner {
             // A store inside a scope is a nested loop's, whose scope is one pipeline, so no two
             // inner pipelines share a breaker's pushes.
             let (inner, planned, starts) = plan_edges(
-                &reads,
-                &names,
-                &leaves,
-                &vec![false; names.len()],
+                &pipelines.reads,
+                &pipelines.names,
+                &pipelines.leaves,
+                &vec![false; members.len()],
                 false,
-                &kinds,
-                &(0..names.len()).collect::<Vec<_>>(),
+                &pipelines.kinds,
+                &(0..members.len()).collect::<Vec<_>>(),
                 morsel_rows,
                 &mut reach,
-                &mut |pipeline| match &members[kept[pipeline.0]] {
+                &mut |pipeline| match &members[pipeline.0] {
                     Member::Scope(scope) => Some(induction(scope).pushing_end()),
                     Member::Chain(_) => None,
                 },
             );
             queue_starts(&inner, &starts);
-            for (_, scope) in &nested {
+            for scope in &nested {
                 induction(scope).forget_through_drive();
             }
             drop(placed);
-            (inner, planned, reads)
+            (inner, planned)
         };
+        let reads = &pipelines.reads;
         assert!(
             reads.iter().any(Vec::is_empty),
             "{} has a pipeline inside its cycle that reads none, the drive's",
             store.read().name()
         );
-        let mut members: Vec<Option<Member>> = members.into_iter().map(Some).collect();
-        let members: Vec<Member> = kept
-            .iter()
-            .map(|&at| members[at].take().expect("a pipeline is kept once"))
-            .collect();
         // Reporting preserves the scope hierarchy; execution later remaps every body graph.
         let mut planned = planned;
         for (plan, member) in planned.iter_mut().zip(&members) {
@@ -2947,10 +2960,7 @@ impl Planner {
             .filter(|&at| reads[at].is_empty() || !matches!(members[at], Member::Chain(_)))
             .map(PipelineId)
             .collect();
-        let placements = kept
-            .iter()
-            .map(|&at| pipelines.placements[at].clone())
-            .collect();
+        let placements = pipelines.placements.clone();
         let drive = driver_of(&members);
         debug_assert!(
             inner.is_source(drive),
@@ -3103,31 +3113,6 @@ fn consumes_at_once(breaker: &dyn Breaker) -> bool {
             .input_tiling(InputId::ONLY)
             .domain_extent()
             .is_some_and(|keys| crate::interpreter::tile_operators::keys_have_order(&keys))
-}
-
-/// The reads of the pipelines `kept` holds, numbered by their place in it: a read of a pipeline
-/// that is not kept is a read of the pipelines it reads.
-fn reads_of_kept(reads: &[Vec<usize>], kept: &[usize]) -> Vec<Vec<usize>> {
-    fn expand(reads: &[Vec<usize>], kept: &[usize], read: usize, into: &mut Vec<usize>) {
-        match kept.iter().position(|&pipeline| pipeline == read) {
-            Some(at) if !into.contains(&at) => into.push(at),
-            Some(_) => {}
-            None => {
-                for &beneath in &reads[read] {
-                    expand(reads, kept, beneath, into);
-                }
-            }
-        }
-    }
-    kept.iter()
-        .map(|&pipeline| {
-            let mut into = Vec::new();
-            for &read in &reads[pipeline] {
-                expand(reads, kept, read, &mut into);
-            }
-            into
-        })
-        .collect()
 }
 
 /// Whether the chain under `producer` reads the fan-out `fan` through a recurrence slot: whether
@@ -3597,50 +3582,13 @@ fn drive_live(
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, execution, reach);
         }
-        workers.begin_drain(dispatcher, true);
-        loop {
-            let (next, (mut reserved, _activity)) = workers.next(dispatcher, None, &|_| true);
-            let mut claim_reach = |id: PipelineId, call: &mut Call<'_>| {
-                if let Some(seed) = reserved.take() {
-                    seed.reach(call);
-                } else {
-                    reach(id, call);
-                }
-            };
-            match next {
-                Next::Package(package) if workers.admits(package.pipeline) => {
-                    workers.consume_on_coordinator(dispatcher, package, &mut claim_reach)
-                }
-                Next::Package(package) => execution.consume(dispatcher, &mut claim_reach, package),
-                Next::Finish { pipeline } if workers.admits(pipeline) => {
-                    workers.finish(dispatcher, pipeline, &mut claim_reach)
-                }
-                Next::Finish { pipeline } => {
-                    workers.finishing(pipeline, &mut claim_reach);
-                    execution.finish(dispatcher, &mut claim_reach, pipeline)
-                }
-                Next::Wait(_) if workers.help_active_claim(dispatcher) => {}
-                Next::Wait(generation) if workers.may_progress(dispatcher) => {
-                    dispatcher.wait(generation)
-                }
-                Next::Wait(generation) if workers.drained(dispatcher, &generation) => {
-                    assert!(
-                        live.iter().any(|at| !at.closed),
-                        "a run whose live pipelines have all closed has a pipeline that may finish"
-                    );
-                    break;
-                }
-                Next::Wait(_) => {}
-                Next::Done => {
-                    workers.end_drain();
-                    return true;
-                }
-                // A worker's panic failed the run; the pool resumes it once it joins.
-                Next::Failed => {
-                    workers.end_drain();
-                    return false;
-                }
-            }
+        match execution.claim_until_quiescent(dispatcher, reach, workers, true) {
+            Claimed::Done => return true,
+            Claimed::Failed => return false,
+            Claimed::Quiescent => assert!(
+                live.iter().any(|at| !at.closed),
+                "a run whose live pipelines have all closed has a pipeline that may finish"
+            ),
         }
         #[cfg(debug_assertions)]
         execution.assert_nothing_in_flight(dispatcher);
@@ -3948,11 +3896,11 @@ mod tests {
             guard: guard.clone(),
             queued_at: 0,
         };
-        let (member, step) = scope.with_body(|body| {
+        let (member, hold, step) = scope.with_body(|body| {
             let Member::Chain(member) = &body.members[0] else {
                 unreachable!()
             };
-            (member.clone(), body.attached().step)
+            (member.clone(), body.attached().hold, body.attached().step)
         });
         dispatcher.queue_for(peer, &guard);
         let (locked, ready) = mpsc::channel();
@@ -3970,7 +3918,7 @@ mod tests {
                 !steps.poll(&dispatcher),
                 "a busy check alone makes no progress"
             );
-            assert_ne!(dispatcher.followers_hold(step).0 & 1, 0);
+            assert_ne!(dispatcher.followers_hold(hold).0 & 1, 0);
             assert_eq!(dispatcher.outstanding(step), 0);
             let Next::Package(package) = dispatcher.try_claim(None) else {
                 panic!("claim the peer")
@@ -4001,10 +3949,9 @@ mod tests {
         );
         run.writers[0].body.set_waiting(Some(waiting.clone()), None);
         assert!(run.settle(1, queued_at, false));
-        let dispatcher = Dispatcher::new(vec![vec![]], 1);
-        assert!(!run.writers[0].body.has_offers(&dispatcher));
+        assert!(!run.writers[0].body.offers.lock().unwrap().has_work());
         assert!(!run.settle(1, queued_at, true));
-        assert!(run.writers[0].body.has_offers(&dispatcher));
+        assert!(run.writers[0].body.offers.lock().unwrap().has_work());
         assert_eq!(run.writers[0].body.take_waited(), Some(waiting));
         assert!(
             !run.settle(0, queued_at, false),
@@ -4022,7 +3969,8 @@ mod tests {
         let inner = (base..base + writer.body.members.len()).map(PipelineId);
         let step = dispatcher.add_pipeline(inner.clone().collect());
         dispatcher.take_arrivals(step);
-        writer.body.attach(scope, base, step);
+        let hold = dispatcher.add_hold_group(inner.chain([step]));
+        writer.body.attach(scope, base, step, hold);
         let mut phase = WriterPhase::Idle;
         assert_eq!(writer.take_finish(&mut phase, &dispatcher), None);
         writer.drain(&mut phase, &dispatcher);

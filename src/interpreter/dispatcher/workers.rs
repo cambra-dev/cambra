@@ -45,9 +45,9 @@ struct Spec {
     /// Whether its packages run beside each other ([`WorkerTarget::concurrent`]); otherwise they
     /// are consumed one at a time, in queue order.
     concurrent: bool,
-    /// For a pipeline of a loop's or transaction writer's body, the body's pipelines and step,
-    /// whose followers a claim holds again before it is acknowledged.
-    body: Option<Vec<PipelineId>>,
+    /// For a pipeline of a loop's or transaction writer's body, the body's follower hold, which a
+    /// claim holds again before it is acknowledged.
+    body: Option<HoldGroup>,
 }
 
 enum WorkerPipeline {
@@ -113,7 +113,7 @@ pub(super) struct WorkerPool {
     busy: AtomicUsize,
     #[cfg(test)]
     stats: Vec<Stats>,
-    /// The test counters the worker threads counted: a transaction store's stale decisions
+    /// The test counters the worker threads counted: a transaction driver's reissued attempts
     /// (`RETRIES`) and its stalled requests (`STALLS`). The coordinator adds them to its own
     /// ([`hand_over_counters`](Self::hand_over_counters)), so a test that runs a program reads
     /// every thread's counts on its own thread.
@@ -125,7 +125,7 @@ impl WorkerPool {
     pub(super) fn new(
         count: usize,
         targets: Vec<Option<WorkerTarget>>,
-        bodies: Vec<Option<Vec<PipelineId>>>,
+        bodies: Vec<Option<HoldGroup>>,
         actions: Vec<Option<ScopePipeline>>,
         scope_steps: ScopeSteps,
     ) -> Self {
@@ -534,7 +534,7 @@ impl WorkerPool {
         // Before the acknowledgement that can leave the body quiescent: the round's step waits
         // for a claimant to publish what this consume left held.
         if let Some(body) = &spec.body {
-            dispatcher.hold_followers(body.iter().copied(), true);
+            dispatcher.hold_followers(*body);
         }
         dispatcher.acknowledge(package);
         self.admit_readers(dispatcher, pipeline);

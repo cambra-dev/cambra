@@ -32,7 +32,7 @@ pub(crate) struct InductionRun {
 #[derive(Default)]
 pub(super) struct LoopSchedule {
     phase: LoopPhase,
-    request: Option<Request>,
+    round: Option<ActiveRound>,
     /// The position round a request ended with undecided: the next request runs it again first,
     /// since the drive has emitted its position already ([`complete_round`](InductionStoreProducer::complete_round)).
     rerun: Option<TileGuard>,
@@ -71,16 +71,16 @@ impl LoopSchedule {
         dispatcher: &Dispatcher,
         package: WorkPackage,
     ) {
-        {
+        let (request, outcome) = {
             let mut store = induction(store);
             #[cfg(test)]
             if let Some(probe) = &dispatcher.scope_step_probe {
                 probe(package.pipeline);
             }
-            store.complete_round(self);
-        }
+            store.complete_round(self)
+        };
         dispatcher.acknowledge(package);
-        let (done, work) = induction(store).queue_package_round(self, dispatcher);
+        let (done, work) = induction(store).queue_package_round(self, dispatcher, request, outcome);
         work.queue(dispatcher);
         induction(store).hold_followers(dispatcher);
         Self::complete(store, dispatcher, done);
@@ -97,12 +97,16 @@ impl LoopSchedule {
 
     /// Whether a request is open, whose claim is in flight until its last round steps.
     pub(super) fn has_request(&self) -> bool {
-        self.request.is_some()
+        self.round.is_some()
     }
 
     /// The guard of the open round's step package.
     pub(super) fn step_guard(&self) -> Option<&TileGuard> {
-        self.request.as_ref()?.round.as_ref()
+        let active = self.round.as_ref()?;
+        Some(match &active.kind {
+            Round::Position(guard) => guard,
+            Round::Closing => &active.request.covers,
+        })
     }
 
     /// Whether the body's held output is published and its follower hold settled: from the first
@@ -183,23 +187,56 @@ impl RoundWork {
 /// the rest here.
 #[derive(Default)]
 pub struct Offered {
-    /// The region of the scope's input offered and not queued yet.
-    pub region: Option<TileGuard>,
-    /// Whether the scope's pipeline closes once everything offered is queued.
-    pub closing: bool,
-    /// Whether the scope's pipeline has closed: a later ask to close it again asks nothing.
-    pub closed: bool,
-    /// Whether the scope's pipeline closes once every pipeline it reads has finished, which an
-    /// admission checks ([`Body::intake`](loop_scope::Body)) and turns into `closing`.
-    after_reads: bool,
+    intake: ScopeInput,
+    close: IntakeClose,
     /// Per inner pipeline, what pushes from outside the body brought it since the last round or
     /// attempt began ([`Entry::wake`]): the next round or attempt queues it there, so the pipeline
     /// reads what grew.
     pub grown: Vec<(PipelineId, TileGuard)>,
-    /// Positions the next request must revisit. Fresh input remains in `region`.
+    /// Positions the next request must revisit. Fresh input stays in the intake.
     retry: Option<Retry>,
     /// A wake that the next decision to park must observe.
     woken: bool,
+}
+
+/// Ordinary requests consume each offered region. A parent-fed loop retains delivery evidence
+/// because the parent can give it the same row again in a closing round.
+enum ScopeInput {
+    Ordinary(Option<TileGuard>),
+    Parent(Box<ParentRows>),
+}
+
+impl Default for ScopeInput {
+    fn default() -> Self {
+        Self::Ordinary(None)
+    }
+}
+
+struct ParentRows {
+    input: Tiling,
+    held: Option<TileGuard>,
+    delivered: Option<TileGuard>,
+}
+
+impl ParentRows {
+    /// The held rows the drive's source has delivered, and the rest: a row is ready where the
+    /// source delivered it, and where what is left of it, closed over the scope's input, names no
+    /// position, as a closing round gives a row's remainder past the positions its domain has.
+    /// `None` where no row is held or the source has delivered nothing.
+    fn ready(&self) -> Option<(TileGuard, TileGuard)> {
+        let held = self.held.as_ref()?;
+        let rest = guard_minus(held, self.delivered.as_ref()?).closed_over(&self.input);
+        Some((guard_minus(held, &rest), rest))
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum IntakeClose {
+    #[default]
+    Open,
+    AfterReads,
+    Requested,
+    Closed,
 }
 
 struct Retry {
@@ -218,6 +255,26 @@ enum RetryPhase {
 }
 
 impl Offered {
+    pub(super) fn has_work(&self) -> bool {
+        matches!(self.intake, ScopeInput::Ordinary(Some(_)))
+            || self
+                .retry
+                .as_ref()
+                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
+            || self.close == IntakeClose::Requested
+    }
+
+    pub(super) fn offer(&mut self, guard: TileGuard) {
+        let region = match &mut self.intake {
+            ScopeInput::Ordinary(pending) => pending,
+            ScopeInput::Parent(rows) => &mut rows.delivered,
+        };
+        *region = Some(match region.take() {
+            Some(before) => before.union(&guard),
+            None => guard,
+        });
+    }
+
     pub(super) fn wake(&mut self) {
         if let Some(retry) = &mut self.retry
             && retry.phase == RetryPhase::Parked
@@ -245,8 +302,7 @@ pub type Offers = Arc<Mutex<Offered>>;
 /// own, which execution appends to the run's shared dispatcher between the scope's own pipeline
 /// and its step (`Execution::attach_body` in `plan.rs`).
 pub(super) struct Body {
-    /// The planned graph, until execution appends it.
-    graph: Option<Dispatcher>,
+    layout: BodyLayout,
     pub(super) members: Vec<Member>,
     /// Each inner pipeline's entries, by local id. While the body runs, every entry is placed at
     /// its pipeline's global id except a source's, which stays unplaced so the source's pushes
@@ -258,31 +314,30 @@ pub(super) struct Body {
     /// The one inner pipeline whose breaker answers `TileProducer::next_position`: a loop's drive,
     /// a writer's transaction driver.
     pub(super) driver: PipelineId,
-    /// Where the body sits in the run's shared dispatcher, once appended.
-    attached: Option<Attached>,
-    /// Whether the inner pipelines' entries are placed at their global ids and the pipelines
-    /// run, which they do from the first request on. Only an attached body activates.
-    active: bool,
     /// What the scope's input offered and the scope has not queued yet: the pushes of the drive's
     /// source, its live arrivals and its start ([`queue_offered`](Self::queue_offered)).
-    offers: Offers,
-    /// Whether the scope is a nested loop's, whose rows the loop around it gives it: what its
-    /// drive's source offers then releases those rows ([`hold_row`](Self::hold_row)) rather than
-    /// being queued itself.
-    rows_from_outer: bool,
-    /// The rows the loop around a nested loop gave it, waiting for its drive's source to deliver
-    /// them.
-    held: Option<TileGuard>,
+    pub(super) offers: Offers,
+}
+
+enum BodyLayout {
+    Planned(Box<Dispatcher>),
+    /// The dispatcher has taken the local graph and is attaching its nested scopes and step.
+    Attaching,
+    Attached(Attached),
 }
 
 /// Where a body sits in the run's shared dispatcher.
 pub(super) struct Attached {
+    /// The entries are placed at their global pipeline IDs.
+    active: bool,
     /// The scope's own pipeline in the dispatcher around it, whose claims are its requests.
     pub(super) pipeline: PipelineId,
     /// The global id of the first inner pipeline; the others follow it in local order.
     base: usize,
     /// The pipeline that follows every inner one, whose claim ends a round or an attempt.
     pub(super) step: PipelineId,
+    /// The follower hold of the inner pipelines and the step.
+    pub(super) hold: HoldGroup,
 }
 
 impl Body {
@@ -294,35 +349,43 @@ impl Body {
         driver: PipelineId,
     ) -> Self {
         Self {
-            graph: Some(graph),
+            layout: BodyLayout::Planned(Box::new(graph)),
             members,
             placements,
             planned,
             driver,
-            attached: None,
-            active: false,
             offers: Offers::default(),
-            rows_from_outer: false,
-            held: None,
         }
     }
 
     /// The planned graph, for execution to append to the run's dispatcher.
     pub(super) fn take_graph(&mut self) -> Dispatcher {
-        self.graph.take().expect("a body's graph is appended once")
+        let BodyLayout::Planned(graph) = std::mem::replace(&mut self.layout, BodyLayout::Attaching)
+        else {
+            panic!("a body's graph is appended once")
+        };
+        *graph
     }
 
     /// Record where execution appended the graph: after the scope's pipeline `pipeline`, from
     /// global id `base`, with the step `step`.
-    pub(super) fn attach(&mut self, pipeline: PipelineId, base: usize, step: PipelineId) {
+    pub(super) fn attach(
+        &mut self,
+        pipeline: PipelineId,
+        base: usize,
+        step: PipelineId,
+        hold: HoldGroup,
+    ) {
         debug_assert!(
-            self.graph.is_none() && self.attached.is_none(),
+            matches!(self.layout, BodyLayout::Attaching),
             "a body's graph is taken, then attached, once"
         );
-        self.attached = Some(Attached {
+        self.layout = BodyLayout::Attached(Attached {
+            active: false,
             pipeline,
             base,
             step,
+            hold,
         });
     }
 
@@ -332,24 +395,29 @@ impl Body {
     ///
     /// Before [`attach`](Self::attach): a body is reached through the handlers attaching installs.
     pub(super) fn attached(&self) -> &Attached {
-        self.attached
-            .as_ref()
+        self.attachment()
             .expect("a body is reached once it is attached")
     }
 
-    pub(super) fn is_active(&self) -> bool {
-        self.active
+    fn attachment(&self) -> Option<&Attached> {
+        match &self.layout {
+            BodyLayout::Attached(attached) => Some(attached),
+            _ => None,
+        }
     }
 
-    /// The global id of the inner pipeline `local`; its local id before the body is attached,
-    /// while planning probes the body graph alone.
+    pub(super) fn is_active(&self) -> bool {
+        self.attachment().is_some_and(|attached| attached.active)
+    }
+
+    /// The global id of an attached body's inner pipeline.
     pub(super) fn global(&self, local: PipelineId) -> PipelineId {
-        PipelineId(self.attached.as_ref().map_or(0, |attached| attached.base) + local.0)
+        PipelineId(self.attached().base + local.0)
     }
 
     /// The global ids of the inner pipelines, none before the body is attached.
     pub(super) fn pipelines(&self) -> Vec<PipelineId> {
-        match &self.attached {
+        match self.attachment() {
             Some(attached) => (attached.base..attached.base + self.members.len())
                 .map(PipelineId)
                 .collect(),
@@ -357,19 +425,16 @@ impl Body {
         }
     }
 
-    /// The inner pipelines and the step.
-    fn with_step(&self) -> impl Iterator<Item = PipelineId> + use<> {
-        let step = self.attached().step;
-        self.pipelines().into_iter().chain(std::iter::once(step))
-    }
-
     /// Place each inner pipeline's entries at its global id, except a source's. Whether this call
     /// activated the body: it does so once.
     pub(super) fn activate(&mut self, dispatcher: &Dispatcher) -> bool {
-        if self.active {
+        let BodyLayout::Attached(attached) = &mut self.layout else {
+            panic!("only an attached body activates")
+        };
+        if attached.active {
             return false;
         }
-        self.active = true;
+        attached.active = true;
         for (local, placements) in self.placements.iter().enumerate() {
             let pipeline = self.global(PipelineId(local));
             for placement in placements {
@@ -382,10 +447,10 @@ impl Body {
 
     /// Hold back the pipelines that follow the inner pipelines and the step, once the body runs.
     pub(super) fn hold_followers(&self, dispatcher: &Dispatcher) {
-        if !self.active {
+        if !self.is_active() {
             return;
         }
-        dispatcher.hold_followers(self.with_step(), true);
+        dispatcher.hold_followers(self.attached().hold);
     }
 
     /// A step reads the active round's guard. Its outstanding dispatcher claim prevents
@@ -394,7 +459,7 @@ impl Body {
         let step = self.attached().step;
         if dispatcher.outstanding(step) != 0
             || !dispatcher.quiescent(self.pipelines().into_iter().map(|id| id.0))
-            || dispatcher.followers_hold(self.attached().step).0 & 1 == 1
+            || dispatcher.followers_hold(self.attached().hold).0 & 1 == 1
             || self.children_have_work(dispatcher)
         {
             return false;
@@ -415,7 +480,7 @@ impl Body {
     /// The scope pipeline once its step has finished. The step reads every inner pipeline and
     /// takes arrivals its scope closes at the finish, so it finishes after all of them.
     pub(super) fn finished_pipeline(&self, dispatcher: &Dispatcher) -> Option<PipelineId> {
-        let attached = self.attached.as_ref()?;
+        let attached = self.attachment()?;
         (dispatcher.states[attached.step.0].phase.load() == Phase::Finished)
             .then_some(attached.pipeline)
     }
@@ -439,10 +504,7 @@ impl Body {
     /// Add `guard`, a region of the scope's input, to what is offered and not queued yet.
     pub(super) fn offer(&self, guard: &TileGuard) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.region = Some(match offered.region.take() {
-            Some(before) => before.union(guard),
-            None => guard.clone(),
-        });
+        offered.offer(guard.clone());
     }
 
     /// Whether a nested loop among the inner pipelines has work the round waits for: a request
@@ -472,57 +534,49 @@ impl Body {
     }
 
     fn has_ready_row_or_retry(&self) -> bool {
-        self.ready_rows()
-            .is_some_and(|(ready, _)| !ready.is_empty())
-            || self
-                .offers
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+        let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ready_row = match &offered.intake {
+            ScopeInput::Parent(rows) => rows.ready().is_some_and(|(ready, _)| !ready.is_empty()),
+            ScopeInput::Ordinary(_) => false,
+        };
+        ready_row
+            || offered
                 .retry
                 .as_ref()
                 .is_some_and(|retry| retry.phase == RetryPhase::Ready)
     }
 
-    /// For a nested loop, the rows it holds that its drive's source has delivered, and the rest:
-    /// a row is ready where the source delivered it, and where what is left of it, closed over the
-    /// scope's input, names no position, as a closing round gives a row's remainder past the
-    /// positions its domain has. `None` where it holds no row or its source has offered nothing.
-    fn ready_rows(&self) -> Option<(TileGuard, TileGuard)> {
-        let input = self.driver_target().and_then(|target| {
-            let target = target.read().unwrap_or_else(PoisonError::into_inner);
-            target.as_ref().map(|(_, input)| input.clone())
-        });
-        let held = self.held.as_ref()?;
-        let offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        let delivered = offered.region.as_ref()?;
-        let rest = guard_minus(held, delivered);
-        let rest = match input {
-            Some(input) => rest.closed_over(&input),
-            None => rest,
-        };
-        Some((guard_minus(held, &rest), rest))
-    }
-
-    /// Take the rows the loop around this nested loop gives it: they are queued once the drive's
-    /// source has offered each whole ([`queue_offered`](Self::queue_offered)).
+    /// Keep a parent row until the drive's source has delivered it.
     pub(super) fn hold_row(&mut self, guard: &TileGuard) {
-        self.rows_from_outer = true;
-        self.held = Some(match self.held.take() {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ScopeInput::Parent(rows) = &mut offered.intake else {
+            unreachable!("only a nested scope accepts a parent row")
+        };
+        rows.held = Some(match rows.held.take() {
             Some(before) => before.union(guard),
             None => guard.clone(),
         });
     }
 
-    /// Mark this scope a nested loop's, whose rows come from the loop around it.
-    pub(super) fn take_rows_from_outer(&mut self) {
-        self.rows_from_outer = true;
+    pub(super) fn take_rows_from_outer(&mut self, input: Tiling) {
+        let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let ScopeInput::Ordinary(delivered) = &mut offered.intake else {
+            unreachable!("a nested scope is attached once")
+        };
+        offered.intake = ScopeInput::Parent(Box::new(ParentRows {
+            input,
+            held: None,
+            delivered: delivered.take(),
+        }));
     }
 
     /// Close the scope's pipeline once every pipeline it reads has finished and everything
     /// offered to it is queued.
     pub(super) fn close_after_reads(&self) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.after_reads |= !offered.closed;
+        if offered.close == IntakeClose::Open {
+            offered.close = IntakeClose::AfterReads;
+        }
     }
 
     /// The scope's intake, with a close after reads turned into a close once every read has
@@ -530,9 +584,10 @@ impl Body {
     /// admission that misses the last count finds it on any later admission.
     fn intake(&self, dispatcher: &Dispatcher) -> std::sync::MutexGuard<'_, Offered> {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        if offered.after_reads && dispatcher.only_arrivals_remain(self.attached().pipeline) {
-            offered.after_reads = false;
-            offered.closing |= !offered.closed;
+        if offered.close == IntakeClose::AfterReads
+            && dispatcher.only_arrivals_remain(self.attached().pipeline)
+        {
+            offered.close = IntakeClose::Requested;
         }
         offered
     }
@@ -540,48 +595,46 @@ impl Body {
     /// Close the scope's pipeline once everything offered to it is queued.
     pub(super) fn close_offers(&self) {
         let mut offered = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
-        offered.closing |= !offered.closed;
+        if matches!(offered.close, IntakeClose::Open | IntakeClose::AfterReads) {
+            offered.close = IntakeClose::Requested;
+        }
     }
 
     /// Queue what was offered on the scope's pipeline, and close the pipeline once asked, where
     /// `ready` says a request can run: a writer's attempt reads its store, which must be open.
     /// Whether it queued or closed anything.
     pub(super) fn queue_offered(&mut self, dispatcher: &Dispatcher, ready: bool) -> bool {
-        let Some(pipeline) = self.attached.as_ref().map(|attached| attached.pipeline) else {
+        let Some(pipeline) = self.attachment().map(|attached| attached.pipeline) else {
             return false;
         };
-        // A nested loop queues each row given to it once its drive's source has delivered it.
-        if self.rows_from_outer {
-            let Some((ready_rows, rest)) = self.ready_rows() else {
-                return false;
-            };
-            if ready_rows.is_empty() {
-                return false;
-            }
-            // What the drive's source delivered stays delivered: a closing round gives the row
-            // again, which reads it again.
-            self.held = (!rest.is_empty()).then_some(rest);
-            dispatcher.queue_for(pipeline, &ready_rows);
-            return true;
-        }
         // An offer comes from a push that also queues packages to the pipelines the drive pulls
         // its source through, which a worker may still be consuming: a request begun before
         // they have consumed them finds no position and closes over positions the drive will
         // emit. So the offer waits until every pipeline the scope's pipeline reads is quiescent.
-        if !dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied()) {
-            return false;
-        }
+        let reads_ready = dispatcher.quiescent(dispatcher.infos[pipeline.0].reads.iter().copied());
         let mut offered = self.intake(dispatcher);
+        // A parent-fed loop queues the rows its drive's source has delivered, and a ready retry
+        // with them or alone. Its intake never closes the pipeline.
+        let mut region = match &mut offered.intake {
+            ScopeInput::Parent(rows) => rows.ready().and_then(|(ready, rest)| {
+                if ready.is_empty() {
+                    return None;
+                }
+                rows.held = (!rest.is_empty()).then_some(rest);
+                Some(ready)
+            }),
+            ScopeInput::Ordinary(pending) if ready && reads_ready => pending.take(),
+            ScopeInput::Ordinary(_) => return false,
+        };
         // The pipeline stays open while a request is queued or running, which may leave positions
         // waiting for inputs, and while any wait: what an input brings queues the request that
         // runs them.
-        if !ready {
-            return false;
-        }
         let idle = dispatcher.outstanding(pipeline) == 0;
-        let closing =
-            offered.closing && idle && offered.region.is_none() && offered.retry.is_none();
-        let mut region = offered.region.take();
+        let closing = matches!(offered.intake, ScopeInput::Ordinary(_))
+            && offered.close == IntakeClose::Requested
+            && idle
+            && region.is_none()
+            && offered.retry.is_none();
         // An ordinary request already queued on this ordered pipeline takes the retry when it
         // begins. Enqueueing a separate package behind it would revisit the same positions twice.
         if idle && let Some(retry) = offered.ready_retry() {
@@ -594,8 +647,9 @@ impl Body {
         if region.is_none() && !closing {
             return false;
         }
-        offered.closing &= !closing;
-        offered.closed |= closing;
+        if closing {
+            offered.close = IntakeClose::Closed;
+        }
         drop(offered);
         if let Some(region) = region {
             dispatcher.queue_for(pipeline, &region);
@@ -608,13 +662,7 @@ impl Body {
 
     /// Whether anything offered is not queued yet.
     pub(super) fn has_offers(&self, dispatcher: &Dispatcher) -> bool {
-        let offered = self.intake(dispatcher);
-        offered.region.is_some()
-            || offered
-                .retry
-                .as_ref()
-                .is_some_and(|retry| retry.phase == RetryPhase::Ready)
-            || offered.closing
+        self.intake(dispatcher).has_work()
     }
 
     /// Clear every inner pipeline's entries.
@@ -623,7 +671,9 @@ impl Body {
             placement.set(None);
             placement.set_scope(None);
         }
-        self.active = false;
+        if let BodyLayout::Attached(attached) = &mut self.layout {
+            attached.active = false;
+        }
     }
 
     /// Queue with `work` what pushes from outside the body brought its pipelines since the last
@@ -694,21 +744,35 @@ impl Drop for Body {
     }
 }
 
-struct Request {
+pub(super) struct Request {
+    /// Whether the request has read the drive's source for newly delivered positions.
     read: bool,
+    /// Whether the request has run a position round.
     emitted: bool,
-    closing: bool,
-    /// The last round's position is one the store could not decide: what the body read there is
-    /// not final yet. The request ends with that position unreleased, and a push from a pipeline
-    /// the scope reads brings the next request, which runs it again.
-    undecided: bool,
     /// The positions the request runs: its package's, and those an earlier request left waiting
     /// for inputs.
     covers: TileGuard,
-    /// Whether positions waited at the start of this request.
+    /// Whether positions waited for inputs when the request began ([`Body::take_waited`]).
     waited: bool,
-    round: Option<TileGuard>,
     package: WorkPackage,
+}
+
+/// A round whose body is running or whose step is queued.
+struct ActiveRound {
+    request: Request,
+    kind: Round,
+}
+
+enum Round {
+    Position(TileGuard),
+    Closing,
+}
+
+/// What to do with a request after acknowledging its step package.
+pub(super) enum RoundOutcome {
+    Select,
+    Park,
+    End,
 }
 
 impl InductionRun {
@@ -775,8 +839,8 @@ impl InductionStoreProducer {
         package: WorkPackage,
     ) -> (Option<WorkPackage>, RoundWork) {
         self.activate(dispatcher);
-        self.begin_package(schedule, package);
-        self.queue_package_round(schedule, dispatcher)
+        let request = self.begin_package(schedule, package);
+        self.queue_package_round(schedule, dispatcher, request, RoundOutcome::Select)
     }
 
     /// Begin the loop's finish: close the body's sources and the step's arrivals, so the step
@@ -995,7 +1059,7 @@ impl InductionStoreProducer {
             .collect()
     }
 
-    fn begin_package(&mut self, schedule: &mut LoopSchedule, package: WorkPackage) {
+    fn begin_package(&mut self, schedule: &mut LoopSchedule, package: WorkPackage) -> Request {
         assert!(
             !schedule.has_request()
                 && matches!(schedule.phase, LoopPhase::New | LoopPhase::Running),
@@ -1023,16 +1087,13 @@ impl InductionStoreProducer {
         if let Some(waited) = &waited {
             self.placed(|scope| scope.step_round(waited));
         }
-        schedule.request = Some(Request {
+        Request {
             read: rows,
             emitted: false,
-            closing: false,
-            undecided: false,
             covers,
             waited: waited.is_some(),
-            round: None,
             package,
-        });
+        }
     }
 
     /// Keep `waiting`, the positions a request leaves undecided, waiting for inputs: a push that
@@ -1070,25 +1131,22 @@ impl InductionStoreProducer {
         &mut self,
         schedule: &mut LoopSchedule,
         dispatcher: &Dispatcher,
+        mut request: Request,
+        outcome: RoundOutcome,
     ) -> (Option<WorkPackage>, RoundWork) {
+        match outcome {
+            RoundOutcome::Select => {}
+            RoundOutcome::Park => {
+                let waiting = guard_minus(&request.covers, &self.input_released(InputId::ONLY));
+                self.wait_for_inputs(waiting);
+                return (Some(request.package), RoundWork::default());
+            }
+            RoundOutcome::End => {
+                self.keep_undecided(&request.covers, request.waited);
+                return (Some(request.package), RoundWork::default());
+            }
+        }
         let rows = !matches!(self.tiling(), Tiling::Store { .. });
-        let mut request = schedule
-            .request
-            .take()
-            .expect("a loop has a pending request");
-        assert!(
-            request.round.is_none(),
-            "the body and store step complete before the next round"
-        );
-        if request.undecided {
-            let waiting = guard_minus(&request.covers, &self.input_released(InputId::ONLY));
-            self.wait_for_inputs(waiting);
-            return (Some(request.package), RoundWork::default());
-        }
-        if request.closing {
-            self.keep_undecided(&request.covers, request.waited);
-            return (Some(request.package), RoundWork::default());
-        }
         // A round an earlier request left undecided runs again first: what it read has grown.
         if let Some(guard) = schedule.rerun.take()
             && !guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty()
@@ -1097,8 +1155,10 @@ impl InductionStoreProducer {
             let mut work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
             self.run().body.queue_grown(&mut work);
             request.emitted = true;
-            request.round = Some(guard);
-            schedule.request = Some(request);
+            schedule.round = Some(ActiveRound {
+                request,
+                kind: Round::Position(guard),
+            });
             return (None, work);
         }
         loop {
@@ -1111,8 +1171,10 @@ impl InductionStoreProducer {
                 let mut work = self.placed(|store| store.round_on(dispatcher, &guard, &starts));
                 self.run().body.queue_grown(&mut work);
                 request.emitted = true;
-                request.round = Some(guard);
-                schedule.request = Some(request);
+                schedule.round = Some(ActiveRound {
+                    request,
+                    kind: Round::Position(guard),
+                });
                 return (None, work);
             }
             // A flat scope reads newly delivered source positions at most once per request,
@@ -1148,30 +1210,39 @@ impl InductionStoreProducer {
         // readers, a nested loop's among them, and a reader that has not read what grew would
         // offer the nested loop none of the positions it brings.
         self.run().body.queue_grown(&mut work);
-        request.closing = true;
-        request.round = Some(request.covers.clone());
-        schedule.request = Some(request);
+        schedule.round = Some(ActiveRound {
+            request,
+            kind: Round::Closing,
+        });
         (None, work)
     }
 
     /// Step the queued round after its body and held pushes settle.
-    pub(super) fn complete_round(&mut self, schedule: &mut LoopSchedule) {
-        let (guard, closing) = schedule
-            .request
-            .as_mut()
-            .and_then(|request| Some((request.round.take()?, request.closing)))
+    pub(super) fn complete_round(
+        &mut self,
+        schedule: &mut LoopSchedule,
+    ) -> (Request, RoundOutcome) {
+        let ActiveRound { request, kind } = schedule
+            .round
+            .take()
             .expect("a loop steps one queued round");
-        self.placed(|scope| scope.step_round(&guard));
-        // A position round the store did not decide stays unreleased: running it again before
-        // what the body read changes would decide nothing again.
-        if !closing && !guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty() {
-            schedule
-                .request
-                .as_mut()
-                .expect("a loop steps one queued round")
-                .undecided = true;
-            schedule.rerun = Some(guard);
-        }
+        let outcome = match kind {
+            Round::Position(guard) => {
+                self.placed(|scope| scope.step_round(&guard));
+                if guard_minus(&guard, &self.input_released(InputId::ONLY)).is_empty() {
+                    RoundOutcome::Select
+                } else {
+                    // Retry the exact position when a later request wakes its wider coverage.
+                    schedule.rerun = Some(guard);
+                    RoundOutcome::Park
+                }
+            }
+            Round::Closing => {
+                self.placed(|scope| scope.step_round(&request.covers));
+                RoundOutcome::End
+            }
+        };
+        (request, outcome)
     }
 
     /// The body's work for one position or closing row, before the store steps it.
@@ -1295,11 +1366,81 @@ mod tests {
     use crate::interpreter::{Position, Tile};
 
     #[test]
-    fn a_wake_before_parking_and_one_after_admission_queue_one_retry() {
+    fn a_closing_round_can_take_a_delivered_parent_row_again() {
         let compiled = Compiled::of(SUM);
         let mut scope = induction(&compiled.scope);
-        let (entry, placement) = Entry::unplaced(scope.input_tiling(InputId::ONLY));
+        let input = scope.input_tiling(InputId::ONLY);
         let body = scope.body_mut();
+        let row = keys_between(0, 0);
+        body.offer(&row);
+        body.take_rows_from_outer(input);
+        assert!(!body.queue_offered(&compiled.dispatcher, true));
+        for _ in 0..2 {
+            body.hold_row(&row);
+            assert!(body.queue_offered(&compiled.dispatcher, true));
+            assert!(!body.queue_offered(&compiled.dispatcher, true));
+            let request = compiled.dispatcher.claim_of(PipelineId(0)).unwrap();
+            assert_eq!(request.guard, row);
+            compiled.dispatcher.acknowledge(request);
+        }
+    }
+
+    #[test]
+    fn a_parent_between_requests_releases_its_hold_for_a_woken_child() {
+        let compiled = Compiled::of(indoc! {"
+            out = test_sink()
+            total := 0
+            for x in [1, 2, 3]:
+                for y in [1, 2]:
+                    total += x * y
+            out << total
+        "});
+        compiled.consume(keys_between(0, 0));
+        let dispatcher = &compiled.dispatcher;
+        let (hold, child) = {
+            let mut parent = induction(&compiled.scope);
+            let body = parent.body_mut();
+            let child = body
+                .members
+                .iter()
+                .find_map(|member| match member {
+                    Member::Scope(child) => Some(child.clone()),
+                    Member::Chain(_) => None,
+                })
+                .unwrap();
+            (body.attached().hold, child)
+        };
+        let child_request = {
+            let mut child = induction(&child);
+            let body = child.body_mut();
+            body.set_waiting(Some(keys_between(0, 0)), None);
+            body.offers.lock().unwrap().wake();
+            body.attached().pipeline
+        };
+        dispatcher.hold_followers(hold);
+        for _ in 0..dispatcher.infos.len() {
+            compiled.steps.poll(dispatcher);
+            if let Some(package) = dispatcher.claim_of(child_request) {
+                assert_eq!(dispatcher.outstanding(PipelineId(0)), 0);
+                dispatcher.acknowledge(package);
+                return;
+            }
+        }
+        panic!("a ready child retry runs before the parent's next request");
+    }
+
+    #[rstest_log::rstest]
+    #[case::ordinary(false)]
+    #[case::parent_row(true)]
+    fn a_wake_before_parking_and_one_after_admission_queue_one_retry(#[case] parent_row: bool) {
+        let compiled = Compiled::of(SUM);
+        let mut scope = induction(&compiled.scope);
+        let input = scope.input_tiling(InputId::ONLY);
+        let (entry, placement) = Entry::unplaced(input.clone());
+        let body = scope.body_mut();
+        if parent_row {
+            body.take_rows_from_outer(input);
+        }
         placement.set_scope(Some(body.offers.clone()));
         let waiting = keys_between(0, 0);
         entry.wake(&Projection::Everything);
@@ -1360,9 +1501,7 @@ mod tests {
             .claim_of(PipelineId(0))
             .expect("ordinary request");
         assert_eq!(request.guard, fresh);
-        let mut schedule = LoopSchedule::default();
-        scope.begin_package(&mut schedule, request);
-        let active = schedule.request.as_ref().unwrap();
+        let active = scope.begin_package(&mut LoopSchedule::default(), request);
         assert!(active.waited);
         assert_eq!(active.covers, fresh.union(&waiting));
         assert_eq!(compiled.dispatcher.outstanding(PipelineId(0)), 1);
@@ -1597,12 +1736,7 @@ mod tests {
         struct OfferRows(Offers);
         impl Consumer for OfferRows {
             fn notify(&self, _: &Projection, _: &mut Landing<'_>) {
-                let mut offered = self.0.lock().unwrap();
-                let rows = keys_between(0, 2);
-                offered.region = Some(match offered.region.take() {
-                    Some(before) => before.union(&rows),
-                    None => rows,
-                });
+                self.0.lock().unwrap().offer(keys_between(0, 2));
             }
         }
         let request = PipelineId(0);
@@ -1794,8 +1928,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the body and store step complete before the next round")]
-    fn a_request_cannot_queue_the_next_round_before_stepping() {
+    #[should_panic(expected = "a loop completes one request before starting another")]
+    fn a_loop_cannot_begin_another_request_before_stepping() {
         let compiled = Compiled::of(SUM);
         let whole = induction(&compiled.scope)
             .input_tiling(InputId::ONLY)
@@ -1805,8 +1939,33 @@ mod tests {
         let Scope::Loop { schedule, .. } = compiled.execution.request_scope(PipelineId(0)) else {
             unreachable!("the test's scope is a loop")
         };
-        let _ = induction(&compiled.scope)
-            .queue_package_round(&mut schedule.lock().unwrap(), &compiled.dispatcher);
+        let _ = induction(&compiled.scope).begin_package(
+            &mut schedule.lock().unwrap(),
+            WorkPackage {
+                pipeline: PipelineId(0),
+                guard: whole,
+                index: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn a_settled_loop_queues_one_step_until_the_coordinator_runs_it() {
+        let compiled = Compiled::of(SUM);
+        let whole = induction(&compiled.scope)
+            .input_tiling(InputId::ONLY)
+            .universal_guard();
+        compiled.dispatcher.notify(PipelineId(0), &whole);
+        let step = induction(&compiled.scope).body_mut().attached().step;
+        for _ in 0..32 {
+            if compiled.dispatcher.outstanding(step) != 0 {
+                break;
+            }
+            compiled.tick();
+        }
+        assert_eq!(compiled.dispatcher.outstanding(step), 1);
+        assert!(!compiled.steps.poll(&compiled.dispatcher));
+        assert_eq!(compiled.dispatcher.outstanding(step), 1);
     }
 
     /// A guarded loop's `Memo`s are inner pipelines, which each round queues the position for and
