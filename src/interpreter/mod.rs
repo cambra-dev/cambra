@@ -30,6 +30,7 @@ pub mod value_probe;
 pub use binop::*;
 pub use http_server::HttpServerDataSource;
 pub use notifications::*;
+pub use producer_releases::SourceReaderRetirement;
 pub use scalar_expr::ScalarProgram;
 pub use stdio::*;
 pub use subscribe_context::*;
@@ -41,8 +42,7 @@ pub use types::*;
 pub use unary_op::*;
 
 use smol_str::{SmolStr, format_smolstr};
-use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::sync::{Arc, Weak};
 
 // ============================================================================
 // Consumer Protocol
@@ -57,7 +57,7 @@ use std::rc::{Rc, Weak};
 /// that takes them. What `notify` does only for a delivery ([`dispatcher::Landing::is_delivery`])
 /// is not walked. A delivery that reaches a reader the walk of its pipeline did not reach fails
 /// the run (`src/interpreter/design-dispatcher.md`, "Running a compiled program").
-pub trait Consumer {
+pub trait Consumer: Send + Sync {
     /// The transaction store key whose closure completes this direct subscription of the store,
     /// if any.
     fn completion_key(&self) -> Option<&Value> {
@@ -65,45 +65,46 @@ pub trait Consumer {
     }
 
     /// Record an announced region and deliver it toward its dispatcher entries.
-    fn notify(&mut self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
+    ///
+    /// It takes `&self`, so delivery takes no lock on the consumer: state it records sits behind
+    /// its own lock or atomic, released before it notifies another consumer.
+    fn notify(&self, _region: &Projection, _landing: &mut dispatcher::Landing<'_>) {}
 }
 
-/// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
-// shared-state-ok: this is what makes a shared *notification* handle a consumer;
-// a wakeup carries no value, so it is not a dataflow edge.
-impl<C: Consumer + ?Sized> Consumer for Rc<RefCell<C>> {
-    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
-        self.borrow_mut().notify(region, landing)
+/// A shared consumer is one. Each notification passes the re-entry check ([`notify_shared`]).
+impl<C: Consumer + ?Sized> Consumer for Arc<C> {
+    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+        notify_shared(self, region, landing)
     }
 }
 
 /// A weak handle notifies its consumer while some owner keeps the consumer alive, and does
 /// nothing once it is gone: a subscription that does not keep its subscriber alive
 /// (`src/ccl/design/program-evolution.md`, "A subscription lasts as long as its producer").
-impl<C: Consumer + ?Sized> Consumer for Weak<RefCell<C>> {
-    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+/// A notification that reaches the consumer passes the re-entry check ([`notify_shared`]).
+impl<C: Consumer + ?Sized> Consumer for Weak<C> {
+    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         if let Some(consumer) = self.upgrade() {
-            consumer.borrow_mut().notify(region, landing);
+            notify_shared(&consumer, region, landing);
         }
     }
 }
 
-/// A boxed consumer is one, so it can be shared behind an `Rc<RefCell<_>>` as a
-/// [`SharedConsumer`].
+/// A boxed consumer is one, so it can be shared as a [`SharedConsumer`].
 impl Consumer for Box<dyn Consumer> {
     fn completion_key(&self) -> Option<&Value> {
         (**self).completion_key()
     }
 
-    fn notify(&mut self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
+    fn notify(&self, region: &Projection, landing: &mut dispatcher::Landing<'_>) {
         (**self).notify(region, landing)
     }
 }
 
-/// Blanket implementation: FnMut() implements Consumer, ignoring the region.
+/// Blanket implementation: Fn() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
-impl<F: FnMut()> Consumer for F {
-    fn notify(&mut self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
+impl<F: Fn() + Send + Sync> Consumer for F {
+    fn notify(&self, _: &Projection, landing: &mut dispatcher::Landing<'_>) {
         if landing.is_delivery() {
             self()
         }

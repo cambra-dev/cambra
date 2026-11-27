@@ -101,7 +101,7 @@ use crate::{
         Stmt as ChlStmt, VariantPayload as ChlVariantPayload,
     },
     interpreter::{
-        DataSink, DataSourceDomainExtentImpl,
+        DataSink,
         http_server::{SharedHttpServer, UnopenedRoute, UnopenedRouteSink},
     },
 };
@@ -497,7 +497,7 @@ pub struct LoweringContext {
     /// (registered-source recognition) submodules can read and mutate the map
     /// directly; external callers go through the `register_source` /
     /// `take_sources` methods.
-    pub(super) sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    pub(super) sources: HashMap<String, crate::ccl::SourceDefinition>,
     /// Route templates supply types while checking modules but have no runtime source.
     pub(super) module_route_sources: HashSet<String>,
 
@@ -958,8 +958,9 @@ impl LoweringContext {
     pub fn register_source(
         &mut self,
         name: impl Into<String>,
-        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        source: impl Into<crate::ccl::SourceDefinition>,
     ) {
+        let source = source.into();
         self.sources.insert(name.into(), source);
     }
 
@@ -991,13 +992,13 @@ impl LoweringContext {
     /// the map in place, so it may be called before the drain.
     pub fn registered_sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> {
+    ) -> impl Iterator<Item = (&str, &crate::ccl::SourceDefinition)> {
         self.sources.iter().map(|(n, s)| (n.as_str(), s))
     }
 
     pub(crate) fn runtime_sources(
         &self,
-    ) -> impl Iterator<Item = (&str, &Rc<RefCell<dyn DataSourceDomainExtentImpl>>)> {
+    ) -> impl Iterator<Item = (&str, &crate::ccl::SourceDefinition)> {
         self.registered_sources()
             .filter(|(name, _)| !self.module_route_sources.contains(*name))
     }
@@ -1042,7 +1043,7 @@ impl LoweringContext {
     /// running program has and may add to it.
     pub fn adopt_sources_and_sinks(
         &mut self,
-        sources: impl IntoIterator<Item = (String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>)>,
+        sources: impl IntoIterator<Item = (String, crate::ccl::SourceDefinition)>,
         routes: impl IntoIterator<Item = (String, LoweredRoute)>,
         servers: impl IntoIterator<Item = (u16, Arc<SharedHttpServer>)>,
     ) {
@@ -1067,7 +1068,7 @@ impl LoweringContext {
     /// after `lower_stmts` returns and pass each entry to
     /// [`GlobalContext`](crate::ccl::context::GlobalContext) for uniform
     /// registration with inference and operator-conversion.
-    pub fn take_sources(&mut self) -> HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+    pub fn take_sources(&mut self) -> HashMap<String, crate::ccl::SourceDefinition> {
         std::mem::take(&mut self.sources)
     }
 
@@ -2231,7 +2232,6 @@ fn use_name_members(
 #[cfg(test)]
 pub(crate) mod test_helpers {
     //! Shared test fixtures for the `lower` submodules' inline `mod tests`.
-    use std::{cell::RefCell, rc::Rc};
 
     use crate::{
         ccl::{
@@ -2242,7 +2242,6 @@ pub(crate) mod test_helpers {
             FileId,
             ast::{Expr as ChlExpr, Module as ChlModule, Spanned},
         },
-        interpreter::DataSourceDomainExtentImpl,
     };
 
     /// Parse a CHL expression, the root of its own one-file map, and return the
@@ -2254,13 +2253,14 @@ pub(crate) mod test_helpers {
     }
 
     /// Create a minimal registered source for tests that only care about name recognition.
-    pub(crate) fn stub_source(name: &str) -> Rc<RefCell<dyn DataSourceDomainExtentImpl>> {
+    pub(crate) fn stub_source(name: &str) -> crate::ccl::SourceDefinition {
         use crate::interpreter::{BaseType, Extent, TestDataSource};
-        Rc::new(RefCell::new(TestDataSource::new(
+        TestDataSource::new(
             name,
             Type::Base(BaseType::String),
             Extent::Base(BaseType::String),
-        )))
+        )
+        .into()
     }
 
     /// A context outside any program, which reaches `std`'s traits and instances as a module

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
 use std::ops::Range;
+use std::sync::PoisonError;
 
 use smol_str::SmolStr;
 
@@ -395,9 +396,12 @@ impl ColumnValue {
                     .collect();
                 ColumnValue::Records(fields)
             }
-            Extent::DataSourceDomain(d) => {
-                ColumnValue::from_values(values, &d.borrow().element_extent())
-            }
+            Extent::DataSourceDomain(d) => ColumnValue::from_values(
+                values,
+                &d.read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .element_extent(),
+            ),
             Extent::Union(sub_extents) => {
                 // Bucket each row by its tag, keeping the row index alongside the
                 // payload so the arm records the partition directly.
@@ -522,7 +526,10 @@ impl ColumnValue {
     /// before comparison.
     pub fn is_compatible_with_extent(&self, extent: &Extent) -> bool {
         let extent = match extent {
-            Extent::DataSourceDomain(source) => source.borrow().element_extent(),
+            Extent::DataSourceDomain(source) => source
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

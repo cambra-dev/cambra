@@ -5,6 +5,7 @@ use crate::interpreter::tile_operators::test_helpers::ReadInPipeline as _;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
+use std::sync::PoisonError;
 
 use crate::{
     ccl::{
@@ -57,10 +58,10 @@ use crate::{
     },
     util::ScopeStack,
 };
+use std::sync::RwLock;
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
-    rc::Rc,
+    sync::Arc,
 };
 
 /// Converts a λ-eliminated CCL expression into an operator graph.
@@ -115,7 +116,7 @@ use std::{
 pub fn convert_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     [ctx.reading_a_source] = nodes_reaching(expr, [reads_a_source]);
     let op = convert_root(expr, ctx)?;
     // A pure program has one synthetic output, so its sink belongs to the
@@ -128,14 +129,14 @@ pub fn convert_to_operators(
 }
 
 /// One compiled operator per program output.
-pub type OutputOperators = Vec<(SmolStr, Box<dyn TileOperator>)>;
+pub type OutputOperators = Vec<(SmolStr, Arc<dyn TileOperator>)>;
 
 /// The program's value: its top-level bindings, then the value they are bound over, which the
 /// main output reads ([`OpConversionContext::bind_output`]).
 fn convert_root(
     expr: &Expr,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     match &expr.node {
         TypedExprNode::Let {
             binding,
@@ -167,9 +168,9 @@ fn compile_let_binding(
     let_id: NodeId,
     binding: &crate::ccl::TypedBinding,
     bound_expr: &Expr,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<Option<Box<dyn TileOperator>>, ConversionError> {
+) -> Result<Option<Arc<dyn TileOperator>>, ConversionError> {
     let _scope = crate::ccl::provenance::converting(let_id);
 
     // `let __hist = Transact{…}`: build the shared store once and register it
@@ -198,7 +199,7 @@ fn compile_let_binding(
             // Memoized, as every shared computed input is: a `FanOut` passes each slot's
             // pull to its input, and this input is the enclosing drive, which every reader
             // of the `Transact` pulls once per lap.
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+            let fan = Arc::new(FanOut::new(Arc::new(Memo::new(input))));
             ctx.bind_nested_store(&binding.name, bound_expr, keys, writers, fan.slot())?;
             return Ok(Some(fan.slot()));
         }
@@ -208,7 +209,7 @@ fn compile_let_binding(
 
     let (bound_input, body_input) = match input {
         Some(input) => {
-            let fan_out = Rc::new(FanOut::new(input));
+            let fan_out = Arc::new(FanOut::new(input));
             (Some(fan_out.slot()), Some(fan_out.slot()))
         }
         None => (None, None),
@@ -417,7 +418,7 @@ struct StoreReadInfo {
     site: ContentHash,
     /// The cyclic store fan — a [`FanOut`] over the store body stream; every
     /// read is a slot of this one fan.
-    fan: Rc<FanOut>,
+    fan: Arc<FanOut>,
     /// Per-variable read info, keyed by the variable's [`Name::field_key`].
     keys: HashMap<Label, KeyReadInfo>,
     /// Which engine backs the store (selects the read projection).
@@ -451,7 +452,7 @@ pub struct OpConversionContext {
     /// The fan-outs the offer held, kept past [`release_offer`](Self::release_offer) without
     /// keeping them alive, so the handover settles on each that another branch still holds
     /// ([`FanOut::settle_handover`]).
-    offered: Vec<std::rc::Weak<FanOut>>,
+    offered: Vec<std::sync::Weak<FanOut>>,
     /// The version the offer was a graph of, held past [`release_offer`](Self::release_offer)
     /// until the handover settles, so its reader names stay in the fan-outs while the
     /// replacements subscribe and look their predecessors up by them
@@ -478,7 +479,7 @@ pub struct OpConversionContext {
     /// How much of the previous version's graph this compilation kept.
     reuse: ReuseTally,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
-    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    sources: HashMap<String, Arc<RwLock<dyn DataSourceDomainExtentImpl>>>,
     /// Every mutable variable's identity, by the `Transact` node that declares
     /// it, from [`state_identities`] over the tree about to be converted.
     /// Installed by [`set_var_paths`](Self::set_var_paths) before conversion
@@ -495,7 +496,7 @@ pub struct OpConversionContext {
     /// about the tree rather than about the compilation.
     unrecomputable: HashSet<NodeId>,
     /// The source of each reading site's values ([`Self::reading_source`]).
-    readings: HashMap<Rc<crate::ccl::site::Site>, Rc<RefCell<ReadingSource>>>,
+    readings: HashMap<std::rc::Rc<crate::ccl::site::Site>, Arc<RwLock<ReadingSource>>>,
     /// The nodes of the tree being converted whose value comes from a data source, through the
     /// bindings between ([`nodes_reaching`]), on every compilation: an output reading one is a
     /// reuse boundary ([`bind_output`](Self::bind_output)).
@@ -540,7 +541,7 @@ pub struct OpConversionContext {
 pub(crate) struct OpenIteration {
     /// The curried source: one inner collection per enclosing position, which is the keys a
     /// binding from outside is spread over.
-    source: Rc<FanOut>,
+    source: Arc<FanOut>,
     /// The level the iteration adds beneath its enclosing positions, which a lifted binding is
     /// paired at ([`Product::per_row_at`]).
     paired: CurryLevel,
@@ -562,7 +563,7 @@ pub(crate) struct OpenIteration {
 /// variable, and the next compilation keeps from it.
 ///
 /// A branch's entry holds one of these (`src/ccl/design/program-evolution.md`,
-/// "The branch table"). Every [`Recorded`] holds its operator by `Rc`, so a
+/// "The branch table"). Every [`Recorded`] holds its operator by `Arc`, so a
 /// clone builds nothing and the two copies hold the same operators.
 #[derive(Default, Clone)]
 pub struct OperatorMap {
@@ -628,11 +629,11 @@ impl OperatorMap {
     /// What an entry holds: an operator is alive while some operator map lists
     /// it, which is what a branch's operator count and its sharing are counted
     /// over.
-    pub fn operators(&self) -> Vec<Rc<FanOut>> {
-        let mut out: Vec<Rc<FanOut>> = Vec::new();
+    pub fn operators(&self) -> Vec<Arc<FanOut>> {
+        let mut out: Vec<Arc<FanOut>> = Vec::new();
         for entry in self.entries.values() {
             let fan = entry.fan();
-            if !out.iter().any(|held| Rc::ptr_eq(held, fan)) {
+            if !out.iter().any(|held| Arc::ptr_eq(held, fan)) {
                 out.push(fan.clone());
             }
         }
@@ -803,7 +804,7 @@ impl Correspondence {
 #[derive(Clone)]
 enum Recorded {
     /// A `Let` binding's operator, or a writer's iteration input.
-    Operator(Rc<FanOut>),
+    Operator(Arc<FanOut>),
     /// A `Transact` store, which every mutable-variable read projects.
     Store(StoreReadInfo),
 }
@@ -811,7 +812,7 @@ enum Recorded {
 impl Recorded {
     /// The fan-out every use of this node branches off. A store's is its own
     /// cyclic fan, which is why the two arms are not a fan plus a payload.
-    fn fan(&self) -> &Rc<FanOut> {
+    fn fan(&self) -> &Arc<FanOut> {
         match self {
             Recorded::Operator(fan) => fan,
             Recorded::Store(info) => &info.fan,
@@ -827,7 +828,7 @@ impl Recorded {
 /// waits for an element that has gone; told to start above, it skips one nothing
 /// has decided.
 struct IterationInput {
-    op: Box<dyn TileOperator>,
+    op: Arc<dyn TileOperator>,
     /// The last position a predecessor drive reached over this input, or `None`
     /// where it offers everything from the beginning. A drive resumes after it.
     resumed_after: Option<Position>,
@@ -850,7 +851,7 @@ pub struct ReuseTally {
 /// One `Let` binding in scope during conversion.
 pub(crate) struct LetBinding {
     /// The fan-out every use of the binding branches off.
-    pub(crate) fan: Rc<FanOut>,
+    pub(crate) fan: Arc<FanOut>,
     /// Whether the binding was compiled inside an iteration scope.
     pub(crate) kind: BindingKind,
     /// **Which** iteration it was compiled inside, as a depth. A reference made deeper
@@ -927,18 +928,18 @@ impl OpConversionContext {
     }
 
     /// The source of `reading`'s site, which every copy of the call reads.
-    fn reading_source(&mut self, reading: &Reading) -> Rc<RefCell<ReadingSource>> {
+    fn reading_source(&mut self, reading: &Reading) -> Arc<RwLock<ReadingSource>> {
         let source = self
             .readings
-            .entry(Rc::clone(&reading.site))
-            .or_insert_with(|| Rc::new(RefCell::new(ReadingSource::new(reading.kind))));
+            .entry(reading.site.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(ReadingSource::new(reading.kind))));
         assert_eq!(
-            source.borrow().kind(),
+            source.read().unwrap_or_else(PoisonError::into_inner).kind(),
             reading.kind,
             "one site is one call, of one kind of reading: {}",
             reading.site,
         );
-        Rc::clone(source)
+        Arc::clone(source)
     }
 
     /// Install where each node of the tree about to be converted stood in the
@@ -958,7 +959,7 @@ impl OpConversionContext {
     pub fn register_source(
         &mut self,
         name: impl Into<String>,
-        impl_: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        impl_: Arc<RwLock<dyn DataSourceDomainExtentImpl>>,
     ) {
         self.sources.insert(name.into(), impl_);
     }
@@ -966,7 +967,7 @@ impl OpConversionContext {
     pub fn get_source(
         &self,
         name: &str,
-    ) -> Result<Rc<RefCell<dyn DataSourceDomainExtentImpl>>, ConversionError> {
+    ) -> Result<Arc<RwLock<dyn DataSourceDomainExtentImpl>>, ConversionError> {
         self.sources
             .get(name)
             .cloned()
@@ -1006,7 +1007,7 @@ impl OpConversionContext {
     /// only what no retired producer had finished with, and a rebuild over it starts there. Keeping
     /// the output's operator keeps what it holds; rebuilding it would lose the positions it had
     /// taken. No [`Memo`] is interposed: one reader, the output, pulls it.
-    fn bind_output(&mut self, term: &Expr) -> Result<Box<dyn TileOperator>, ConversionError> {
+    fn bind_output(&mut self, term: &Expr) -> Result<Arc<dyn TileOperator>, ConversionError> {
         // A rebuild of a term that reads no source reproduces everything it held, so only one
         // that reads a source needs the fan-out a kept operator is handed on through.
         if !self.reading_a_source.contains(&term.node_id()) {
@@ -1032,7 +1033,7 @@ impl OpConversionContext {
             return Ok(self.slot_read_by(&fan, term));
         }
         let op = convert_impl(term, None, self)?;
-        let fan = Rc::new(FanOut::new(op));
+        let fan = Arc::new(FanOut::new(op));
         self.record(term.node_id(), Recorded::Operator(fan.clone()));
         Ok(self.slot_read_by(&fan, term))
     }
@@ -1068,7 +1069,7 @@ impl OpConversionContext {
         bound_expr: &Expr,
         keys: &[TransactKey],
         writers: &[WriterSite],
-        enclosing_input: Box<dyn TileOperator>,
+        enclosing_input: Arc<dyn TileOperator>,
     ) -> Result<(), ConversionError> {
         let [w] = writers else {
             return Err(ConversionError::Unsupported(format!(
@@ -1208,7 +1209,7 @@ records one and the only site a `Transact` reaches"
         &mut self,
         name: &Name,
         bound_expr: &Expr,
-        bound_input: Option<Box<dyn TileOperator>>,
+        bound_input: Option<Arc<dyn TileOperator>>,
     ) -> Result<(), ConversionError> {
         let kind = if bound_input.is_some() {
             BindingKind::Aligned
@@ -1261,7 +1262,7 @@ records one and the only site a `Transact` reaches"
             self.rebuilt.insert(name.clone());
         }
         let bound_op = convert_impl(bound_expr, bound_input, self)?;
-        let fan = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
+        let fan = Arc::new(FanOut::new(Arc::new(Memo::new(bound_op))));
         // An `Aligned` operator is offered to the next version even though it
         // will not be kept: the offer is keyed by the node, and declining is the
         // reader's decision, made where the operator would be taken.
@@ -1369,7 +1370,7 @@ records one and the only site a `Transact` reaches"
         term: &Expr,
         fresh_start: Option<Position>,
         continues: bool,
-        build: impl FnOnce(&mut Self) -> Result<Box<dyn TileOperator>, ConversionError>,
+        build: impl FnOnce(&mut Self) -> Result<Arc<dyn TileOperator>, ConversionError>,
     ) -> Result<IterationInput, ConversionError> {
         let node = term.node_id();
         self.reuse.bound += 1;
@@ -1411,7 +1412,7 @@ records one and the only site a `Transact` reaches"
             }
         }
         let op = build(self)?;
-        let fan = Rc::new(FanOut::new(op));
+        let fan = Arc::new(FanOut::new(op));
         self.record(node, Recorded::Operator(fan.clone()));
         Ok(IterationInput {
             op: self.slot_read_by(&fan, term),
@@ -1423,7 +1424,7 @@ records one and the only site a `Transact` reaches"
     /// A slot of `fan` for the reader `reader`. It starts at the release of the slot its
     /// correspondent read in the version this one replaces, where `fan` holds one
     /// ([`FanOut::slot_read_by`]).
-    fn slot_read_by(&self, fan: &FanOut, reader: &Expr) -> Box<dyn TileOperator> {
+    fn slot_read_by(&self, fan: &FanOut, reader: &Expr) -> Arc<dyn TileOperator> {
         let node = reader.node_id();
         fan.slot_read_by(
             SlotReader::new(node),
@@ -1465,7 +1466,7 @@ records one and the only site a `Transact` reaches"
     /// skips the predicates of a `Cast` target, which live in a `Type` — and that
     /// is sound in both directions here: conversion discards a cast target
     /// (`convert_impl`), so no entry is ever recorded inside one.
-    fn keep_region(&mut self, term: &Expr, kept: &Rc<FanOut>) {
+    fn keep_region(&mut self, term: &Expr, kept: &Arc<FanOut>) {
         kept.with_input(record_kept_operators);
         fn nodes_below(e: &Expr, out: &mut Vec<NodeId>) {
             e.walk_children(|child| {
@@ -1779,7 +1780,7 @@ the compilation declined outlives it here"
         }
         for fan in std::mem::take(&mut self.offered)
             .iter()
-            .filter_map(std::rc::Weak::upgrade)
+            .filter_map(std::sync::Weak::upgrade)
         {
             fan.settle_handover();
         }
@@ -1793,10 +1794,10 @@ the compilation declined outlives it here"
     /// the retired version built, including the ones this compilation rebuilt
     /// instead — and an operator holds the producers beneath it, so a source's
     /// release record for a producer nobody reads any more would go on
-    /// constraining what that source may drop. The records are handed back from
-    /// the producers' own `Drop`
-    /// ([`DataSourceDomainExtentImpl::retire_producer`](crate::interpreter::DataSourceDomainExtentImpl::retire_producer)),
-    /// so this is what makes them run. What was kept is unaffected: the
+    /// constraining what that source may drop. Each producer holds the handle that hands its
+    /// record back
+    /// ([`DataSourceDomainExtentImpl::producer_retirement`](crate::interpreter::DataSourceDomainExtentImpl::producer_retirement)),
+    /// so dropping the offer drops the records. What was kept is unaffected: the
     /// compilation that kept it holds its own reference.
     pub fn release_offer(&mut self) {
         self.offered = self
@@ -1804,7 +1805,7 @@ the compilation declined outlives it here"
             .operators
             .operators()
             .iter()
-            .map(Rc::downgrade)
+            .map(Arc::downgrade)
             .collect();
         self.offered_version = Some(self.offer.operators.version.clone());
         self.offer = Offer::default();
@@ -2125,9 +2126,9 @@ enum DependentTuples {
 /// entries; each use produces a fresh [`FanOutSlot`] handle via [`FanOut::slot`].
 fn convert_impl(
     expr: &Expr,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     // One frame per node, sized for the union of every arm below; grow on demand as
     // the other pass-level walks do (`lambda_elim`, `check`, `constrain`,
     // `channelize`).
@@ -2149,10 +2150,10 @@ fn convert_impl(
 /// [`convert_impl`] with the node at `level`, restoring the enclosing level afterwards.
 fn convert_at(
     expr: &Expr,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     level: CurryLevel,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let enclosing = ctx.level.replace(level);
     let converted = convert_impl(expr, input, ctx);
     ctx.level = enclosing;
@@ -2163,18 +2164,18 @@ fn convert_at(
 /// over the elements of its input's values converts it at.
 fn convert_lifted(
     expr: &Expr,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let level = CurryLevel::new(ctx.level().index() + 1);
     convert_at(expr, input, level, ctx)
 }
 
 fn convert_impl_inner(
     expr: &Expr,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     // Every operator minted while this frame is innermost attributes to `expr`.
     // Nested frames open their own, so a child's operators go to the child; what
     // lands here is what this arm built around them. See
@@ -2188,7 +2189,7 @@ fn convert_impl_inner(
         expect_no_input(input, "nested store read")?;
         return convert_nested_store_read(read, ctx);
     }
-    let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
+    let result: Result<Arc<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
             let mut result = input;
@@ -2322,7 +2323,7 @@ fn convert_impl_inner(
         {
             let input = expect_input(input, "const")?;
             let const_op = convert_impl(argument, None, ctx)?;
-            Ok(Box::new(MapResultToConst::new_at(
+            Ok(Arc::new(MapResultToConst::new_at(
                 input,
                 const_op,
                 MapResultToConstMode::Replace,
@@ -2371,7 +2372,7 @@ fn convert_impl_inner(
                             MapResultToConstMode::ZipRight
                         };
                         let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), ctx)?;
-                        return Ok(Box::new(MapResultToConst::new_at(
+                        return Ok(Arc::new(MapResultToConst::new_at(
                             non_const_arm,
                             const_arm,
                             mode,
@@ -2440,9 +2441,9 @@ fn convert_impl_inner(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Converse) =>
         {
-            let converse = Box::new(Converse::new(convert_impl(argument, None, ctx)?));
+            let converse = Arc::new(Converse::new(convert_impl(argument, None, ctx)?));
             if let Some(input) = input {
-                Ok(Box::new(MapResult::new_at(input, converse, ctx.level())))
+                Ok(Arc::new(MapResult::new_at(input, converse, ctx.level())))
             } else {
                 Ok(converse)
             }
@@ -2537,7 +2538,7 @@ fn convert_impl_inner(
             if as_builtin(function) == Some(Builtin::MapDomain) =>
         {
             expect_no_input(input, "map_domain")?;
-            Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
+            Ok(Arc::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
         }
 
         // uncurry(n) flattens n collection levels into one keyed by n-tuples: the outer two
@@ -2552,9 +2553,9 @@ fn convert_impl_inner(
         {
             let mut op = convert_impl(argument, None, ctx)?;
             for step in 0..n - 1 {
-                op = Box::new(Uncurry::new(op));
+                op = Arc::new(Uncurry::new(op));
                 if step > 0 {
-                    op = Box::new(FlattenTupleDomain::new(op, vec![0]));
+                    op = Arc::new(FlattenTupleDomain::new(op, vec![0]));
                 }
             }
             Ok(op)
@@ -2593,12 +2594,12 @@ fn convert_impl_inner(
                 ))
             })?;
             let extent = ctx.extent_of(&domain_ty)?;
-            let pred_input: Box<dyn TileOperator> = Box::new(IterateExtent::new(extent));
+            let pred_input: Arc<dyn TileOperator> = Arc::new(IterateExtent::new(extent));
             if is_trivially_true_predicate(predicate) {
                 return Ok(pred_input);
             }
             let pred_op = convert_impl(predicate, Some(pred_input), ctx)?;
-            Ok(Box::new(Restrict::new(pred_op)))
+            Ok(Arc::new(Restrict::new(pred_op)))
         }
 
         // restrict(p): mid-chain filter form.  Requires `input=Some(_)`;
@@ -2610,7 +2611,7 @@ fn convert_impl_inner(
         {
             let upstream = expect_input(input, "restrict")?;
             let pred_op = convert_impl(argument, Some(upstream), ctx)?;
-            Ok(Box::new(Restrict::new(pred_op)))
+            Ok(Arc::new(Restrict::new(pred_op)))
         }
 
         // filter_values(p): the **value-preserving** mid-chain filter. Requires `input=Some(_)`,
@@ -2635,9 +2636,9 @@ fn convert_impl_inner(
             // writer re-pulls the body once per proposal — without the memo the two
             // fan slots desync (one sees a position the other has already
             // consumed).
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
+            let fan = Arc::new(FanOut::new(Arc::new(Memo::new(upstream))));
             let pred_op = convert_impl(argument, Some(fan.slot()), ctx)?;
-            Ok(Box::new(Filter::new_at(fan.slot(), pred_op, masked)))
+            Ok(Arc::new(Filter::new_at(fan.slot(), pred_op, masked)))
         }
 
         // cast(value): pure type-level assertion — re-views `value` under
@@ -2677,13 +2678,13 @@ fn convert_impl_inner(
                 TypedExprNode::Tuple(elts) if elts.len() == 2 => {
                     let stream_op = convert_impl(&elts[0], None, ctx)?;
                     let default_op = convert_impl(&elts[1], None, ctx)?;
-                    Ok(Box::new(ExtractFinal::new(stream_op, default_op)))
+                    Ok(Arc::new(ExtractFinal::new(stream_op, default_op)))
                 }
                 TypedExprNode::Tuple(elts) => Err(ConversionError::Unsupported(format!(
                     "FinalOrDefault with a Tuple argument expects 2 elements, got {}",
                     elts.len()
                 ))),
-                _ => Ok(Box::new(ExtractFinal::without_default(convert_impl(
+                _ => Ok(Arc::new(ExtractFinal::without_default(convert_impl(
                     argument, None, ctx,
                 )?))),
             }
@@ -2753,7 +2754,7 @@ fn convert_impl_inner(
                     ));
                 }
                 let collection = convert_impl_inner(expr, None, ctx)?;
-                return Ok(Box::new(MapResult::new_at(input, collection, ctx.level())));
+                return Ok(Arc::new(MapResult::new_at(input, collection, ctx.level())));
             }
             let Some((store_name, field)) = as_store_read(argument, ctx) else {
                 return Err(ConversionError::Unsupported(
@@ -2810,7 +2811,7 @@ fn convert_impl_inner(
             let option_extent = ctx.extent_of(&option_ty)?;
             let collection = convert_impl(argument, None, ctx)?;
             reject_unanswerable_lookup_collection(collection.tiling())?;
-            Ok(Box::new(CheckedLookup::split(
+            Ok(Arc::new(CheckedLookup::split(
                 collection,
                 keys,
                 option_extent,
@@ -2842,7 +2843,7 @@ fn convert_impl_inner(
             let collection = convert_impl(coll_expr, None, ctx)?;
             reject_unanswerable_lookup_collection(collection.tiling())?;
             let keys = convert_impl(key_expr, None, ctx)?;
-            Ok(Box::new(CheckedLookup::split(
+            Ok(Arc::new(CheckedLookup::split(
                 collection,
                 keys,
                 option_extent,
@@ -2927,7 +2928,7 @@ fn convert_impl_inner(
                     )));
                 }
                 let collection = convert_impl_inner(expr, None, ctx)?;
-                return Ok(Box::new(MapResult::new_at(input, collection, ctx.level())));
+                return Ok(Arc::new(MapResult::new_at(input, collection, ctx.level())));
             }
             // The argument is a root, a stream of its own, so the function applied to it
             // runs over the root's iteration rather than the enclosing node's. An applied
@@ -2965,7 +2966,7 @@ fn convert_impl_inner(
                 // pointwise via `MapResult`.
                 BindingKind::Free => Ok(match input {
                     None => op,
-                    Some(input) => Box::new(MapResult::new_at(input, op, ctx.level())),
+                    Some(input) => Arc::new(MapResult::new_at(input, op, ctx.level())),
                 }),
                 BindingKind::Aligned => {
                     // Aligned to an iteration outside this one: the tile is keyed by that
@@ -3032,7 +3033,7 @@ fn convert_impl_inner(
                      {extent:?}"
                 )));
             }
-            Ok(Box::new(Constant::from_bindings(
+            Ok(Arc::new(Constant::from_bindings(
                 Value::Function(Vec::new()),
                 extent,
             )))
@@ -3109,7 +3110,7 @@ fn convert_impl_inner(
                              {domain} is not supported yet"
                         )))
                     } else {
-                        Ok(Box::new(UnionOperator::new_flat_over(
+                        Ok(Arc::new(UnionOperator::new_flat_over(
                             vec![input],
                             Some(*domain),
                             values,
@@ -3133,9 +3134,9 @@ fn convert_impl_inner(
                         domain: Box::new(value_extent_at(input.tiling(), ctx.level())),
                         codomain: Box::new(ctx.extent_of(&out_extent)?),
                     };
-                    Ok(Box::new(MapResult::new_at(
+                    Ok(Arc::new(MapResult::new_at(
                         input,
-                        Box::new(Constant::new(
+                        Arc::new(Constant::new(
                             Value::ComputableFunction(FunctionDef::Insert),
                             fn_extent,
                         )),
@@ -3156,7 +3157,7 @@ fn convert_impl_inner(
                         ))
                     })?;
                     let option_extent = ctx.extent_of(&option_ty)?;
-                    Ok(Box::new(
+                    Ok(Arc::new(
                         CheckedLookup::paired(input, option_extent)
                             .map_err(ConversionError::Unsupported)?,
                     ))
@@ -3164,8 +3165,8 @@ fn convert_impl_inner(
                 // Both act on the collection each row of the input holds, beneath the levels
                 // it is converted under: a group-by whose key or source varies with an enclosing row
                 // inverts each row's collection on its own.
-                Builtin::MapDomain => Ok(Box::new(MapDomain::new_at(input, ctx.level()))),
-                Builtin::Converse => Ok(Box::new(Converse::new_at(input, ctx.level()))),
+                Builtin::MapDomain => Ok(Arc::new(MapDomain::new_at(input, ctx.level()))),
+                Builtin::Converse => Ok(Arc::new(Converse::new_at(input, ctx.level()))),
                 // `variant_project(c)` consumes the fed scrutinee stream and
                 // narrows it to that tag's restricted sub-domain, yielding the
                 // arm's inner payload column. The union extents come from the fed
@@ -3211,7 +3212,7 @@ fn convert_impl_inner(
                         ))
                     })?;
                     let payload_extent = ctx.extent_of(&payload_ty)?;
-                    Ok(Box::new(VariantProject::new(
+                    Ok(Arc::new(VariantProject::new(
                         input,
                         tag.clone(),
                         payload_extent,
@@ -3221,7 +3222,7 @@ fn convert_impl_inner(
                 // position and call path.
                 Builtin::Reading(reading) => {
                     let source = ctx.reading_source(reading);
-                    Ok(Box::new(Readings::at(input, source, ctx.level())))
+                    Ok(Arc::new(Readings::at(input, source, ctx.level())))
                 }
                 // `variant_is(c)` — the total tag test. Same scrutinee shapes as
                 // `variant_project(c)`, but every key of the domain is answered,
@@ -3233,7 +3234,7 @@ fn convert_impl_inner(
                             input.tiling()
                         )));
                     }
-                    Ok(Box::new(VariantIs::new(input, tag.clone())))
+                    Ok(Arc::new(VariantIs::new(input, tag.clone())))
                 }
                 // `variant_wrap(c)` — the point-free constructor. Consumes the fed
                 // payload stream and injects it at tag `c`. The union extents come
@@ -3263,7 +3264,7 @@ fn convert_impl_inner(
                     // one union column. The tiling cannot say which is which, since a
                     // collection of payloads and a payload that is itself a collection are
                     // both collections, so the level is the one the wrap is converted at.
-                    Ok(Box::new(VariantWrap::new_at(
+                    Ok(Arc::new(VariantWrap::new_at(
                         input,
                         tag.clone(),
                         TagMap::from_arms(variant_extents),
@@ -3277,8 +3278,8 @@ fn convert_impl_inner(
                     apply_unaryop(input, op, ctx.level())
                 }
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(
-                    Box::new(MapAggregate::new(input, kind)),
+                b if let Some(kind) = b.as_aggregate() => Ok(Arc::new(MapExtractAggregate::new(
+                    Arc::new(MapAggregate::new(input, kind)),
                     kind,
                 ))),
                 // Composed rather than applied would be a reduction per enclosing position, which
@@ -3292,11 +3293,11 @@ fn convert_impl_inner(
                 // that stand above it: a flattening an enclosing comprehension maps over its rows.
                 // It pairs and splices as the applied form does, each step at those levels.
                 Builtin::Uncurry(n) => {
-                    let mut op: Box<dyn TileOperator> = input;
+                    let mut op: Arc<dyn TileOperator> = input;
                     for step in 0..n - 1 {
-                        op = Box::new(Uncurry::new_at(op, ctx.level()));
+                        op = Arc::new(Uncurry::new_at(op, ctx.level()));
                         if step > 0 {
-                            op = Box::new(FlattenTupleDomain::new_at(op, vec![0], ctx.level()));
+                            op = Arc::new(FlattenTupleDomain::new_at(op, vec![0], ctx.level()));
                         }
                     }
                     Ok(op)
@@ -3305,7 +3306,7 @@ fn convert_impl_inner(
                 // A collection is a data function, so applying one at a key its type keeps in
                 // the domain is the total lookup. A compute function has no compiled form as a
                 // value, so applying one stays unsupported.
-                Builtin::Apply if applies_a_collection(&expr.ty) => Ok(Box::new(
+                Builtin::Apply if applies_a_collection(&expr.ty) => Ok(Arc::new(
                     Lookup::new_at(input, ctx.level()).map_err(ConversionError::Unsupported)?,
                 )),
                 _ => Err(ConversionError::Unsupported(format!(
@@ -3336,7 +3337,7 @@ fn convert_impl_inner(
                         .into(),
                 )
             })?;
-            Ok(Box::new(MapResult::new_at(
+            Ok(Arc::new(MapResult::new_at(
                 index_stream,
                 fn_const,
                 ctx.level(),
@@ -3432,7 +3433,7 @@ fn convert_impl_inner(
             // collection-valued one included, which the arm holds materialized in one cell.
             // The node's type is one variant value, so the wrap acts on the payload whole.
             let level = CurryLevel::OUTERMOST;
-            Ok(Box::new(VariantWrap::new_at(
+            Ok(Arc::new(VariantWrap::new_at(
                 payload_op,
                 tag_key,
                 variant_extents,
@@ -3452,7 +3453,7 @@ fn convert_impl_inner(
                 .iter()
                 .map(|path| path.iter().map(field).collect())
                 .collect();
-            Ok(Box::new(MapResultWithSource::projecting(
+            Ok(Arc::new(MapResultWithSource::projecting(
                 source, input, fields,
             )))
         }
@@ -3466,7 +3467,7 @@ fn convert_impl_inner(
                 "a reading with no position operand is converted outside every loop: {}",
                 reading.site,
             );
-            Ok(Box::new(Readings::once(ctx.reading_source(reading))))
+            Ok(Arc::new(Readings::once(ctx.reading_source(reading))))
         }
 
         // `@LoadFrom(x)`: the value the retired version held, as a constant.
@@ -3498,9 +3499,9 @@ fn convert_impl_inner(
             // outputs. Nothing applies this constant the way a list literal's table
             // is applied, which is the distinction `Constant` cannot read off the
             // value and takes from the call site instead.
-            let op: Box<dyn TileOperator> = match extent {
-                Extent::Function { .. } => Box::new(Constant::from_bindings(value.clone(), extent)),
-                _ => Box::new(Constant::new(value.clone(), extent)),
+            let op: Arc<dyn TileOperator> = match extent {
+                Extent::Function { .. } => Arc::new(Constant::from_bindings(value.clone(), extent)),
+                _ => Arc::new(Constant::new(value.clone(), extent)),
             };
             Ok(op)
         }
@@ -3534,9 +3535,9 @@ fn convert_impl_inner(
 /// so reaching one of these arms without an input is a planner bug, not
 /// a user error.
 fn expect_input(
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     name: &str,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     input.ok_or_else(|| ConversionError::Unsupported(format!("{name} requires an input operator")))
 }
 
@@ -3556,7 +3557,7 @@ fn applies_a_collection(apply_ty: &Type) -> bool {
 }
 
 fn expect_no_input(
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     name: &str,
 ) -> Result<(), ConversionError> {
     if input.is_some() {
@@ -3588,7 +3589,7 @@ fn expect_no_input(
 fn compile_list_fn(
     elts: &[Expr],
     elt_extent: Extent,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let elts: Vec<&Expr> = elts.iter().collect();
     let (values, values_tiling) = list_levels(&elts, &elt_extent)?;
     let domain = Extent::uint_range(uint_of_row(elts.len()));
@@ -3604,7 +3605,7 @@ fn compile_list_fn(
         tile.check_from(&tiling),
         "a list literal's tile is its tiling's: {tile:?} vs {tiling}"
     );
-    Ok(Box::new(Constant::collection(tile, tiling)))
+    Ok(Arc::new(Constant::collection(tile, tiling)))
 }
 
 /// `expr` with a `box` around it removed. `box` has no runtime content: at the element
@@ -3773,13 +3774,13 @@ fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
 /// [`ConversionError::TypeError`]. Function-tiled components under a record extent would
 /// otherwise build a record of collections where the consumer reads a collection of records.
 fn build_product(
-    components: Vec<(SmolStr, Box<dyn TileOperator>)>,
+    components: Vec<(SmolStr, Arc<dyn TileOperator>)>,
     expr: &Expr,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let want = ctx.extent_of(&expr.ty)?;
-    let product: Box<dyn TileOperator> = if matches!(want, Extent::Record(_)) {
-        Box::new(MakeRecord::new_named(components))
+    let product: Arc<dyn TileOperator> = if matches!(want, Extent::Record(_)) {
+        Arc::new(MakeRecord::new_named(components))
     } else {
         // The components pair at the domains the node's type is curried over, which is where
         // it takes its argument: a component whose values are collections keeps them as
@@ -3901,14 +3902,14 @@ pub(super) fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
 }
 
 /// Compile a CCL literal to a [`Constant`] scalar operator.
-fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
+fn compile_lit(lit: &Lit) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let (value, extent) = match lit {
         Lit::Int(n) => (Value::Int(*n), Extent::Base(BaseType::Int)),
         Lit::String(s) => (Value::String(s.clone()), Extent::Base(BaseType::String)),
         Lit::Bool(b) => (Value::Bool(*b), Extent::Base(BaseType::Bool)),
         Lit::Unit => (Value::Unit, Extent::Base(BaseType::Unit)),
     };
-    Ok(Box::new(Constant::new(value, extent)))
+    Ok(Arc::new(Constant::new(value, extent)))
 }
 
 /// Build the operator graph for a `let __hist = Transact{…}` and return the
@@ -4105,7 +4106,7 @@ fn build_commit_store(
     let mut keys_map: HashMap<Label, KeyReadInfo> = HashMap::with_capacity(keys.len());
     // Per scalar key, the stream giving its seed, the value it holds before any commit (a
     // literal init is a constant; a computed init streams to its value).
-    let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
+    let mut seed_ops: Vec<(Value, Arc<dyn TileOperator>)> = Vec::new();
     let continues = ctx.store_continues(keys, paths);
 
     // The store-wide per-commit value extent types a *proposal's* read and write set
@@ -4131,10 +4132,10 @@ fn build_commit_store(
         // same rule the induction path follows, and the reason state is keyed by
         // variable rather than by store.
         let carried = ctx.offer.mutable_state.get(&paths[i]);
-        let seed_op: Box<dyn TileOperator> = match carried {
+        let seed_op: Arc<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming transactional {field} from the retired version's value");
-                Box::new(Constant::new(carried.clone(), key_value_extent.clone()))
+                Arc::new(Constant::new(carried.clone(), key_value_extent.clone()))
             }
             None => convert_impl(&k.init, None, ctx)?,
         };
@@ -4209,7 +4210,7 @@ fn build_commit_store(
     let setters: Vec<_> = (0..writers.len())
         .map(|k| commit.writer_input_setter(k))
         .collect();
-    let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+    let store_fan = Arc::new(FanOut::new_cyclic(Arc::new(commit)));
 
     for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
         // Attribute this writer's operators to the writer, not to the binding
@@ -4240,13 +4241,13 @@ fn build_commit_store(
                 ))
             })?;
             let order = info.by_item.expect("a fed-back tap is keyed by item");
-            let stream = Box::new(StoreValueStream::new(
+            let stream = Arc::new(StoreValueStream::new(
                 store_fan.recurrence_slot(),
                 info.runtime_key.clone(),
                 info.value_extent.clone(),
                 false,
             ));
-            let fan = Rc::new(FanOut::new(Box::new(RekeySorted::new(stream, order))));
+            let fan = Arc::new(FanOut::new(Arc::new(RekeySorted::new(stream, order))));
             scope.rebuilt.insert(fed.name.clone());
             let binding = LetBinding {
                 fan,
@@ -4307,7 +4308,7 @@ fn build_commit_store(
         // attempt still in flight — and so this is the one fan whose input is **not**
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
         // driver as an ack for an attempt no slot has finished.
-        let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
+        let driver_fan = Arc::new(FanOut::new(Arc::new(driver)));
         // The body releases each row as it consumes it, which is its half of that intersection.
         // A `Memo` over the driver's slot makes that release for any body shape: a body that
         // reads its input once has no fan of its own, and without the release a superseded
@@ -4316,7 +4317,7 @@ fn build_commit_store(
         // domain, whatever the `Transact` sits in.
         let body_op = convert_at(
             &w.body,
-            Some(Box::new(Memo::new(driver_fan.slot()))),
+            Some(Arc::new(Memo::new(driver_fan.slot()))),
             CurryLevel::new(1),
             ctx,
         )?;
@@ -4373,7 +4374,7 @@ fn build_commit_store(
             value_extent.clone(),
             item_positions,
         );
-        set_writer(Box::new(writer));
+        set_writer(Arc::new(writer));
     }
 
     Ok(StoreReadInfo {
@@ -4499,7 +4500,10 @@ fn source_start(domain: &Type, ctx: &OpConversionContext) -> Option<Position> {
     // resumes after is the one below. A collection offers every position it has, so
     // a drive over one resumes after nothing.
     let next = ctx.sources.get(name).map_or(0, |source| {
-        source.borrow().first_position_for_a_new_producer()
+        source
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first_position_for_a_new_producer()
     });
     next.checked_sub(1).map(|p| Position::new(Value::UInt(p)))
 }
@@ -5329,9 +5333,9 @@ fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>,
 /// rows: one seed per row, a row whose inner loop runs no position included.
 fn convert_nested_seeds(
     keys: &[TransactKey],
-    enclosing_fan: &Rc<FanOut>,
+    enclosing_fan: &Arc<FanOut>,
     ctx: &mut OpConversionContext,
-) -> Result<Vec<Box<dyn TileOperator>>, ConversionError> {
+) -> Result<Vec<Arc<dyn TileOperator>>, ConversionError> {
     keys.iter()
         .map(|k| convert_impl(&k.init, Some(enclosing_fan.slot()), ctx))
         .collect()
@@ -5355,7 +5359,7 @@ fn build_nested_induction_store(
     keys: &[TransactKey],
     w: &WriterSite,
     bound_expr: &Expr,
-    enclosing_input: Box<dyn TileOperator>,
+    enclosing_input: Arc<dyn TileOperator>,
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let _scope = crate::ccl::provenance::converting(bound_expr.node_id());
@@ -5365,7 +5369,7 @@ fn build_nested_induction_store(
     // `Memo`: a `FanOut` passes every slot's pull to its input, and without the cache each
     // reader recomputes the input once per lap. None of these fans' releases is read as a
     // drive's progress, which is what keeps a `Memo` off an iteration source.
-    let enclosing_fan = Rc::new(FanOut::new(Box::new(Memo::new(enclosing_input))));
+    let enclosing_fan = Arc::new(FanOut::new(Arc::new(Memo::new(enclosing_input))));
 
     // `ᴘ ⇒ (Pos ⥤ item)` against the enclosing positions: one inner collection per row. Both
     // source shapes planning emits converge here — a `curry_over` for an inner source the
@@ -5386,15 +5390,15 @@ fn build_nested_induction_store(
             source_nested.tiling()
         )));
     };
-    let source_fan = Rc::new(FanOut::new(Box::new(Memo::new(source_nested))));
+    let source_fan = Arc::new(FanOut::new(Arc::new(Memo::new(source_nested))));
     // The body takes `(ᴘ, Pos)`, so each row's parameter is paired with the keys of **its
     // own** collection ([`Product::per_row_at`]).
     // The `Transact`'s rows stand beneath the levels left standing, and the pairing adds the
     // level beneath them: where the program puts this loop, not what the operands' tilings
     // happen to hold.
     let paired = CurryLevel::new(standing.len() + 1);
-    let pairs = Box::new(Uncurry::new_at(
-        Box::new(Product::per_row_at(
+    let pairs = Arc::new(Uncurry::new_at(
+        Arc::new(Product::per_row_at(
             enclosing_fan.slot(),
             source_fan.slot(),
             paired,
@@ -5404,7 +5408,7 @@ fn build_nested_induction_store(
     // What a nested body takes beside its slots is the **whole pair** `(ᴘ, Pos)`, which is
     // what elimination gave it and what the seed is a morphism of — not `ᴘ` alone.
     let enclosing_extent = pairs.tiling().deepest_values().extent();
-    let pairs_fan = Rc::new(FanOut::new(Box::new(Memo::new(pairs))));
+    let pairs_fan = Arc::new(FanOut::new(Arc::new(Memo::new(pairs))));
     // The driver takes the source **curried**, one inner collection per enclosing position,
     // because that is where per-row completeness is stated: the outer level's
     // `domain_predicate` names the rows that will gain no more items, and flattening to
@@ -5417,8 +5421,8 @@ fn build_nested_induction_store(
     ]));
 
     let mut keys_map: HashMap<Label, KeyReadInfo> = HashMap::with_capacity(keys.len());
-    let mut seed_ops: Vec<Box<dyn TileOperator>> = Vec::new();
-    let mut store_seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
+    let mut seed_ops: Vec<Arc<dyn TileOperator>> = Vec::new();
+    let mut store_seed_ops: Vec<(Value, Arc<dyn TileOperator>)> = Vec::new();
     // A seed is a morphism of the enclosing parameter, one per enclosing position, so it is
     // converted at the enclosing body's own iteration and reads its bindings as they are.
     let seeds = convert_nested_seeds(keys, &enclosing_fan, ctx);
@@ -5432,7 +5436,7 @@ fn build_nested_induction_store(
         // the body with it at an enclosing boundary, and the store folds a carry to it at
         // a position that writes nothing. One reader would leave the other disagreeing —
         // which is the shape of every "write between the loops" case.
-        let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(seed))));
+        let seed_fan = Arc::new(FanOut::new(Arc::new(Memo::new(seed))));
         seed_ops.push(seed_fan.slot());
         store_seed_ops.push((rk.clone(), seed_fan.slot()));
         let prior = keys_map.insert(
@@ -5488,7 +5492,7 @@ fn build_nested_induction_store(
         None,
     );
     let set_body = store.body_input_setter();
-    let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+    let fan = Arc::new(FanOut::new_cyclic(Arc::new(store)));
     // The two things a nested drive adds: the enclosing parameter its body takes, and
     // where each accumulator restarts at an enclosing position boundary. The positions it
     // sequences are the inner half of the pair domain.
@@ -5517,7 +5521,7 @@ fn build_nested_induction_store(
         source: source_fan.clone(),
         paired,
     });
-    let body = convert_lifted(&w.body, Some(Box::new(driver)), ctx);
+    let body = convert_lifted(&w.body, Some(Arc::new(driver)), ctx);
     ctx.iterations.pop();
     set_body(body?);
     Ok(StoreReadInfo {
@@ -5557,7 +5561,7 @@ fn build_induction_store_single(
     // position, read per pull until it settles) plus a dense-read entry carrying that
     // value as the leading-carry fold default.
     let mut keys_map: HashMap<Label, KeyReadInfo> = HashMap::with_capacity(keys.len());
-    let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
+    let mut seed_ops: Vec<(Value, Arc<dyn TileOperator>)> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = store_key(&field);
@@ -5569,10 +5573,10 @@ fn build_induction_store_single(
         // discarding what it had accumulated, which is what distinguishes
         // swapping the logic from recomputing the program.
         let carried = ctx.offer.mutable_state.get(&paths[i]);
-        let seed_op: Box<dyn TileOperator> = match carried {
+        let seed_op: Arc<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming {field} from the retired version's value");
-                Box::new(Constant::new(carried.clone(), value_extent.clone()))
+                Arc::new(Constant::new(carried.clone(), value_extent.clone()))
             }
             None => convert_impl(&k.init, None, ctx)?,
         };
@@ -5656,7 +5660,7 @@ resolves to the other's value",
     // Cyclic: the driver reads this store's changelog back to recover each
     // position's previous accumulator, so one fan slot feeds the cycle and the
     // rest serve the downstream `__hist.k` dense reads.
-    let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+    let fan = Arc::new(FanOut::new_cyclic(Arc::new(store)));
     let driver = InductionDriver::new(
         // The driver is placed inside this store by `set_body` below, so its
         // read of the store's changelog is a recurrence rather than a reader.
@@ -5674,7 +5678,7 @@ resolves to the other's value",
     // The body runs over the store's own domain, whatever the `Transact` sits in.
     set_body(convert_at(
         &w.body,
-        Some(Box::new(driver)),
+        Some(Arc::new(driver)),
         CurryLevel::new(1),
         ctx,
     )?);
@@ -5713,7 +5717,7 @@ fn convert_store_settled_read(
     store_name: &Name,
     field: &Label,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let info = ctx.lookup_store(store_name).ok_or_else(|| {
         ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
     })?;
@@ -5725,7 +5729,7 @@ fn convert_store_settled_read(
     // A nested store is one store per enclosing position, so its settled read is one per row:
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
-    Ok(Box::new(StoreFinalRead::per_row_at(
+    Ok(Arc::new(StoreFinalRead::per_row_at(
         // A scalar read takes the store's current value, which the fan-out retains for it, once in
         // each version, so its slot replaces no reader; a read per row reads the rows its
         // predecessor left.
@@ -5748,7 +5752,7 @@ fn convert_store_read(
     store_name: &Name,
     field: &Label,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let (fan, kind, key) = {
         let info = ctx.lookup_store(store_name).ok_or_else(|| {
             ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
@@ -5769,7 +5773,7 @@ fn convert_store_read(
         // variable holds its value across ticks that wrote other keys, and a reply tap
         // appears only at the tick that wrote it.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward, by_item))) => {
-            let stream = Box::new(StoreValueStream::new(
+            let stream = Arc::new(StoreValueStream::new(
                 ctx.slot_read_by(&fan, reader),
                 runtime_key.clone(),
                 value_extent,
@@ -5778,7 +5782,7 @@ fn convert_store_read(
             // A tap keyed by item holds `(item position, value)` at each commit, and its site
             // commits its items in its source's order.
             Ok(match by_item {
-                Some(order) => Box::new(RekeySorted::new(stream, order)),
+                Some(order) => Arc::new(RekeySorted::new(stream, order)),
                 None => stream,
             })
         }
@@ -5797,7 +5801,7 @@ fn convert_store_read(
         (
             StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog,
             Some((runtime_key, value_extent, carry_forward, _)),
-        ) => Ok(Box::new(StoreDenseRead::new(
+        ) => Ok(Arc::new(StoreDenseRead::new(
             ctx.slot_read_by(&fan, reader),
             runtime_key,
             value_extent,
@@ -5839,17 +5843,17 @@ fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
 /// The row side is `input` itself. `collections` reads it too, so it is fanned to both and the
 /// product takes the two sides directly.
 fn strength_over_at(
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     ctx: &mut OpConversionContext,
     collections: impl FnOnce(
-        Box<dyn TileOperator>,
+        Arc<dyn TileOperator>,
         &mut OpConversionContext,
-    ) -> Result<Box<dyn TileOperator>, ConversionError>,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+    ) -> Result<Arc<dyn TileOperator>, ConversionError>,
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let level = ctx.level();
-    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+    let fan_out = Arc::new(FanOut::new(Arc::new(Memo::new(input))));
     let collections = collections(fan_out.slot(), ctx)?;
-    Ok(Box::new(Product::per_row_values_at(
+    Ok(Arc::new(Product::per_row_values_at(
         fan_out.slot(),
         collections,
         level,
@@ -5912,10 +5916,10 @@ fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), Conversi
 /// the pair is left standing rather than flattened: a nested body reads its two levels as
 /// two.
 fn lift_into_iteration(
-    op: Box<dyn TileOperator>,
+    op: Arc<dyn TileOperator>,
     open: &OpenIteration,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let paired = Box::new(Product::per_row_at(op, open.source.slot(), open.paired));
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
+    let paired = Arc::new(Product::per_row_at(op, open.source.slot(), open.paired));
     // The pairing adds its level at `open.paired`, so the pairs stand one level further in.
     proj_named_field(
         paired,
@@ -5931,14 +5935,14 @@ fn lift_into_iteration(
 /// comprehension map's input is the binding's own row paired with each element
 /// (`strength_over`), so the binding's value there is the value the reference wants.
 fn lift_into_level(
-    op: Box<dyn TileOperator>,
-    input: Box<dyn TileOperator>,
+    op: Arc<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     bound_at: CurryLevel,
     level: CurryLevel,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let keys = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
+    let keys = Arc::new(FanOut::new(Arc::new(Memo::new(input))));
     (bound_at.index()..level.index()).try_fold(op, |op, row| {
-        let paired = Box::new(Product::per_row_at(op, keys.slot(), CurryLevel::new(row)));
+        let paired = Arc::new(Product::per_row_at(op, keys.slot(), CurryLevel::new(row)));
         proj_named_field(paired, &tuple_field(0), CurryLevel::new(row + 1))
     })
 }
@@ -5947,12 +5951,12 @@ fn lift_into_level(
 ///
 /// Produces `MapResult(input, Constant(RecordField(name)))`.
 fn proj_named_field(
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     name: &str,
     level: CurryLevel,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     if selects_a_tile(input.tiling(), name) {
-        return Ok(Box::new(SelectField::new(input, name)));
+        return Ok(Arc::new(SelectField::new(input, name)));
     }
     let record_extent = value_extent_at(input.tiling(), level);
     let field_extent = field_extent_of(&record_extent, name)?;
@@ -5961,9 +5965,9 @@ fn proj_named_field(
         domain: Box::new(record_extent),
         codomain: Box::new(field_extent),
     };
-    Ok(Box::new(MapResult::new_at(
+    Ok(Arc::new(MapResult::new_at(
         input,
-        Box::new(Constant::new(fn_value, fn_extent)),
+        Arc::new(Constant::new(fn_value, fn_extent)),
         level,
     )))
 }
@@ -5974,10 +5978,10 @@ fn proj_named_field(
 /// `DataFunction` over some domain (morphism context) or as a `Scalar`
 /// constant record (scalar context).  Returns `MapResult(input, Constant(BinOp(op)))`.
 fn apply_binop(
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     op: InterpreterBinOp,
     level: CurryLevel,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let record_extent = value_extent_at(input.tiling(), level);
     let out_extent = binop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::BinOp(op));
@@ -5985,9 +5989,9 @@ fn apply_binop(
         domain: Box::new(record_extent),
         codomain: Box::new(out_extent),
     };
-    Ok(Box::new(MapResult::new_at(
+    Ok(Arc::new(MapResult::new_at(
         input,
-        Box::new(Constant::new(fn_value, fn_extent)),
+        Arc::new(Constant::new(fn_value, fn_extent)),
         level,
     )))
 }
@@ -6006,20 +6010,20 @@ fn fusable_prefix(chain: &[Expr], input: &Tiling, level: CurryLevel) -> Option<s
 
 /// `MapResult(input, Constant(Scalar(expr)))`: one pass over the column the chain started from.
 fn apply_scalar_expr(
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     program: ScalarProgram,
     domain: Extent,
     codomain: Extent,
     level: CurryLevel,
-) -> Box<dyn TileOperator> {
+) -> Arc<dyn TileOperator> {
     let fn_value = Value::ComputableFunction(FunctionDef::Scalar(program));
     let fn_extent = Extent::Function {
         domain: Box::new(domain),
         codomain: Box::new(codomain),
     };
-    Box::new(MapResult::new_at(
+    Arc::new(MapResult::new_at(
         input,
-        Box::new(Constant::new(fn_value, fn_extent)),
+        Arc::new(Constant::new(fn_value, fn_extent)),
         level,
     ))
 }
@@ -6029,9 +6033,9 @@ fn apply_scalar_expr(
 fn realized(
     operands: &[Expr],
     expr: &Expr,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
     // `lambda_elim`, carries no binder, so no kind is here to bound the legs' keys.
     assert!(
@@ -6111,9 +6115,9 @@ fn union_operand_ops(
     operands: &[Expr],
     shape: UnionShape,
     declared_codomain: Extent,
-    input: Option<Box<dyn TileOperator>>,
+    input: Option<Arc<dyn TileOperator>>,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     // A flat union merges its arms by key and keeps no record of which arm delivered one, so
     // its arms must be disjoint by how they were built; a debug build checks the shape here.
     if cfg!(debug_assertions)
@@ -6131,10 +6135,10 @@ fn union_operand_ops(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(match shape {
                 UnionShape::Copair { tags } => {
-                    Box::new(UnionOperator::new_tagged(ops, tags, declared_codomain))
-                        as Box<dyn TileOperator>
+                    Arc::new(UnionOperator::new_tagged(ops, tags, declared_codomain))
+                        as Arc<dyn TileOperator>
                 }
-                UnionShape::DisjointJoin { over } => Box::new(UnionOperator::new_flat_over(
+                UnionShape::DisjointJoin { over } => Arc::new(UnionOperator::new_flat_over(
                     ops,
                     over,
                     declared_codomain,
@@ -6177,12 +6181,12 @@ fn union_operand_ops(
                 .level()
                 .enclosing()
                 .expect("a fed disjoint join partitions the keys its input stands at, and a scalar has none");
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
+            let fan = Arc::new(FanOut::new(Arc::new(Memo::new(inp))));
             let ops = operands
                 .iter()
                 .map(|e| convert_impl(e, Some(fan.slot()), ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Box::new(UnionOperator::new_flat_over(
+            Ok(Arc::new(UnionOperator::new_flat_over(
                 ops,
                 over,
                 declared_codomain,
@@ -6197,10 +6201,10 @@ fn union_operand_ops(
 /// `input` must have a `DataFunction` tiling.
 /// Returns `MapResult(input, Constant(UnaryOp(op)))`.
 fn apply_unaryop(
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     op: UnaryOpKind,
     level: CurryLevel,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let in_extent = value_extent_at(input.tiling(), level);
     let out_extent = unaryop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::UnaryOp(op));
@@ -6208,19 +6212,19 @@ fn apply_unaryop(
         domain: Box::new(in_extent),
         codomain: Box::new(out_extent),
     };
-    Ok(Box::new(MapResult::new_at(
+    Ok(Arc::new(MapResult::new_at(
         input,
-        Box::new(Constant::new(fn_value, fn_extent)),
+        Arc::new(Constant::new(fn_value, fn_extent)),
         level,
     )))
 }
 
 fn apply_aggregate(
-    input: Box<dyn TileOperator>,
+    input: Arc<dyn TileOperator>,
     op: AggregateKind,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    Ok(Box::new(ExtractAggregate::new(
-        Box::new(Aggregate::new(input, op)),
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
+    Ok(Arc::new(ExtractAggregate::new(
+        Arc::new(Aggregate::new(input, op)),
         op,
         true,
     )))
@@ -6314,19 +6318,19 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
 /// share with, so it reads the input directly. A leaf arm is a source over its own domain and
 /// reads none (`is_leaf_zip_arm`).
 enum ZipReaders {
-    Lone(Option<Box<dyn TileOperator>>),
-    Fan(Rc<FanOut>),
+    Lone(Option<Arc<dyn TileOperator>>),
+    Fan(Arc<FanOut>),
 }
 
 impl ZipReaders {
     fn new<'e>(
-        input: Box<dyn TileOperator>,
+        input: Arc<dyn TileOperator>,
         arms: impl Iterator<Item = &'e Expr>,
         ctx: &OpConversionContext,
     ) -> Self {
         match arms.filter(|e| !is_leaf_zip_arm(e, ctx)).count() {
             1 => Self::Lone(Some(input)),
-            _ => Self::Fan(Rc::new(FanOut::new(Box::new(Memo::new(input))))),
+            _ => Self::Fan(Arc::new(FanOut::new(Arc::new(Memo::new(input))))),
         }
     }
 
@@ -6336,7 +6340,7 @@ impl ZipReaders {
         &mut self,
         arm: &Expr,
         ctx: &OpConversionContext,
-    ) -> Option<Box<dyn TileOperator>> {
+    ) -> Option<Arc<dyn TileOperator>> {
         if is_leaf_zip_arm(arm, ctx) {
             return None;
         }
@@ -6388,7 +6392,7 @@ struct NestedStoreRead<'a> {
 fn convert_nested_store_read(
     read: NestedStoreRead<'_>,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let mut op = convert_store_read(read.at, &read.store, &read.field, ctx)?;
     for step in read.steps {
         op = convert_lifted(step, Some(op), ctx)?;
@@ -6506,7 +6510,7 @@ fn convert_permute_domain(
     function: &Expr,
     argument: &Expr,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let TypedExprNode::Apply {
         function: inner_func,
         argument: inner_arg,
@@ -6518,7 +6522,7 @@ fn convert_permute_domain(
 
     let permutation = extract_usize_list(inner_arg)?;
 
-    Ok(Box::new(PermuteRecordDomain::new(
+    Ok(Arc::new(PermuteRecordDomain::new(
         convert_impl(argument, None, ctx)?,
         permutation,
     )))
@@ -6536,7 +6540,7 @@ fn convert_flatten_domain(
     function: &Expr,
     argument: &Expr,
     ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
+) -> Result<Arc<dyn TileOperator>, ConversionError> {
     let TypedExprNode::Apply {
         function: inner_func,
         argument: inner_arg,
@@ -6548,7 +6552,7 @@ fn convert_flatten_domain(
 
     let flatten_indices = extract_usize_list(inner_arg)?;
 
-    Ok(Box::new(FlattenTupleDomain::new(
+    Ok(Arc::new(FlattenTupleDomain::new(
         convert_impl(argument, None, ctx)?,
         flatten_indices,
     )))
@@ -6667,10 +6671,12 @@ mod variant_ctor_tests {
 
     /// Drive an operator once and return its tile: each breaker beneath it consumes its input
     /// whole, inputs before readers, and the operator is then read whole.
-    fn drive(op: Box<dyn TileOperator>) -> Tile {
-        let mut op = op;
+    fn drive(op: Arc<dyn TileOperator>) -> Tile {
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let mut producer =
+            op.clone()
+                .clone()
+                .subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         crate::interpreter::tile_operators::test_helpers::consume_breakers(&mut *producer);
         producer.read_in_pipeline(producer.tiling().universal_guard())
     }
@@ -6817,7 +6823,7 @@ mod variant_ctor_tests {
             &self.tiling
         }
         fn subscribe(
-            &mut self,
+            self: Arc<Self>,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _cx: &mut SubscribeContext,
@@ -6975,7 +6981,7 @@ mod variant_ctor_tests {
         );
         let stream_tiling =
             Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(stream_extent));
-        let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
+        let stream_op: Arc<dyn TileOperator> = Arc::new(FixedStreamOp {
             tile: stream_tile,
             tiling: stream_tiling,
         });
@@ -7089,7 +7095,7 @@ mod variant_ctor_tests {
         let transformer = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
 
         // Drive over the value stream [0, 1] (injected at the op boundary).
-        let stream_op: Box<dyn TileOperator> = Box::new(FixedStreamOp {
+        let stream_op: Arc<dyn TileOperator> = Arc::new(FixedStreamOp {
             tile: Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1]))),

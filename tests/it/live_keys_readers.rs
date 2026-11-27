@@ -3,9 +3,6 @@
 //! row the predicate rejects, and observes the reader through what it releases from the source
 //! and what it answers.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use cambra::ccl::Type;
 use cambra::interpreter::tile_operators::{
     Converse, ExtractFinal, InputId, IterateExtent, MapResultWithSource, Restrict, Tile,
@@ -15,28 +12,32 @@ use cambra::interpreter::{
     BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, FunctionGuard, Predicate,
     SubscribeContext, TestDataSource, TileGuard, Value,
 };
+use std::sync::PoisonError;
 
 /// A still-open source of flags `0 ↦ true, 1 ↦ true, 2 ↦ false`, and the `Restrict` keeping
 /// the keys flagged `true`: key `2` stays in its domain column, marked deleted.
-fn restricted_flags() -> (Rc<RefCell<TestDataSource>>, Restrict) {
-    let src = Rc::new(RefCell::new(TestDataSource::new(
+fn restricted_flags() -> (cambra::ccl::SourceDefinition<TestDataSource>, Restrict) {
+    let src = TestDataSource::new(
         "flags",
         Type::Base(BaseType::Bool),
         Extent::Base(BaseType::Bool),
-    )));
-    src.borrow_mut().add_data(&[
-        (Value::UInt(0), Value::Bool(true)),
-        (Value::UInt(1), Value::Bool(true)),
-        (Value::UInt(2), Value::Bool(false)),
-    ]);
-    src.borrow_mut()
+    );
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_data(&[
+            (Value::UInt(0), Value::Bool(true)),
+            (Value::UInt(1), Value::Bool(true)),
+            (Value::UInt(2), Value::Bool(false)),
+        ]);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(2)));
-    let dyn_src: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+    let dyn_src: std::sync::Arc<std::sync::RwLock<dyn DataSourceDomainExtentImpl>> = src.runtime();
     let flags = MapResultWithSource::new(
         dyn_src.clone(),
-        Box::new(IterateExtent::new(Extent::DataSourceDomain(dyn_src))),
+        std::sync::Arc::new(IterateExtent::new(Extent::DataSourceDomain(dyn_src))),
     );
-    (src, Restrict::new(Box::new(flags)))
+    (src, Restrict::new(std::sync::Arc::new(flags)))
 }
 
 /// `ExtractFinal` keeps the row at the highest live position, `1`, of what it consumes from an
@@ -45,8 +46,10 @@ fn restricted_flags() -> (Rc<RefCell<TestDataSource>>, Restrict) {
 #[test]
 fn extract_final_keeps_the_highest_live_position() {
     let (src, restricted) = restricted_flags();
-    let mut op = ExtractFinal::without_default(Box::new(restricted));
-    let mut reader = op.subscribe(
+    let op = std::sync::Arc::new(ExtractFinal::without_default(std::sync::Arc::new(
+        restricted,
+    )));
+    let mut reader = op.clone().subscribe(
         op.tiling().universal_guard(),
         Box::new(|| {}),
         &mut SubscribeContext::new(),
@@ -63,10 +66,14 @@ fn extract_final_keeps_the_highest_live_position() {
     };
     consume_whole();
     assert_eq!(
-        src.borrow().get_released_predicate(),
+        src.read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_released_predicate(),
         Predicate::at_or_below(Value::UInt(2)),
     );
-    src.borrow_mut().set_yield_predicate(Predicate::True);
+    src.write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .set_yield_predicate(Predicate::True);
     consume_whole();
     let guard = reader.tiling().universal_guard();
     assert_eq!(
@@ -81,8 +88,8 @@ fn extract_final_keeps_the_highest_live_position() {
 #[test]
 fn converse_holds_no_deleted_row() {
     let (src, restricted) = restricted_flags();
-    let mut op = Converse::new(Box::new(restricted));
-    let mut producer = op.subscribe(
+    let op = std::sync::Arc::new(Converse::new(std::sync::Arc::new(restricted)));
+    let mut producer = op.clone().subscribe(
         op.tiling().universal_guard(),
         Box::new(|| {}),
         &mut SubscribeContext::new(),
@@ -91,5 +98,10 @@ fn converse_holds_no_deleted_row() {
     cambra::interpreter::dispatcher::read_for_test(&mut *producer, guard);
     let value_two = Predicate::from_column_value(&ColumnValue::from_uints(vec![2]));
     producer.release(TileGuard::Function(FunctionGuard::Domain(value_two)));
-    assert_eq!(src.borrow().get_released_predicate(), Predicate::False);
+    assert_eq!(
+        src.read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_released_predicate(),
+        Predicate::False
+    );
 }
