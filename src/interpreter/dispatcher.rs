@@ -64,6 +64,23 @@ pub struct WorkPackage {
     pub(crate) index: usize,
 }
 
+impl WorkPackage {
+    fn consume<'b>(
+        &self,
+        breaker: &'b dyn Breaker,
+        input: InputId,
+        pushes: &mut Pushes<'_>,
+    ) -> Option<&'b dyn BreakingProducer> {
+        debug_assert!(
+            self.guard.check_from(&breaker.input_tiling(input)),
+            "pipeline {} consumes a guard of the tiling its breaker's input answers: {:?}",
+            self.pipeline.0,
+            self.guard
+        );
+        breaker.consume_for_dispatch(input, self.guard.clone(), pushes)
+    }
+}
+
 /// What a source's notify did with a region ([`Dispatcher::try_notify`]).
 pub enum Admission {
     /// The region is queued, or names nothing.
@@ -1799,9 +1816,17 @@ impl Pushes<'_> {
     /// Push `region` to `reader` alone, through its usual notification path once the breaker has
     /// released its borrow. The breaker's other readers keep their own frontier.
     pub(crate) fn push_to(&mut self, reader: SharedConsumer, region: Projection) {
-        if !self.dispatcher.infos[self.pipeline].readers.is_empty() {
+        if self.has_readers() {
             self.pending.push(Push::Reader(reader, region));
         }
+    }
+
+    pub(crate) fn has_readers(&self) -> bool {
+        !self.dispatcher.infos[self.pipeline].readers.is_empty()
+    }
+
+    pub(crate) fn morsel_rows(&self) -> usize {
+        self.dispatcher.morsel_rows
     }
 
     /// Push what `breaker` has completed and the pipeline has not pushed before, its final guard
@@ -1816,9 +1841,28 @@ impl Pushes<'_> {
     /// Where the guard algebra has no exact difference of the two ([`guard_minus`]); in a debug
     /// build, when the morsels do not partition what is pushed ([`partition_gap`]).
     pub fn push_final<B: BreakingProducer + ?Sized>(&mut self, breaker: &B) {
-        if self.dispatcher.infos[self.pipeline].readers.is_empty() {
+        if !self.has_readers() {
             return;
         }
+        // A push names a projection of the breaker's keys, so it pushes the part of the final
+        // guard a projection spells. The rest, such as a record whose collection field is
+        // complete through some rows, is pushed once a projection spells what it has grown to, at
+        // the latest once it is whole, which a finish checks.
+        let complete = breaker.final_guard();
+        let spelled = spelled_part(&complete).unwrap_or_else(|| breaker.tiling().empty_guard());
+        self.unspelled = Projection::of(&complete).is_err() && !complete.is_empty();
+        self.push_region(breaker, &spelled, |guard, rows| {
+            breaker.morsels(guard, rows)
+        });
+    }
+
+    /// Record a publishable region once across all claimants, then cut only its new part.
+    pub(crate) fn push_region<B: BreakingProducer + ?Sized>(
+        &mut self,
+        breaker: &B,
+        region: &TileGuard,
+        cut: impl FnOnce(&TileGuard, usize) -> Vec<TileGuard>,
+    ) {
         let to = breaker.base().downstream.clone();
         self.dispatcher.ensure(to.is_some(), || {
             format!(
@@ -1828,18 +1872,11 @@ impl Pushes<'_> {
             )
         });
         self.to = to;
-        // A push names a projection of the breaker's keys, so it pushes the part of the final
-        // guard a projection spells. The rest, such as a record whose collection field is
-        // complete through some rows, is pushed once a projection spells what it has grown to, at
-        // the latest once it is whole, which a finish checks.
-        let complete = breaker.final_guard();
-        let spelled = spelled_part(&complete).unwrap_or_else(|| breaker.tiling().empty_guard());
-        self.unspelled = Projection::of(&complete).is_err() && !complete.is_empty();
         let guard = self.record(|pushed| match pushed {
-            Some(pushed) => guard_minus(&spelled, pushed),
-            None => spelled.clone(),
+            Some(pushed) => guard_minus(region, pushed),
+            None => region.clone(),
         });
-        self.cut(&guard, |guard, rows| breaker.morsels(guard, rows));
+        self.cut(&guard, cut);
     }
 
     /// Add the region `next` computes from the region pushed so far to that region, under its
@@ -2695,31 +2732,13 @@ pub(crate) fn consume(dispatcher: &Dispatcher, breakers: &[BreakerHandle], packa
 }
 
 fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPackage) {
-    let p = package.pipeline.0;
-    // The pushes land once the reach has returned: a breaker reached through a fan-out slot is
-    // called while the walk holds the fan-out, which the push climbs.
-    let mut landed = None;
+    let mut pushes = dispatcher.pushes(package.pipeline);
     reach(package.pipeline, &mut |breaker, input| {
-        let tiling = breaker.input_tiling(input);
-        // A package carries a guard of the tiling of the pipeline that pushed it, or of this
-        // breaker's own input for a source or a pipeline that reads it whole, so it fits only a
-        // breaker whose input answers that tiling.
-        debug_assert!(
-            package.guard.check_from(&tiling),
-            "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
-            package.guard
-        );
-
-        breaker.consume_impl(input, package.guard.clone());
-        if let Some(producer) = breaker.as_producer()
-            && producer.pushes_while_consuming()
-        {
-            let mut pushes = dispatcher.pushes(package.pipeline);
+        if let Some(producer) = package.consume(breaker, input, &mut pushes) {
             pushes.push_final(producer);
-            landed = Some(pushes);
         }
     });
-    if let Some(pushes) = landed {
+    if !pushes.pending.is_empty() {
         dispatcher.land(pushes);
     }
     dispatcher.acknowledge(package);
@@ -3121,6 +3140,34 @@ mod tests {
         assert_eq!(overlapping.guard, keys_between(5, 14));
         for package in [disjoint, overlapping] {
             dispatcher.acknowledge(package);
+        }
+    }
+
+    #[test]
+    fn disjoint_fields_can_be_claimed_on_the_same_row() {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record([("a".into(), scalar.clone()), ("b".into(), scalar)].into()),
+        );
+        let field = |key, name| {
+            Projection::within(
+                crate::interpreter::CurryLevel::OUTERMOST,
+                Predicate::point(Value::UInt(key)),
+                Projection::of_field(name, Projection::Everything),
+            )
+            .guard(&tiling)
+        };
+        let first = field(0, "a");
+        let other = field(1, "b");
+        let same = field(0, "b");
+        assert!(first.intersect(&same).is_empty());
+        let queue = Queue::new();
+        let guards = [first, other, same];
+        queue.append(&guards);
+        for guard in guards {
+            let (package, ()) = queue.claim(0, false, || Some(())).expect("disjoint field");
+            assert_eq!(package.guard, guard);
         }
     }
 

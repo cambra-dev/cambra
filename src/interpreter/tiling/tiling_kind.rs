@@ -246,8 +246,7 @@ impl Tiling {
                     domain,
                     Predicate::False,
                 )),
-                terminal: false,
-                closed_keys: Vec::new(),
+                closures: crate::interpreter::StoreClosures::uniform(false),
             },
         }
     }

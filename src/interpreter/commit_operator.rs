@@ -772,8 +772,7 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
                 false => Predicate::False,
             },
         )),
-        terminal,
-        closed_keys: Vec::new(),
+        closures: crate::interpreter::StoreClosures::uniform(terminal),
     }
 }
 
@@ -793,8 +792,8 @@ fn empty_engines_tile(tiling: &Tiling, complete: &[Predicate], terminal: bool) -
             *domain_predicate = pred.clone();
         }
     }
-    if let Tile::Store { terminal: t, .. } = tile.values_at_mut(CurryLevel::values_of(tiling)) {
-        *t = terminal;
+    if let Tile::Store { closures, .. } = tile.values_at_mut(CurryLevel::values_of(tiling)) {
+        *closures = crate::interpreter::StoreClosures::uniform(terminal);
     }
     tile
 }
@@ -1564,16 +1563,16 @@ impl CommitProducer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let breaker = &state.breaker;
         let Some(Tile::Store {
-            closed_keys,
-            frontier,
-            terminal: false,
-            ..
+            closures, frontier, ..
         }) = &breaker.snapshot
         else {
-            // Whole-store completion already reaches every reader through push_final.
             return;
         };
-        if closed_keys.len() == self.pushed_closed.len() {
+        // A flat commit store has one row. Whole-store completion reaches every reader
+        // through push_final, while an individual key closes only its own readers.
+        let end = closures.at(0);
+        let closed_keys = &end.closed_keys;
+        if end.terminal || closed_keys.len() == self.pushed_closed.len() {
             return;
         }
         let tail = Projection::admitting(Predicate::True.minus(&running_frontier(frontier)));
@@ -2334,35 +2333,8 @@ fn decode_source_paths(tile: &Tile, levels: usize) -> Vec<(Path, Tile)> {
 /// the ordinary row retain — which is what lets the fold, the frontier and the seed
 /// machinery read a nested row with no second implementation of any of them.
 pub fn store_row(store: &Tile, row: usize, rows: usize) -> Tile {
-    let Tile::Store {
-        state,
-        seed,
-        decided,
-        frontier,
-        terminal,
-        closed_keys,
-    } = store
-    else {
-        // Every caller has descended to the level whose values are the stores, and a
-        // `Tiling::Store` renders as a `Tile::Store` even when empty. Returning the input
-        // unchanged instead hands back the *whole* level, which reads as a one-row answer
-        // and silently folds one enclosing position's writes into the next.
-        unreachable!("store_row takes a row of a vectorized store, got {store:?}")
-    };
-    let keep = (0..rows).map(|i| i == row).collect::<Vec<bool>>();
-    let retained = |t: &Tile| {
-        let mut t = t.clone();
-        t.retain_rows(&keep);
-        Box::new(t)
-    };
-    Tile::Store {
-        state: retained(state),
-        seed: retained(seed),
-        decided: retained(decided),
-        frontier: retained(frontier),
-        terminal: *terminal,
-        closed_keys: closed_keys.clone(),
-    }
+    assert!(matches!(store, Tile::Store { .. }) && row < rows && store.rows() == rows);
+    store.select_rows(&[row])
 }
 
 /// The commit clock as a store domain: the `Txn` sequencing order, a `UInt` counter.
@@ -3083,16 +3055,8 @@ impl CommitProducer {
         // A store with **no** writers is trivially terminal (no commit can ever
         // happen) — `all()` over the empty writer set is `true`, which is what we
         // want, so there is no `is_empty()` guard.
-        if let Tile::Store {
-            terminal,
-            closed_keys,
-            ..
-        } = &mut store
-        {
-            if state.writer_terminal.iter().all(|&t| t) {
-                // Close the frontier (no more commits), keeping its numeric watermark.
-                *terminal = true;
-            }
+        if let Tile::Store { closures, .. } = &mut store {
+            let terminal = closures.terminal() || state.writer_terminal.iter().all(|&t| t);
             // Per-key closure: a key is closed once every writer whose write set
             // contains it is terminal, which is no later than the whole store and
             // earlier whenever some other writer is still running. This is what lets
@@ -3113,7 +3077,11 @@ impl CommitProducer {
             }
             #[cfg(debug_assertions)]
             state.reported_closed.extend(closed.iter().cloned());
-            *closed_keys = closed;
+            *closures =
+                crate::interpreter::StoreClosures::Uniform(crate::interpreter::StoreClosure {
+                    terminal,
+                    closed_keys: closed,
+                });
         }
         debug_assert!(
             store.check_from(self.tiling()),
@@ -4371,10 +4339,7 @@ impl TileProducer for StoreValueStreamProducer {
         // domain predicate so a downstream terminal read resolves; a live one
         // carries the store's `at_or_below` watermark through.
         let Tile::Store {
-            frontier,
-            terminal,
-            closed_keys,
-            ..
+            frontier, closures, ..
         } = &store
         else {
             unreachable!("StoreValueStream's constructor requires a store source; got {store:?}")
@@ -4387,11 +4352,8 @@ impl TileProducer for StoreValueStreamProducer {
         // ticks that wrote some other key, so per-key closure would report terminal
         // while positions are still arriving; only the whole store closing can close
         // it.
-        let closed = if self.carry_forward {
-            *terminal
-        } else {
-            *terminal || closed_keys.contains(&self.key)
-        };
+        let end = closures.at(0);
+        let closed = end.terminal || (!self.carry_forward && end.closed_keys.contains(&self.key));
         let domain_predicate = if closed {
             Predicate::True
         } else {
@@ -4625,11 +4587,9 @@ impl TileProducer for StoreFinalReadProducer {
                 .remember(domain_prefix_over(vec![frontier.into_value()], &levels));
         }
         let settled = match &store {
-            Tile::Store {
-                terminal,
-                closed_keys,
-                ..
-            } => *terminal || closed_keys.contains(&self.key),
+            Tile::Store { closures, .. } => {
+                closures.at(0).terminal || closures.at(0).closed_keys.contains(&self.key)
+            }
             _ => false,
         };
         if !settled {
@@ -11922,8 +11882,8 @@ mod tests {
 
         // Once the store is terminal, so is the stream — and `ExtractFinal` over
         // it gives the final value 60 (the latest committed entry).
-        if let Tile::Store { terminal, .. } = &mut store_tile {
-            *terminal = true;
+        if let Tile::Store { closures, .. } = &mut store_tile {
+            *closures = crate::interpreter::StoreClosures::uniform(true);
         }
         let stream = StoreValueStream::new(
             Arc::new(FixedSource {
@@ -11992,8 +11952,8 @@ mod tests {
         // Terminal: closing the whole domain (the numeric frontier `≤ 2` is kept, not
         // rewritten) must fold identically.
         let mut terminal = live.clone();
-        if let Tile::Store { terminal, .. } = &mut terminal {
-            *terminal = true;
+        if let Tile::Store { closures, .. } = &mut terminal {
+            *closures = crate::interpreter::StoreClosures::uniform(true);
         }
         assert_eq!(store_frontier(&terminal), Some(pos(2)));
         assert_eq!(
@@ -12100,10 +12060,10 @@ mod tests {
             HashMap::from([("xs".into(), Tiling::Scalar(value_extent.clone()))]),
         );
         let mut tile = engine.render_full_store_tile(&store_tiling);
-        let Tile::Store { terminal, .. } = &mut tile else {
+        let Tile::Store { closures, .. } = &mut tile else {
             unreachable!()
         };
-        *terminal = true;
+        *closures = crate::interpreter::StoreClosures::uniform(true);
         let read = Arc::new(StoreFinalRead::new(
             Arc::new(FixedSource {
                 tiling: store_tiling,
@@ -12338,8 +12298,7 @@ mod tests {
                 Some(Value::UInt(w)) => ColumnValue::from_uints(vec![w]),
                 _ => ColumnValue::from_uints(vec![]),
             })),
-            terminal: false,
-            closed_keys: Vec::new(),
+            closures: crate::interpreter::StoreClosures::uniform(false),
         };
         assert!(validate_tile(&tile), "store_tile built an invalid tile");
         tile
@@ -12584,8 +12543,7 @@ mod tests {
             seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(vec![]))),
             frontier: Box::new(one_row_decided(ColumnValue::from_uints(vec![]))),
-            terminal: false,
-            closed_keys: Vec::new(),
+            closures: crate::interpreter::StoreClosures::uniform(false),
         };
         let one_key = |log: Tile| store(Tile::record(HashMap::from([("a".into(), log)])));
         // Non-ascending change ticks.
@@ -12602,8 +12560,7 @@ mod tests {
             seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(decided))),
             frontier: Box::new(one_row_decided(ColumnValue::from_uints(frontier))),
-            terminal: false,
-            closed_keys: Vec::new(),
+            closures: crate::interpreter::StoreClosures::uniform(false),
         };
         assert!(validate_tile(&decided_through(vec![0, 1], vec![1])));
         assert!(!validate_tile(&decided_through(vec![0, 2], vec![1])));
