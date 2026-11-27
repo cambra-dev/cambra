@@ -11,7 +11,7 @@ use bit_set::BitSet;
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::interpreter::{
-    Consumer, Projection, RowIndex, SubscribeContext, Value, shared_consumer, tuple_field,
+    Consumer, Projection, SubscribeContext, Value, shared_consumer, tuple_field,
 };
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
@@ -735,11 +735,6 @@ impl TileProducer for ZipProducer {
                          two arms gave back separately have no skeleton to stand on"
                     );
                 }
-                let skeleton_levels: Vec<(Vec<RowIndex>, ColumnValue)> =
-                    filtered_tiles[skeleton_at].key_levels()[..self.level.index()]
-                        .iter()
-                        .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
-                        .collect();
                 let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
                 let mut absent: HashMap<SmolStr, BitSet> = HashMap::new();
                 // What a level inside a value states is the pair's to say only beneath the rows it
@@ -768,18 +763,8 @@ impl TileProducer for ZipProducer {
                         );
                     }
                     if held == rows {
-                        // Presence is intersected over the outermost keys only, so arms that
-                        // disagree beneath them would pair one arm's values under another's
-                        // keys.
-                        assert!(
-                            filtered.key_levels()[..self.level.index()]
-                                .iter()
-                                .map(|(starts, keys)| (starts.to_vec(), (*keys).clone()))
-                                .eq(skeleton_levels.iter().cloned()),
-                            "Zip: inputs disagree on the {} levels above the pair, after \
-                             aligning them: {skeleton_levels:?} against {filtered:?}",
-                            self.level.index(),
-                        );
+                        // Equal item paths put the values in the same order. Empty groups
+                        // can occupy different positions without contributing any values.
                         codomains.push(values);
                         continue;
                     }
@@ -2349,6 +2334,73 @@ mod tests {
     }
 
     // ── ZipProducer: asymmetric per-branch presence ────────────────────────
+
+    #[test]
+    fn zip_pairs_items_when_its_arms_store_an_empty_group_in_different_positions() {
+        let grouped = |parents, starts, values| {
+            Tile::data_function(
+                ColumnValue::UInts(parents),
+                Box::new(Tile::grouped(
+                    starts,
+                    ColumnValue::UInts(vec![3, 4]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let levels = |values| {
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::data_function(Extent::Base(BaseType::UInt), values),
+            )
+        };
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let inputs = [
+            (vec![7, 8], vec![0, 2], vec![13, 14]),
+            (vec![8, 7], vec![0, 0], vec![23, 24]),
+        ]
+        .into_iter()
+        .map(|(parents, starts, values)| {
+            Box::new(TestTileProducer::new(
+                grouped(parents, starts, values),
+                levels(int.clone()),
+            )) as Box<dyn TileProducer>
+        })
+        .collect();
+        let output = levels(Tiling::tuple(&[int.clone(), int]));
+        let mut zip = ZipProducer {
+            level: CurryLevel::new(2),
+            state: Mutex::new(ZipState::new(2)),
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &output),
+            names: (0..2).map(tuple_field).collect(),
+            inputs,
+        };
+        let result = zip.read_in_pipeline(output.universal_guard());
+        assert!(
+            result
+                .paths_at(CurryLevel::OUTERMOST)
+                .contains(&vec![Value::UInt(8)])
+        );
+        assert_eq!(
+            result.paths_at(CurryLevel::new(1)),
+            [
+                vec![Value::UInt(7), Value::UInt(3)],
+                vec![Value::UInt(7), Value::UInt(4)]
+            ]
+        );
+        let Tile::Record { fields, .. } = result.values_at(CurryLevel::new(2)) else {
+            panic!("zip pairs its inputs");
+        };
+        for (index, expected) in [(0, vec![13, 14]), (1, vec![23, 24])] {
+            assert_eq!(
+                scalar_tile_to_column_value(fields[&tuple_field(index)].clone()),
+                ColumnValue::Ints(expected)
+            );
+        }
+    }
 
     /// Two `DataFunction` inputs with different sets of present positions.
     /// The output should restrict to the intersection of those positions.
