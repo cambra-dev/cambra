@@ -1683,6 +1683,8 @@ impl Tile {
     /// constructing the guards. Doing it this way significantly reduces the fragmentation of
     /// the obsolete guards, which lets them use smaller representations.
     pub fn to_guard(&self) -> TileGuard {
+        #[cfg(test)]
+        memo::check_cache_snapshot(self);
         // A guard names what the consumer may **release**: every key whose value is
         // complete, by its path, and within an open key whatever of it has keys of its own.
         // A record names completed fields under their own enclosing paths.

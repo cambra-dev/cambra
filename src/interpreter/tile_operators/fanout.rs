@@ -1922,11 +1922,11 @@ impl MemoProducer {
                 .unwrap_or_else(PoisonError::into_inner);
             let obsolete = self.obsolete_guard();
             if !obsolete.is_empty() {
-                answer.remove_guarded(obsolete);
+                answer.remove_guarded(obsolete.clone());
                 answer.compact();
                 answer.restrict_to(projection, self.tiling());
             }
-            cache.append(answer, projection, self.tiling())
+            cache.append(answer, projection, self.tiling(), &obsolete)
         };
         self.input.release(released);
         if let Some(pushes) = pushes.filter(|p| p.has_readers()) {
@@ -1979,7 +1979,7 @@ impl MemoProducer {
             .cached_tile
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        let delta = cache.append(input, &projection, self.tiling());
+        let delta = cache.append(input, &projection, self.tiling(), &self.obsolete_guard());
 
         if let Projection::Keys { level, keys } = &projection {
             let complete = cache.completion_at(*level).intersect(keys);

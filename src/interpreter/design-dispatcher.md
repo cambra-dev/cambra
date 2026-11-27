@@ -664,7 +664,9 @@ A worker consumes, publishes and acknowledges its own claim, in that order:
      completes a row pushes the row's end, and a closure-only delivery can complete several
      ancestor rows at once. Collections of scalar items, a selected record field among them,
      record their completed paths in the collection statements.
-   - Other irregular shapes compare the cache before and after the merge.
+   - For other shapes, append subtracts the relevant prior coverage and releases from
+     the incoming region and the cache's completion statements. Nested record items
+     deliver their still-needed scalar fields together. Collection fields can keep growing.
 
    The worker releases its input, then pushes its delta, even where a peer's merge has already
    seen those paths in the cache. Two workers' deltas are disjoint because `Tile::append` returns
