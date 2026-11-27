@@ -849,6 +849,44 @@ impl ColumnValue {
         }
     }
 
+    /// Whether one collection's incoming key run names each item once.
+    pub(crate) fn has_unique_keys(&self) -> bool {
+        match self {
+            Self::UInts(v) if v.windows(2).all(|w| w[0] < w[1]) => true,
+            Self::Ints(v) if v.windows(2).all(|w| w[0] < w[1]) => true,
+            Self::Units(n) => *n <= 1,
+            _ => {
+                let mut seen = std::collections::HashSet::new();
+                (0..self.len()).all(|i| seen.insert(self.index_at(i)))
+            }
+        }
+    }
+
+    /// Insert a run at an enclosing row's end, keeping the following rows in order.
+    pub(crate) fn insert_column(&mut self, at: usize, incoming: ColumnValue) {
+        let len = self.len();
+        if at == len {
+            self.append(incoming);
+            return;
+        }
+        let added = incoming.len();
+        self.append(incoming);
+        // The common primitive columns can move the affected suffix in place. Composite
+        // columns use their existing gather to keep tags and child columns aligned.
+        match self {
+            Self::Units(_) => {}
+            Self::Bools(v) => v[at..].rotate_right(added),
+            Self::Ints(v) => v[at..].rotate_right(added),
+            Self::UInts(v) => v[at..].rotate_right(added),
+            Self::Strings(v) => v[at..].rotate_right(added),
+            Self::Variants(v) => v[at..].rotate_right(added),
+            _ => {
+                *self =
+                    self.select_indices((0..at).chain(len..len + added).chain(at..len), len + added)
+            }
+        }
+    }
+
     pub fn append(&mut self, other: ColumnValue) {
         match (self, other) {
             (ColumnValue::Units(s), ColumnValue::Units(o)) => *s += o,

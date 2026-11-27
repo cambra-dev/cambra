@@ -1052,9 +1052,11 @@ its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 ### Memo
 
 A memo answers every pull from its cache. `consume_impl` reads its input at the package's guard,
-merges the answer, and releases the region the answer states complete. A consume entirely within
-an already released region reads nothing. The dispatcher publishes the cached region after each
-consume. There is no notification gate or deferred wakeup queue.
+inserts each new keyed value once, and releases the region the answer states complete. An open
+parent can gain new children. A second payload for a completed key is a protocol error, even if
+the two values agree. A close can extend the completion statement without adding a value.
+A consume entirely within an already released region reads nothing. The dispatcher publishes the
+cached region after each consume. There is no notification gate or deferred wakeup queue.
 
 ### Aggregate
 
