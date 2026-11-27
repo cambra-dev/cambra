@@ -77,15 +77,19 @@ replaced by its definitions once those land on main.
   has no site yet.
 - **Source position.** An element of a source's domain: the number a source gives an element when
   it takes it, or a number the source states no element will take ([Observations](#observations)).
-- **Generation.** One build of an operator in the run. The operators of the run's first version
-  start the first generation, and a reload that rebuilds an operator starts a new one. A reload
-  that keeps an operator, in any branch, keeps its generation, and recovery never starts one. A
-  generation is named by an opaque ID that the implementation chooses: the first generation by one
-  fixed ID, and each later one by an ID its reload's entry records. Every key an operator mints
-  carries its generation, so two generations at one node share no key. No key carries a branch: an
-  operator that several branches hold mints one set of keys, and every branch holding it reads the
-  same observations. The generations at one node are ordered as the reload entries that started
-  them are in the observation log, after the first.
+- **Generation.** The epoch under which a term mints keys. The run's first version starts the
+  first generation of every term. A reload starts a new generation at a term when it rebuilds the
+  term and does not carry its keys: at a rebuilt store's clock, at a rebuilt minter of values whose
+  binding is not identified, and at an identified binding marked `@Discard`
+  ([Identified domains](#identified-domains)). A reload that keeps a term, in any branch, keeps its
+  generation, a reload that carries a rebuilt term's keys keeps it too, and recovery never starts
+  one. A generation is named by an opaque ID that the implementation chooses: the first generation
+  by one fixed ID, and each later one by an ID its reload's entry records. Every key a term mints
+  carries the generation current when it was minted, so two generations at one node share no key,
+  and a key the reload carries keeps the generation it was minted under. No key carries a branch:
+  an operator that several branches hold mints one set of keys, and every branch holding it reads
+  the same observations. The generations at one node are ordered as the reload entries that
+  started them are in the observation log, after the first.
 - **Kept and rebuilt.** A reload **keeps** a term when it keeps the earlier version's operator at
   the term's corresponding node, and **rebuilds** it when it builds a new operator there: because
   the term changed, because it reads a rebuilt binding, or because the reload cannot carry the
@@ -94,14 +98,18 @@ replaced by its definitions once those land on main.
   describes only a reload. After a crash the runtime **recovers** a term in the same version and
   generation, with the same keys.
 - **Position.** The iteration of each loop around an evaluation, outermost first, as the effects
-  work's spec defines it (#656). Each component is a pair: the loop's **domain**, which is the
-  operator the loop iterates, in its generation, and the loop's **iteration position** in it, an
-  index into the sequence the loop reads
-  ([Vocabulary](../src/ccl/design/program-evolution.md#vocabulary)). A reload keeps a domain when it
-  keeps the operator, and a source is kept by its module path and binding name. A loop over a
-  source, or over a filter of one, is at a source position. A loop over another collection, such as
-  the keys of a `group_by`, is at that collection's key. Inside a transaction's body, the position
-  of a reading or of the transaction's decision ends with the attempt index
+  work's spec defines it (#656). Each component is a pair: the loop's **domain**, the identity of
+  the collection the loop iterates, and the loop's **iteration position** in it, the key the
+  element takes in that collection
+  ([Vocabulary](../src/ccl/design/program-evolution.md#vocabulary)). The domain is a declaration
+  where one identifies the collection: a source's or a feed's, kept by module path and binding
+  name, or an identified binding's ([Identified domains](#identified-domains)). Otherwise the
+  domain is the operator that mints the collection's keys, in its generation. A map, a filter or a
+  comprehension over a collection copies its keys, so a loop over one is at the key, and in the
+  domain, of the collection it copies: a loop over a filter of a source is at a source position. A
+  loop over a feed is at the row's feed key, a loop over the keys of a `groupby` is at the group's
+  key, and a loop over `range(𝑛)` is at an index below `𝑛`. Inside a transaction's body, the
+  position of a reading or of the transaction's decision ends with the attempt index
   ([Transactions are keyed](#transactions-are-keyed-by-their-site-and-position)). An evaluation
   under no loop has the empty position. Examples write a component by its iteration position alone
   where no reload intervenes.
@@ -463,7 +471,7 @@ Consequences of the definition:
 - **A decision needs what its body reads.** A body that reads `time::now()` computes its record only
   where the reading at its key is in `𝑂`. Without that reading, `` `commit(𝑔, 5) `` at position `7`
   is not valid.
-- **A key through a derived domain needs what formed it.** In `for g in group_by(orders, sku):`, a
+- **A key through a derived domain needs what formed it.** In `for g in groupby(orders, sku):`, a
   reading at iteration position `A` is reached only where `𝐹(𝑂)` holds group `A`. After the orders
   that formed `A` are lost, the reading is not reached.
 - **A site's decisions are kept in order.** Suppose a withdrawal at position `𝑝` is denied at tick
@@ -487,15 +495,21 @@ crash loses was never part of the run ([Escape](#escape) says which ones may be 
 - **A reload [Decided].** A reading keeps its value at every key the reload keeps. A reload keeps a
   key when it keeps the key's site and the domain of every component of its position
   ([Terms](#terms)). A site the new version moves or adds is a new key, and so is a position under a
-  loop whose iterated term the reload rebuilt: both read anew. A reload keeps every site that does
-  not move, and a site moves only when one of its places moves
-  ([Stability](../src/ccl/design/sites.md#stability)). A call continues the earlier version's call
+  loop whose domain the reload rebuilt without carrying its keys: both read anew. A domain that is
+  a declaration is carried across any rebuild of the operator behind it
+  ([Identified domains](#identified-domains)). A reload keeps every site that does not move, and a
+  site moves only when one of the places that make it up moves
+  ([Places](../src/ccl/design/sites.md#places),
+  [Stability](../src/ccl/design/sites.md#stability)). A call continues the earlier version's call
   at the same site. The version that takes a reading does not own it; the run does.
 - **Changing a loop's collection.** A reload that changes `for o in orders:` to `for o in refunds:`
   keeps the reading's site and changes the loop's domain, so position `7` of `refunds` is a new key,
   and the reading taken at position `7` of `orders` is not reused. A reload that rebuilds `range(3)`
-  as `range(4)` starts a new generation of it, so the loop reaches iteration positions `0` through
-  `3` of the new generation and none of the keys whose entries the release model may have dropped.
+  as `range(4)` under a binding that is not identified starts a new generation of it, so the loop
+  reaches iteration positions `0` through `3` of the new generation and none of the keys whose
+  entries the release model may have dropped. Under an identified binding the reload carries
+  positions `0` through `2`, and the loop reaches `3` alone
+  ([Extending and dropping positions](#extending-and-dropping-positions)).
 
 A program needs no mutable variable to keep a reading. In `started = time::now()`, `started` is one
 instant for the run, and a reload that keeps the binding keeps the instant, as
@@ -505,6 +519,185 @@ A reading the new version takes can be earlier than one the run kept from an ear
 `deployed = time::now()`, a binding the reload adds, `deployed` reads the clock when the new version
 starts, and a kept `started` can be later than it. The readings of a weak clock carry no order
 ([7.5 Time](chl-spec.md#75-time-decided)).
+
+### Identified domains
+
+A **minter** is a term whose keys come from no input: a source, a feed, a store's clock, and a term
+that computes a collection from nothing it iterates, such as `range`, a collection literal, a
+`groupby` or a product of collections. Every other term copies the keys of what it reads. A loop's
+domain is the identity of the minter behind the collection it iterates ([Terms](#terms)), and a
+reload **carries** a domain when a position the earlier version's loop reached is the same position
+for the new version's loop.
+
+A domain is **identified** when a declaration names it, and a reload carries an identified domain
+across any rebuild of the operator behind it:
+
+- a source, by its module path and binding name;
+- a feed, by its declaration
+  ([A loop over a feed outlives a rebuild of the feed](#a-loop-over-a-feed-outlives-a-rebuild-of-the-feed));
+- a binding decorated `@Named`, by its `VarPath`, the scope its site stands in and its spelling, as
+  a store is identified
+  ([Inherit and load](../src/ccl/design/program-evolution.md#inherit-and-load),
+  [8.10 `@Named`](chl-spec.md#810-named-decided)).
+
+`@Named` decorates a binding whose term mints values. On a map, a filter, a comprehension or a
+feed it is refused, because the collection copies its keys from its input and a loop over it is in
+the input's domain; on a store or a source it is refused, because the declaration already
+identifies it. A loop over an unbound minter, `for i in range(𝑛):`, iterates no binding, so its
+domain is identified only once the author binds the collection.
+
+A minter of values whose binding is not identified is paired by content, as any binding is
+([Reuse is hereditary](../src/ccl/design/program-evolution.md#reuse-is-hereditary)), and a reload
+that rebuilds it starts a new generation, so none of its earlier keys is reached again. An
+identified binding is paired by its `VarPath`: a reload that renames it marks the new name
+`@RenamedFrom`, and a reload that drops a position of it, or the binding itself, marks it
+`@Discard` ([Extending and dropping positions](#extending-and-dropping-positions)).
+
+An identified binding inside a loop body, or inside a function body, is one domain per position of
+the loops around it and per call site, as a feed appended there is. The components of the position
+before the loop's own say which. Two bare calls of a function holding one are told apart by
+position alone, and a reload that reorders them is refused as it is for the stores they hold
+([Six refusals](../src/ccl/design/program-evolution.md#six-refusals)).
+
+**What a reload guarantees at each position of a carried domain.** At the swap each position of
+the domain is in one of three regions:
+
+- **Released.** Every consumer has released the position
+  ([Release](#terms)), so neither version reaches it again. Nothing is required.
+- **In flight.** The position is in the evaluation boundary of some term over the domain and is
+  not released: a term holds a value at it that a consumer has not released, or an observation is
+  kept under it whose consumer has not released it, such as a call awaiting its reply or a
+  transaction whose commit the loop has not released. The new version continues the position from
+  the observations kept under it, reading the values the earlier version decided there
+  ([A term rebuilt over a carried domain keeps its decided region](#a-term-rebuilt-over-a-carried-domain-keeps-its-decided-region)).
+  Only the new version's code runs after the swap.
+- **Ahead.** Nothing has been decided at the position. The new version computes it.
+
+A position of the earlier domain that the new domain lacks is **dropped**
+([Extending and dropping positions](#extending-and-dropping-positions)).
+
+#### A loop over a feed outlives a rebuild of the feed
+
+A loop over a feed is positioned by the feed's declaration and each row's feed key, not by the
+operator that produces the feed. A reload that rebuilds that operator starts a new generation of
+it, and the rebuilt term keeps the rows the earlier version decided inside the reload's boundary
+guard, with their feed keys ([Across reloads](#across-reloads)). A row's feed key is the site of
+its `<<` and the position of the iteration that appended it ([Outputs are keyed](#outputs-are-keyed)),
+so no other row in any generation has that key, and the feed's keys need no generation to keep two
+versions' rows apart.
+
+```python
+price = 50                          # v2: price = 60
+orders: Feed(_)
+
+for r in reqs:
+    orders << (item=r.item, total=price)
+
+for o in orders:
+    receipt = mailer::send(o)       # holds `o` across the reload until its reply is kept
+    receipts << receipt
+```
+
+Order `k1` arrives under v1, and its row is appended to `orders` with `total = 50`. The loop over
+`orders` calls `mailer::send` for `k1`, and the request is sent. A call releases nothing until its
+reply is kept ([A call made outside the program](#a-call-made-outside-the-program)), so the loop
+still holds `k1` when v2 is loaded, before the reply arrives. v2 changes only `price`. The loop that
+appends to `orders` reads `price`, so the reload rebuilds the operator that produces `orders`
+([Reuse is hereditary](../src/ccl/design/program-evolution.md#reuse-is-hereditary)), which starts
+generation `𝑔₂` and keeps `k1`'s row. The call's key is its site and its position
+([Key](#terms)), and the position's one component is the loop's domain with `k1`'s feed key; the
+value of `o` is not part of it.
+
+| | Position of the loop at `k1` | Key of the `mailer::send` call | `k1`'s receipt |
+| -- | -- | -- | -- |
+| v1 | `((orders, 𝑔₁), k1)` | `(send, ((orders, 𝑔₁), k1))` | request sent, reply pending |
+| v2, were the operator the domain | `((orders, 𝑔₂), k1)` | `(send, ((orders, 𝑔₂), k1))` | no reply at the new key: the request is sent again, and `receipts` gets a second row |
+| v2, the declaration as the domain | `(orders, k1)` | `(send, (orders, k1))` | the same call continues, and `receipts` gets one row |
+
+With the operator as the domain, the call at the new key is a new call. Its request goes out again,
+and a client that builds the remote's idempotency key from the call's key sends it under a key the
+remote has not seen ([An effect and its record are not atomic](#an-effect-and-its-record-are-not-atomic)).
+Every observation and output of the iteration is rekeyed the same way: a transaction it committed
+commits again, and a reading it took is taken again. A workflow body waits on a call between its
+steps, so every run in flight at a reload is this case, and a run table's `started` is the feed its
+body's loop iterates.
+
+#### A term rebuilt over a carried domain keeps its decided region
+
+A term the reload rebuilds over a carried domain holds, inside the reload's boundary guard, what
+the earlier version decided, and the new version computes outside it
+([Across reloads](#across-reloads)). Every consumer of the term reads one value at a position,
+whichever version decided it; no consumer recomputes a decided position with the new version's
+definition.
+
+```python
+@Named
+xs = range(5)
+doubled = [2 * x for x in xs]       # v2: [3 * x for x in xs]
+
+for d in doubled:
+    receipts << mailer::send(d)     # holds `d` until its reply is kept
+```
+
+At the swap the call has released positions `0` through `2` of `xs`, holds `3` with its request
+sent, and has not pulled `4`. v2 rebuilds `doubled`, whose boundary guard covers `0` through `3`.
+The rebuilt `doubled` holds `6` at position `3` and computes `12` at position `4`. The call at
+`(send, (xs, 3))` continues, and its reply appends one row to `receipts`. A reader v2 adds over
+`doubled`, `[d + 1 for d in doubled]`, reads `7` at position `3`, as the call did.
+
+The region inside the guard can no longer be computed from the term's input, because the version
+that computed it is retired, so the reload's write holds it ([Checkpoints](#checkpoints)). After a
+crash the recovered `doubled` holds `6` at position `3`, where recomputing with v2 would hold `9`.
+The write grows with the unreleased region of each term the reload rebuilds over a carried domain,
+and a term that is kept, or whose domain is not carried, adds nothing to it.
+
+A `groupby` is positioned by its keys, and a changed key function changes which key each later
+element reaches. Under a carried domain the elements the earlier version grouped stay in their
+groups inside the guard, and the new version groups the elements outside it, so one key's group can
+hold members from both key functions. A carried domain with a changed key function is what the
+author declares by identifying it, and the runtime checks only that the key type agrees
+([Extending and dropping positions](#extending-and-dropping-positions)).
+
+#### Extending and dropping positions
+
+An edit to an identified minter's term changes which positions the domain holds. A reload refuses
+the edit where the new term's positions have another type than the carried ones, such as a product
+of two collections edited to a product of three, and refuses it where the new term is not a minter
+of values.
+
+**A position the new term adds is ahead**, and the new version computes it. `range(5)` edited to
+`range(6)` reaches `5` and no earlier position again. A fold over the collection that ran to the end
+under the earlier version has released `0` through `4`, so it folds the element at `5` alone; a
+fold caught at `3` keeps the value it decided through `2` and folds `3` through `5`
+([An edited collection is folded whole unless it is identified](../src/ccl/design/program-evolution.md#an-edited-collection-is-folded-whole-unless-it-is-identified)).
+
+**A position the new term lacks is dropped, and dropping needs `@Discard`.** A reload refuses an
+edit that drops a position of an identified domain, released or not, unless the binding is marked
+`@Discard` ([8.9 `@Discard`](chl-spec.md#89-discard-decided)). Deleting the binding drops every
+position. Under `@Discard` the reload **cancels** each dropped position that is in flight: the
+terms over the domain drop what they hold at it, a call pending at it is dropped and its client
+reports `unknown`, the input retained for it is released, and nothing under the position is reached
+again. Cancelling is by prefix: a dropped position of an outer loop cancels every position of the
+loops inside it. The reload's entry records the cancelled keys, so that recovery after the swap
+neither waits for their replies nor drives them again. A dropped position that is released needs no
+cancelling, and one that is ahead was never decided.
+
+| `range(5)` edited to `range(3)` | Position | Without `@Discard` | With `@Discard` |
+| -- | -- | -- | -- |
+| released | `0`, `1`, `2` | kept | kept |
+| in flight | `3` | the reload is refused | cancelled |
+| ahead | `4` | the reload is refused | never decided |
+
+**`@Discard` starts a new generation**, so a position the domain drops and a later edit adds again
+is minted afresh: `range(5)` marked `@Discard` and edited to `range(3)`, then edited back to
+`range(5)`, reaches `3` and `4` as new keys, and nothing kept under the dropped keys is reached. The
+carried positions keep the generation they were minted under ([Terms](#terms)). An edit that adds
+positions needs no `@Discard`, and an edit that drops none of a binding's positions and only
+changes the binding's name needs `@RenamedFrom`, which carries every position.
+
+A `@Discard` in one branch cancels the positions that branch's operators hold. Another branch
+holding the same keys keeps them, as it keeps its operators
+([A reload changes no other branch](../src/ccl/design/program-evolution.md#a-reload-changes-no-other-branch)).
 
 ### Escape
 
@@ -618,7 +811,9 @@ snapshot and the readings at its own keys, all kept, and yields the record it yi
 keyed-transaction construct is needed, because the key is the position every transaction already
 has. A reload that rebuilds the term a transaction's loop iterates starts a new domain, so a
 transaction the rebuilt loop reaches at the same site has a new key and is a new transaction
-([Immutable history](#immutable-history)).
+([Immutable history](#immutable-history)). A loop over a feed keeps its domain when the feed is
+rebuilt, so its transactions keep their keys
+([A loop over a feed outlives a rebuild of the feed](#a-loop-over-a-feed-outlives-a-rebuild-of-the-feed)).
 
 A transaction that writes nothing is kept as one that writes. `await_final` reads a mutable
 variable once every writer of it has drained ([8.6 `await_final`](chl-spec.md#86-await_final)), so
@@ -899,7 +1094,9 @@ A checkpoint holds the producer's tile in the shape
 [Compaction](operational-semantics/semantics.md#compaction) gives it: `compact(𝑜)` for the region
 `𝑜` every consumer has released, beside the tile `𝑟` no consumer has released yet. The checkpoint
 can leave out `𝑟`, or part of it, only where the producer can compute it again from input it has not
-released.
+released. A region a reload carried into the producer is never computed again, because the version
+that computed it is retired
+([A term rebuilt over a carried domain keeps its decided region](#a-term-rebuilt-over-a-carried-domain-keeps-its-decided-region)).
 
 **A recovered producer can answer a pull for every region its consumers have not released.** A
 summary covers only regions every consumer has released, and a consumer releases a region only once
@@ -957,7 +1154,10 @@ What a checkpoint holds depends on the producer:
 - **A producer with no state**, such as a `map`, a `filter` or a `FanOut`, has no checkpoint. Its
   release is the one its consumers' releases permit, and a `FanOut`'s is the intersection of its
   slots' releases
-  ([The release contract](../src/interpreter/design-operators.md#the-release-contract)).
+  ([The release contract](../src/interpreter/design-operators.md#the-release-contract)). A `map`
+  or a `filter` the reload rebuilt over a carried domain holds the region the reload carried into
+  it until its consumers release it. The reload's write holds that region, and the producer has no
+  checkpoint of its own.
 
 The list is what `TileProducer::state_info` counts
 ([What a producer holds](../src/interpreter/design-operators.md#what-a-producer-holds)). The count
@@ -1278,8 +1478,12 @@ element, and between steps 1 and 2 process memory holds the only copy
 
 ## Consequences for other documents
 
-These statements conflict with the model or depend on it. Of them, only
-[7.5 Time](chl-spec.md#75-time-decided) is edited here. One rename follows this document as its own
+These statements conflict with the model or depend on it. Of them,
+[7.5 Time](chl-spec.md#75-time-decided), [1.9 Decorators](chl-spec.md#19-decorators),
+[8.9 `@Discard`](chl-spec.md#89-discard-decided) and [8.10 `@Named`](chl-spec.md#810-named-decided)
+are edited here, and
+[Identified domains](../src/ccl/design/program-evolution.md#identified-domains) in
+`program-evolution.md` prescribes the mechanism. One rename follows this document as its own
 change:
 
 - **"Block" for a transaction.**
@@ -1328,6 +1532,53 @@ The model's consequences:
   store's private counter that a rebuilt store restarts at `0`. Under the model the rebuilt store's
   clock is a new generation, and the reload's entry links its tick `0` to the old clock's frontier.
   The counter stays private and restartable.
+
+- **[Reuse is hereditary](../src/ccl/design/program-evolution.md#reuse-is-hereditary)** pairs
+  bindings by what they compute, so a renamed binding is kept and an edited minter is a new node
+  whose keys are new. Under the model an identified binding is paired by its `VarPath`, as a store
+  is, and its keys are carried across the edit ([Identified domains](#identified-domains)). A
+  reload then needs `@RenamedFrom` to rename one and `@Discard` to drop a position of one. Reuse
+  is also all-or-nothing per node
+  ([What is never reused](../src/ccl/design/program-evolution.md#what-is-never-reused)), where the
+  model keeps a rebuilt term's decided region inside the boundary guard and rebuilds it outside.
+
+- **[Where a rebuilt store picks up](../src/ccl/design/program-evolution.md#where-a-rebuilt-store-picks-up)**
+  and the table in [Order of a reload](../src/ccl/design/program-evolution.md#order-of-a-reload)
+  start a rebuilt map or feed from what had been released on its input, so the new version computes
+  again each row a reader had not released. In the example under
+  [A loop over a feed outlives a rebuild of the feed](#a-loop-over-a-feed-outlives-a-rebuild-of-the-feed),
+  the rebuilt producer of `orders` appends `k1`'s row again, at the same feed key, with
+  `total = 60`. Under the model the term keeps the row v1 decided, with `total = 50`, because it
+  lies inside the reload's boundary guard
+  ([A term rebuilt over a carried domain keeps its decided region](#a-term-rebuilt-over-a-carried-domain-keeps-its-decided-region)),
+  and the reload's write holds the row ([Checkpoints](#checkpoints)).
+
+- **The transaction drive in
+  [Where a rebuilt store picks up](../src/ccl/design/program-evolution.md#where-a-rebuilt-store-picks-up)**
+  starts over a rebuilt iteration at `0` and decides every item it scans up to. A transaction in a
+  loop over a rebuilt feed therefore commits again for each row the loop had not released, though
+  the earlier version committed it. The runtime keys a feed's rows by the item that appended them,
+  not by a store's commit tick
+  ([Replies ride their transaction](../src/ccl/design/mutability.md#replies-ride-their-transaction)),
+  so a row keeps its position across the rebuild, as a loop over a feed does under the model. Under
+  the model the transaction at that position is the one the earlier version committed, so the drive
+  answers it from that decision and decides only the rows that have none.
+
+- **[Fork](../src/ccl/design/program-evolution.md#vocabulary)** copies a branch's
+  divergence-reachable mutable variables at creation. Under the model branch-and-reload also
+  carries, into each term the branch rebuilds over a carried domain, the region the parent's term
+  decided, as a reload carries it from the predecessor, and the parent keeps its own
+  ([Identified domains](#identified-domains)).
+
+- **"Starting again is not starting at `0`"** in
+  [Where a rebuilt store picks up](../src/ccl/design/program-evolution.md#where-a-rebuilt-store-picks-up)
+  says where a fresh iteration over a source starts, and the table in
+  [Order of a reload](../src/ccl/design/program-evolution.md#order-of-a-reload) starts a rebuilt
+  iteration over a collection at `0`. Neither says where a rebuilt iteration over a feed starts.
+  Under the model it resumes past what the loop released of the feed's keys. For a feed with more
+  than one `<<` site that release is a guard over `(𝑠, 𝑝)` pairs, which have no highest position,
+  so a single watermark such as `FanOut::released_position`, "the highest position the releases
+  have named", cannot state it.
 
 - **[A `Memo` releases everything it takes](../src/interpreter/design-operators.md#a-memo-releases-everything-it-takes)**
   releases each region as it merges it. Under [Checkpoints](#checkpoints) a consumer releases only
@@ -1400,8 +1651,8 @@ The model's consequences:
     reading's kind, and the effects work's reload tests for readings pin two failing cases. Keeping
     a reading at a kept key needs pairing by site ([Immutable history](#immutable-history)).
   - **A position names no domain.** The spec's position counts loop iterations. Under the model each
-    component also names the loop's domain, the operator the loop iterates, in its generation
-    ([Terms](#terms)).
+    component also names the loop's domain: the operator the loop iterates, in its generation, or,
+    for a loop over a source or a feed, its declaration ([Terms](#terms)).
   - **"Position" has two scopes.** The runtime `Position` (`src/interpreter/types/value.rs`) and
     the spec's `OrderableFor(P, E)` mean one loop's component, which this document calls an
     iteration position; the spec's position of an evaluation covers every loop.

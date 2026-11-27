@@ -286,9 +286,10 @@ why the refinement separator moved off `|`.
 `@` introduces a decorator on the line above a declaration. The decorators are `LoadFrom`
 ([8.8 `@LoadFrom`](#88-loadfrom)), `RenamedFrom`
 ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)), `Discard`
-([8.9 `@Discard` [Decided]](#89-discard-decided)) and `Builtin`
+([8.9 `@Discard` [Decided]](#89-discard-decided)), `Named`
+([8.10 `@Named` [Decided]](#810-named-decided)) and `Builtin`
 ([9.16 The std root](#916-the-std-root)), so `@` never appears in any other position.
-`@RenamedFrom` and `@Discard` parse, and lowering refuses them.
+`@RenamedFrom` and `@Discard` parse, and lowering refuses them. `@Named` does not parse yet.
 
 **[Decided]** — `@RenamedFrom` also decorates a `type` declaration and a constructor line inside
 one ([Reloading a nominal type](#reloading-a-nominal-type)). Its argument there is a path:
@@ -403,11 +404,20 @@ load_from_stmt  ::= "@" "LoadFrom" "(" ident ")" NEWLINE
                     [ "pub" ] ident ( ":" | "<:" ) expression NEWLINE
 
 -- A run that the version this source replaces held under another name, by `@RenamedFrom`.
-renamed_from_stmt ::= "@" "RenamedFrom" "(" ident ")" NEWLINE run_stmt NEWLINE
+renamed_from_stmt ::= renamed_from_line run_stmt NEWLINE
+renamed_from_line ::= "@" "RenamedFrom" "(" ident ")" NEWLINE
 
 -- A declaration head marked gone, by `@Discard`.
-discard_stmt    ::= "@" "Discard" NEWLINE discard_head NEWLINE
+discard_stmt    ::= discard_line discard_head NEWLINE
+discard_line    ::= "@" "Discard" NEWLINE
 discard_head    ::= ident | "run" module_path [ "as" ident ]
+
+-- A binding whose collection keeps its positions across an edit, by `@Named`. A
+-- `@RenamedFrom` line above it names the binding the version this source replaces
+-- held the collection under, and a `@Discard` line above it marks the positions
+-- this version drops as gone.
+named_stmt      ::= [ renamed_from_line | discard_line ] "@" "Named" NEWLINE
+                    ( assign_stmt | ann_assign_stmt ) NEWLINE
 
 -- `pub` before the statement that introduces a member. Any statement parses
 -- after it; one that introduces no member is refused.
@@ -5802,6 +5812,86 @@ succeeds, the running program holds nothing at the address, so a version without
 deletes no state.
 
 `@Discard` replaces retiring a variable by loading it into an unused binding.
+
+**On an identified binding** ([8.10 `@Named`](#810-named-decided)) `@Discard` stands above the
+binding's new assignment and marks the positions the new collection lacks as gone, or above the
+bare name where the binding is deleted and every position goes. A reload that drops a position of
+an identified collection is refused without it, whether or not anything is still working at the
+position. With it, the reload cancels whatever is working at a dropped position
+([Extending and dropping positions](durability.md#extending-and-dropping-positions)):
+
+```python
+@Discard
+@Named
+attempts = range(3)           # the predecessor's `range(5)`; positions 3 and 4 are gone
+```
+
+### 8.10 `@Named` [Decided]
+
+`@Named` decorates a binding whose collection is minted by its term rather than copied from an
+input: `range`, a collection literal, `groupby`, or a product of collections
+([Identified domains](durability.md#identified-domains)). It makes the binding **identified**: a
+reload pairs it by its name and scope, as it pairs a mutable variable, and the positions of the
+collection outlive every edit of the term:
+
+```python
+@Named
+attempts = range(3)           # v2: range(5)
+
+for r in requests:
+    for a in attempts:
+        reply = upstream::call(r, a)      # one call per (request, attempt), kept across the reload
+        ...
+```
+
+A reload that edits `range(3)` to `range(5)` reaches attempts `3` and `4` for each request still
+in the loop and reaches no earlier attempt again: a call pending at attempt `2` continues, and a
+request the loop has released is not revisited. Without `@Named`, the edited `range`
+is a new collection, so every request still in the loop runs its attempts from `0` under the new
+version, and a call pending under the old collection is sent again under a new key
+([Immutable history](durability.md#immutable-history)).
+
+**What the decorator means for a term over the collection.** A term computed from an identified
+collection keeps, across a reload that edits the term, every value the earlier version decided at a
+position some reader still holds, and computes the new definition at the positions nothing has
+reached ([A term rebuilt over a carried domain keeps its decided region](durability.md#a-term-rebuilt-over-a-carried-domain-keeps-its-decided-region)).
+Every reader of the term reads one value at a position.
+
+**Extending, dropping, renaming, deleting.** An edit that adds positions needs nothing further. An
+edit that drops positions, or deletes the binding, is refused unless `@Discard` stands above it
+([8.9 `@Discard`](#89-discard-decided)); with `@Discard` the reload cancels whatever is working at
+a dropped position and mints any position a later edit adds back afresh. A rename is marked
+`@RenamedFrom(old)` above `@Named`, as a run's rename is
+([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)); without it the old
+binding is deleted and the new one starts from nothing. `@LoadFrom` is not the rename: it takes a
+snapshot of a value ([8.8 `@LoadFrom`](#88-loadfrom)), where an identified collection keeps
+growing.
+
+```python
+@RenamedFrom(attempts)
+@Named
+retries = range(5)
+```
+
+**Where it stands.** `@Named` decorates an assignment, with or without an annotation, at the top
+level, in a `def` body or in a `for` body. Inside a `def` the binding is one collection per call
+site, and inside a `for` body one collection per iteration of the loops around it, as a feed
+appended there is. Two bare calls of a `def` holding one are told apart by position alone, so a
+reload that reorders them is refused, as it is for the mutable variables they hold; binding each
+call to a name resolves it ([8.8 `@LoadFrom`](#88-loadfrom)).
+
+**What is refused.** `@Named` on a binding whose term copies its input's keys, a map, a filter, a
+comprehension or a feed, is refused: a loop over such a collection is positioned by the collection
+it copies, so identifying the copy adds nothing. On a mutable variable or a source it is refused,
+because the declaration already identifies it. An edit that changes the type of the positions, a
+product of two collections to a product of three or a `groupby` keyed by `String` to one keyed by
+`Int`, is refused, because the carried positions are not positions of the new collection.
+
+**A mutable variable and an identified collection carry separately.** A variable keeps its value
+across every reload by its name; a collection keeps its positions only when identified. A fold
+over an edited collection that is not identified therefore folds the whole new collection onto the
+value the variable carried
+([An edited collection is folded whole unless it is identified](../src/ccl/design/program-evolution.md#an-edited-collection-is-folded-whole-unless-it-is-identified)).
 
 ---
 
