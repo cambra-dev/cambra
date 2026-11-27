@@ -10,6 +10,30 @@ level a producer does not restate by pulling the nearest level above that it res
 the answer. A push beneath the outermost keys lands in its reader as a projection at its level
 (`Dispatcher::land_in`).
 
+## What the gap blocks
+
+A loop nested in another runs in rounds of its own (`src/interpreter/design-dispatcher.md`, "A loop
+in rounds"). Removing the scheduler removes pull mode, so every shape a dispatched run refuses has
+to run there first.
+
+## Where a region crosses an operator
+
+A region crosses an operator on four paths, and only three need a path.
+
+| Path | What crosses | Needs a path |
+| --- | --- | --- |
+| Notification (`Consumer::notify`) | the keys that changed | no |
+| Pull (`TileProducer::get`) | the region asked for | yes |
+| Push (`Consumer::push`) and package | the region a breaker decided | yes |
+| Release (`TileProducer::release`) | the region read no more | yes |
+
+A notification only has to be sound: naming more than changed costs a read and loses nothing, so
+a change at `(k, j)` is notified as the key `k`, or widened to `Everything`. A push names a region
+its reader's pipeline consumes once in the run (`Pushes::record`), so a push of `k` for a change at
+`(k, j)` would consume the row `k` at its first position. A pull at a package's region answers
+that region and no more (`Tile::within`), and the breaker releases its input at what the answer
+states, which a finish checks covers the package (`finish_with`).
+
 ## Representation
 
 A projection at level 𝑛 names keys of level 𝑛, each under the path of keys above it. Level 0 is
@@ -78,3 +102,36 @@ held      = Domain(True)
 released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified { enclosing: k = 0, here: True }) }) ]
 held − released = Domain(k ≠ 0)
 ```
+
+A round pushes per position, so it needs the difference, where a push at a finish only names the
+breaker's whole held region.
+
+`Pushes::record`, `Queue::append_unqueued` and the finish's release check (`finish_with`) compute
+their regions with `guard_minus`, `union` and `intersect` over `TileGuard`, so they take nested
+regions.
+
+## Operator rows
+
+The [projection table](design-operators.md#projection-guards) specifies each operator's supported
+levels and input projections. `TileProducer::restates` declares those levels; `input_level` describes
+how a supported output level maps to each input.
+
+## The planner
+
+A loop nested in another runs as a scope inside the outer loop's scope, queued a row of its store
+per outer round: the inner scope's rounds are the positions `(k, j)` of row `k` the inner drive
+emits, and a round at the row closes it.
+
+A round of a nested loop pulls each operator at the round's paths, beneath the outermost keys. An
+operator that does not restate the level a pull names is pulled at the nearest level it restates
+(`Projection::restated_by`), and the answer is cut to the round's paths (`TileProducer::get`).
+
+## Decisions
+
+- One variant spells a projection at every level: `Keys { level, keys }`, with level 0 the
+  outermost collection.
+- A round pushes per position, so the guard algebra has a difference of nested guards rather than
+  pushing only at a finish.
+- A difference closes an arm against the extent of the row it names, so an arm that names no
+  position of its row reads as `Nothing`.
+- A nested loop runs in rounds of its own; no loop folds into the scope around it.
