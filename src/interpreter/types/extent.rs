@@ -87,17 +87,17 @@ pub struct NotifyOrSubscribeResult {
 
 impl Extent {
     /// The iteration region whose presence or absence is decided by every source it reads.
-    pub(crate) fn decided_region(&self) -> Predicate {
+    pub(crate) fn complete_region(&self) -> Predicate {
         match self {
             Self::DataSourceDomain(source) => source.borrow().get_yield_predicate(),
             Self::Record(fields) => Predicate::Record(
                 fields
                     .iter()
-                    .map(|(name, extent)| (name.clone(), extent.decided_region()))
+                    .map(|(name, extent)| (name.clone(), extent.complete_region()))
                     .collect(),
             ),
             Self::Union(arms) => {
-                Predicate::over_every_tag(arms.map(|_, extent| extent.decided_region()))
+                Predicate::over_every_tag(arms.map(|_, extent| extent.complete_region()))
             }
             _ => Predicate::True,
         }
