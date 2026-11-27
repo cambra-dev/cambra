@@ -10,6 +10,7 @@ use crate::ccl::lower::constants::Refused;
 /// "The module interface").
 #[derive(Debug)]
 pub struct Interface {
+    pub(super) routes: Vec<super::super::http::HttpRoute>,
     pub module: ModulePath,
     /// Parsing omitted declarations, so a missing entry does not establish absence.
     pub(super) incomplete: bool,
@@ -517,6 +518,42 @@ pub struct Reference {
 }
 
 impl Interface {
+    /// The names the route sources of this module take where `consts` gives its constant
+    /// parameters, reached through the run or qualifier `run`.
+    pub(super) fn source_renames<'a>(
+        &self,
+        consts: &HashMap<TypeParamId, ConstTerm>,
+        run: &'a str,
+    ) -> crate::ccl::lower::http::SourceRenames<'a> {
+        let mut names: HashMap<String, crate::ccl::SourceName> = self
+            .routes
+            .iter()
+            .map(|route| match route.at(consts) {
+                Some(Ok((at, from))) => (from, at.source_name().into()),
+                _ => (route.source_name().to_string(), route.source_name().into()),
+            })
+            .collect();
+        let mut aliases: Vec<_> = self
+            .types
+            .iter()
+            .filter(|(_, member)| member.public)
+            .collect();
+        aliases.sort_by_key(|(name, _)| *name);
+        let mut spelled = HashSet::new();
+        for (alias, member) in aliases {
+            if let AliasType::Type(Type::DataSource(source)) = &member.ty
+                && spelled.insert(source.as_str())
+                && let Some(to) = names.get_mut(source.as_str())
+            {
+                to.set_spelling(format!("{run}::{alias}"));
+            }
+        }
+        crate::ccl::lower::http::SourceRenames {
+            names,
+            run: Some(run),
+        }
+    }
+
     /// The value parameters whose annotation leaves part of their type to `_`, whose types
     /// a check infers from the module's uses.
     pub fn inferred_parameters(&self) -> impl Iterator<Item = &SmolStr> {
@@ -748,6 +785,7 @@ impl Interface {
         ast: &ChlModule,
         chain: &Expr,
         mut parameters: Vec<Parameter>,
+        sinks: &[DeclaredSink],
         ctx: &LoweringContext,
     ) -> Self {
         let bindings = &top_level_bindings(&ast.body);
@@ -806,7 +844,32 @@ impl Interface {
                 )
             })
             .collect();
+        let mut routes = Vec::new();
+        for sink in sinks {
+            match sink {
+                DeclaredSink::Http { route, .. } => routes.push((**route).clone()),
+                #[cfg(test)]
+                DeclaredSink::Test { .. } => {}
+            }
+        }
+        for qualifier in ctx.module.qualifiers.values() {
+            if let Some(interface) = &qualifier.interface {
+                for route in &interface.routes {
+                    let at = match route.at(&qualifier.types.consts) {
+                        Some(Ok((at, _))) => at,
+                        None => route.clone(),
+                        // Creating the run reports an invalid address. Retain its template
+                        // so forwarding the module does not erase that declaration.
+                        Some(Err(_)) => route.clone(),
+                    };
+                    if !routes.iter().any(|r| r.source_name() == at.source_name()) {
+                        routes.push(at);
+                    }
+                }
+            }
+        }
         Interface {
+            routes,
             module,
             incomplete: false,
             members,
@@ -1014,14 +1077,19 @@ pub fn top_level_aliases(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
                 ChlStmt::Pub { stmt, .. } => (&stmt.node, true),
                 other => (other, false),
             };
-            let ChlStmt::Assign { target, value, .. } = inner else {
-                return None;
+            let (name, name_span) = match inner {
+                ChlStmt::Assign { target, value, .. } => (
+                    crate::ccl::lower::stmts::type_alias_decl(target, value)?.0,
+                    target.span,
+                ),
+                // A `@Builtin type` is an alias of the type the compiler supplies.
+                ChlStmt::BuiltinType { name, .. } => (name.node.as_str(), name.span),
+                _ => return None,
             };
-            let (name, _) = crate::ccl::lower::stmts::type_alias_decl(target, value)?;
             Some(TopLevelBinding {
                 name: name.into(),
                 span: stmt.span,
-                name_span: target.span,
+                name_span,
                 public,
             })
         })

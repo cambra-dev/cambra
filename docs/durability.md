@@ -1439,9 +1439,9 @@ The model's consequences:
 - **`http::serve`'s requests** release on arrival, so the runtime persists each request body as it
   arrives and drops a response whose connection died in a crash ([Sources](#sources)).
 
-- **[7.3 Sources](chl-spec.md#73-sources)** lists `stdin()` and `http_serve`, and lets a host
-  embedding register more. Every source states what the system it reads gives back
-  ([Sources](#sources)), and `stdin()` and `http_serve` read systems that give back nothing. A
+- **[7.3 Sources](chl-spec.md#73-sources)** lists `stdin()` and `std::http::serve`, and lets a
+  host embedding register more. Every source states what the system it reads gives back
+  ([Sources](#sources)), and `stdin()` and `std::http::serve` read systems that give back nothing. A
   host-registered source states which kind of system it reads and any limit on how long that system
   holds an element, and a topic source names the one partition it reads.
 

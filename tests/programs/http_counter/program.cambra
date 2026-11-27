@@ -1,3 +1,4 @@
+import std::http as http_api
 # A scalar transactional mutable variable shared *live* across two endpoints: POST /set
 # overwrites `latest` (a `Mut(String, Txn)` scalar store) and replies "ok"; GET /get
 # reads the current value cross-endpoint inside a `with begin():` block that only reads.
@@ -11,7 +12,7 @@
 # so it rides the POST request loop (request-indexed), matching how the HTTP
 # response sink dispatches replies to their requests.
 #
-# `latest` is declared after the `http_serve` bindings: its writer iterates
+# `latest` is declared after the route bindings: its writer iterates
 # `set_reqs`, so `set_reqs` must be in scope.
 #
 # Manual smoke test (replace {PORT} with e.g. 8080):
@@ -21,22 +22,22 @@
 #     curl -X POST -d 'bob'   localhost:8080/set
 #     curl localhost:8080/get        # -> bob
 
-run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-http_set_resps_replies: Feed(String)
-set_reqs = http_set_resps::requests
-run std::http(port="{PORT}", method="GET", path="/get") as http_get_resps
-http_get_resps_replies: Feed(String)
-get_reqs = http_get_resps::requests
+run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+http_set_resps_replies: Feed(http_api::Response)
+set_reqs = [request.body() for request in http_set_resps::requests]
+run std::http::serve(port="{PORT}", method="GET", path="/get") as http_get_resps
+http_get_resps_replies: Feed(http_api::Response)
+get_reqs = [request.body() for request in http_get_resps::requests]
 
 latest: Mut(String, Txn) := "(none)"
 
 for msg in set_reqs:
     with begin():
         latest := msg
-    http_set_resps_replies << "ok\n"
+    http_set_resps_replies << http_api::ok_text("ok\n")
 
 for req in get_reqs:
     with begin():
-        http_get_resps_replies << latest
+        http_get_resps_replies << http_api::ok_text(latest)
 http_set_resps::respond(http_set_resps_replies)
 http_get_resps::respond(http_get_resps_replies)

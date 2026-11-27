@@ -1,10 +1,6 @@
-//! A guestbook HTTP service: `POST /sign` appends an entry and the response is
-//! the whole guestbook so far — one endpoint that both *adds* data and
-//! *displays* it. State is carried across requests by an induction accumulator
-//! (`entries: Mut(_)`) whose running value the response feeds back on each
-//! request, exercising a mutating for-loop with a per-request feed in *final*
-//! statement position. Plain-`String` requests and responses (`http_serve`
-//! yields the request body as a `String`; the reply is the accumulated text).
+//! POST /sign appends to an induction accumulator and returns its running text.
+//! One unconditional Feed write per request constructs a nominal Response. Its
+//! collection retains the exact request domain required by the response connection.
 
 use super::serving::{compile_sink, exchange, http_post, reserve_test_port};
 

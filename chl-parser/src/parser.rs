@@ -2203,53 +2203,73 @@ where
             )
         })
         .boxed();
-    // ---- @Builtin above a `def` with no body ---------------------
+    // ---- @Builtin above a declaration with no value -------------
     // (`docs/chl-spec.md`, "9.16 The std root")
     //
-    // The decorator and its declaration are one statement, as the other decorators' are,
-    // and the signature ends the declaration. `pub` stands on the line below the
-    // decorator. Lowering refuses it outside a std module.
+    // The decorator and its declaration are one statement, as the other decorators' are. The
+    // declaration is a `def` signature, a `type` name, or an annotated name, and it ends the
+    // statement. `pub` stands on the line below the decorator. Lowering refuses it outside a std
+    // module.
+    let builtin_signature = def_head.then_ignore(just(Token::Newline)).map(
+        |((owner, name), (((type_params, params), output), (requires, causes)))| {
+            BuiltinItem::Def(Box::new(Stmt::FunctionDef {
+                owner,
+                name,
+                type_params,
+                params,
+                output,
+                requires: Box::new(requires),
+                causes: Box::new(causes),
+                body: Vec::new(),
+                builtin: None,
+            }))
+        },
+    );
+    let builtin_type = just(Token::Type)
+        .ignore_then(binder())
+        .then_ignore(just(Token::Newline))
+        .map(BuiltinItem::Type);
+    let builtin_value = binder()
+        .then(annotation_mode())
+        .then(expr.clone())
+        .then_ignore(just(Token::Newline))
+        .map(|((name, mode), ty)| BuiltinItem::Value(name, TypeAnnotation { mode, ty }));
     let builtin_def = just(Token::At)
         .ignore_then(select! { Token::Ident(s) if s == "Builtin" => () }.map_with(|(), e| e.span()))
         .then_ignore(just(Token::Newline))
         .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
         .then(
-            def_head
-                .then_ignore(just(Token::Newline))
-                .map_with(|head, e| (head, e.span())),
+            choice((builtin_signature, builtin_type, builtin_value))
+                .map_with(|item, e| (item, e.span())),
         )
-        .map_with(
-            |(
-                (builtin, keyword),
-                (((owner, name), (((type_params, params), output), (requires, causes))), def_span),
-            ),
-             e| {
-                let def = Spanned::new(
-                    def_span,
-                    Stmt::FunctionDef {
-                        owner,
-                        name,
-                        type_params,
-                        params,
-                        output,
-                        requires: Box::new(requires),
-                        causes: Box::new(causes),
-                        body: Vec::new(),
-                        builtin: Some(builtin),
-                    },
-                );
-                match keyword {
-                    None => Spanned::new(e.span(), def.node),
-                    Some(keyword) => Spanned::new(
-                        e.span(),
-                        Stmt::Pub {
-                            keyword,
-                            stmt: Box::new(def),
-                        },
-                    ),
+        .map_with(|((builtin, keyword), (item, item_span)), e| {
+            let stmt = match item {
+                BuiltinItem::Def(mut def) => {
+                    let Stmt::FunctionDef { builtin: at, .. } = &mut *def else {
+                        unreachable!("a builtin signature is a `def`")
+                    };
+                    *at = Some(builtin);
+                    *def
                 }
-            },
-        )
+                BuiltinItem::Type(name) => Stmt::BuiltinType { name, builtin },
+                BuiltinItem::Value(name, annotation) => Stmt::Declare {
+                    target: Spanned::new(name.span, AssignTarget::Name(name.node)),
+                    annotation,
+                    builtin: Some(builtin),
+                },
+            };
+            let decl = Spanned::new(item_span, stmt);
+            match keyword {
+                None => Spanned::new(e.span(), decl.node),
+                Some(keyword) => Spanned::new(
+                    e.span(),
+                    Stmt::Pub {
+                        keyword,
+                        stmt: Box::new(decl),
+                    },
+                ),
+            }
+        })
         .boxed();
 
     // ---- impl N(P…): ( [pub] def … | A = T )+ ----------------------
@@ -3061,6 +3081,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         | Stmt::MutAssign { .. }
         | Stmt::FunctionDef { .. }
         | Stmt::TypeDecl(_)
+        | Stmt::BuiltinType { .. }
         | Stmt::TraitDecl(_)
         | Stmt::Error { .. } => return None,
         Stmt::Import { .. } => {
@@ -3116,6 +3137,14 @@ fn failed_statement(
         modules,
         unknown_module,
     }
+}
+
+/// The declaration under `@Builtin`.
+#[derive(Clone)]
+enum BuiltinItem {
+    Def(Box<Stmt>),
+    Type(Spanned<SmolStr>),
+    Value(Spanned<SmolStr>, TypeAnnotation),
 }
 
 /// Intermediate type used inside the statement-level expression dispatch.
@@ -3726,6 +3755,7 @@ fn assign_stmt<'src>(
         AssignTail::Declared(annotation) => Stmt::Declare {
             target: to_target(target)?,
             annotation,
+            builtin: None,
         },
         AssignTail::Broken => {
             fn names(target: &AssignTarget, out: &mut Vec<SmolStr>) {
@@ -6937,5 +6967,31 @@ mod tests {
         assert_eq!(def(&m.body[1]), (true, 0));
         assert_eq!(def(&m.body[2]), (false, 1));
         assert!(matches!(m.body[1].node, Stmt::Pub { .. }));
+    }
+
+    /// `@Builtin` marks a `type` name or an annotated name the compiler supplies, under `pub`
+    /// or not (`docs/chl-spec.md`, "9.16 The std root").
+    #[test]
+    fn builtin_marks_a_type_and_a_value() {
+        let m = parse_m(indoc! {"
+            @Builtin
+            pub type Reqs
+            @Builtin
+            requests: Reqs |=> String
+            out: Feed(Int)
+        "});
+        let Stmt::Pub { stmt, .. } = &m.body[0].node else {
+            panic!("expected `pub`, got {:?}", m.body[0].node);
+        };
+        assert!(matches!(&stmt.node, Stmt::BuiltinType { name, .. } if name.node == "Reqs"));
+        assert!(matches!(
+            &m.body[1].node,
+            Stmt::Declare { target, builtin: Some(_), .. }
+                if matches!(&target.node, AssignTarget::Name(n) if n == "requests")
+        ));
+        assert!(matches!(
+            &m.body[2].node,
+            Stmt::Declare { builtin: None, .. }
+        ));
     }
 }

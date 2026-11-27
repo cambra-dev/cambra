@@ -1440,8 +1440,13 @@ impl Interp {
             }
 
             // `out: Feed(T)` declares a channel. The annotation's argument states a type,
-            // which nothing here reads.
-            Stmt::Declare { target, annotation } => {
+            // which nothing here reads. A `@Builtin` declaration's value is the compiler's, which
+            // nothing here models.
+            Stmt::Declare {
+                target,
+                annotation,
+                builtin: None,
+            } => {
                 let name = name_of(target)?;
                 let is_feed = matches!(&annotation.ty.node, Expr::Call { func, .. }
                     if matches!(&func.node, Expr::Name(n) if n.as_str() == "Feed"));
@@ -3382,7 +3387,6 @@ impl Interp {
                 | SurfaceBuiltin::EmptyMap
                 | SurfaceBuiltin::IntToUint
                 | SurfaceBuiltin::Begin
-                | SurfaceBuiltin::HttpServe
                 | SurfaceBuiltin::TestSink
                 | SurfaceBuiltin::Stdin,
             )

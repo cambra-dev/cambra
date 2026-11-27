@@ -35,6 +35,10 @@ use std::path::Path;
 const STD_MODULES: &[(&str, &str)] = &[
     ("std", include_str!("../../../stdlib/src/std.cambra")),
     (
+        "std::http::serve",
+        include_str!("../../../stdlib/src/std/http/serve.cambra"),
+    ),
+    (
         "std::http",
         include_str!("../../../stdlib/src/std/http.cambra"),
     ),

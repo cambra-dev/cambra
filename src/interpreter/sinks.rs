@@ -130,9 +130,9 @@ impl SinkConsumer {
             if let Some(prod) = producer.borrow_mut().as_mut() {
                 let guard = prod.tiling().universal_guard();
                 let tile = prod.get(guard);
-                sink.process(&tile);
+                let consumed = sink.process(&tile);
                 let is_terminal = tile.is_terminal();
-                prod.release(tile.to_guard());
+                prod.release(consumed);
                 if is_terminal && let Some(notifier) = done.take() {
                     notifier.signal();
                 }

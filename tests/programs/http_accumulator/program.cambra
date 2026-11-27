@@ -1,3 +1,4 @@
+import std::http as http_api
 # A tiny guestbook service: POST a message and get back the whole guestbook so
 # far. State lives in `entries`, a string the request loop accumulates across
 # requests (a pure induction accumulator — `Mut(_)`, NOT transactional), and each
@@ -15,11 +16,11 @@
 
 entries := ""
 
-run std::http(port="{PORT}", method="POST", path="/sign") as http_sign_resps
-http_sign_resps_replies: Feed(String)
-sign_reqs = http_sign_resps::requests
+run std::http::serve(port="{PORT}", method="POST", path="/sign") as http_sign_resps
+http_sign_resps_replies: Feed(http_api::Response)
+sign_reqs = [request.body() for request in http_sign_resps::requests]
 
 for entry in sign_reqs:
     entries := entries + entry + "\n"
-    http_sign_resps_replies << entries
+    http_sign_resps_replies << http_api::ok_text(entries)
 http_sign_resps::respond(http_sign_resps_replies)

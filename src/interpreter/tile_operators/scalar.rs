@@ -378,6 +378,24 @@ impl TileProducer for VariantWrapProducer {
             false => self.input.tiling().universal_guard(),
         };
         let mut tile = self.input.get(input_guard);
+        // A scalar union materializes its payload as one cell, so its aggregates and
+        // record fields must be complete. A union tile keeps growing collection payloads.
+        if matches!(self.tiling().values_at(self.level), Tiling::Scalar(_)) {
+            match self.level.enclosing() {
+                None if !tile.is_terminal() || self.obsolete_guard().is_universal() => {
+                    return self.tiling().empty_tile();
+                }
+                None => {}
+                Some(rows) => {
+                    let complete = tile.completion_at(rows);
+                    let paths = tile.paths_at(rows);
+                    let whole = (0..paths.len())
+                        .map(|key| complete.contains_path(&paths[key]))
+                        .collect::<Vec<bool>>();
+                    tile.values_at_mut(rows).retain_keys(&whole);
+                }
+            }
+        }
         // Which of the two cases this is was decided at construction, from the input's
         // tiling, and is read back from the output's: a payload **stream** keeps its domain
         // and wraps element-wise (so the constructor composes as `payload ≫ variant_wrap`),
@@ -403,7 +421,7 @@ impl TileProducer for VariantWrapProducer {
             // grows as it arrives rather than waiting to be whole.
             Tiling::Union(arm_tilings) => wrap_variant_tile(payload, &self.tag, arm_tilings),
             _ => Tile::Scalar(wrap_variant_column(
-                scalar_tile_to_column_value(payload),
+                materialize_collections(payload),
                 &self.tag,
                 &self.variant_extents,
             )),
@@ -1888,6 +1906,43 @@ mod variant_projection_tests {
             panic!("a collection, got {tile:?}")
         };
         domain.clone()
+    }
+
+    #[test]
+    fn bare_and_record_payloads_wait_for_aggregate_completion() {
+        for record in [false, true] {
+            for complete in [false, true] {
+                let mut input_tiling = Tiling::Aggregation {
+                    kind: crate::ccl::AggregateKind::Sum,
+                    accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+                };
+                let mut payload = Tile::Aggregation {
+                    kind: crate::ccl::AggregateKind::Sum,
+                    accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    terminal: ColumnValue::Bools(vec![complete]),
+                };
+                if record {
+                    input_tiling = Tiling::Record(HashMap::from([("value".into(), input_tiling)]));
+                    payload = Tile::record(HashMap::from([("value".into(), payload)]));
+                }
+                let extent = input_tiling.extent();
+                let arms = TagMap::from_arms(vec![(commit(), extent)]);
+                let output = Tiling::Scalar(Extent::Union(arms.clone()));
+                let (input, _, _) = ProjectionSpy::new(payload, input_tiling);
+                let mut wrap = VariantWrapProducer {
+                    level: CurryLevel::new(0),
+                    base: ProducerBase::unowned(VariantWrapProducer::alloc_id(), &output),
+                    input: Box::new(input),
+                    tag: commit(),
+                    variant_extents: arms,
+                };
+                assert_eq!(
+                    wrap.get(output.universal_guard()).is_terminal(),
+                    complete,
+                    "record={record}, complete={complete}"
+                );
+            }
+        }
     }
 
     /// Both collection payloads stream in their arm. Row 0 is complete; row 1 keeps its

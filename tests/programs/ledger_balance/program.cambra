@@ -1,3 +1,4 @@
+import std::http as http_api
 # A time-pinned view over a transactionally-fed collection.  `ledger` is fed
 # only inside transactions, so each element carries the commit time of the
 # transaction that fed it; /balance answers with the sum of deposits committed
@@ -9,10 +10,10 @@
 
 ledger: Feed({amount: Int})
 
-run std::http(port="8080", method="POST", path="/deposit") as deposit
-deposit_replies: Feed(String)
-run std::http(port="8080", method="GET", path="/balance") as balance_route
-balance_route_replies: Feed(String)
+run std::http::serve(port="8080", method="POST", path="/deposit") as deposit
+deposit_replies: Feed(http_api::Response)
+run std::http::serve(port="8080", method="GET", path="/balance") as balance_route
+balance_route_replies: Feed(http_api::Response)
 
 for req in deposit::requests:
     with begin():

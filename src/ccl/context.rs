@@ -863,7 +863,7 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
 /// of the compilation API imports them by.
 pub use crate::interpreter::operator_conversion::{ReuseTally, StateConflict, UnreadablePrefix};
 
-/// One open `http_serve` route: what lowering binds it by, plus the listener
+/// One open HTTP route: what lowering binds it by, plus the listener
 /// needed to stop serving it.
 struct HttpRoute {
     route: LoweredRoute,
@@ -877,13 +877,13 @@ struct HttpRoute {
 /// routing-table entry, and the requests buffered behind it outlive the version
 /// of the program that opened them, so they are what a replacement version
 /// inherits: every compilation seeds a fresh [`LoweringContext`] from here, and
-/// a `http_serve` naming a route already held binds it rather than opening a
+/// a run serving a route already held binds it rather than opening a
 /// second listener on the same address.
 #[derive(Default)]
 pub struct SourceSinkRegistry {
     /// Every open source, by the name `Source(name)` resolves against.
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
-    /// Every open `http_serve` route, by the route's source name. Keyed by route
+    /// Every open HTTP route, by the route's source name. Keyed by route
     /// rather than by response-binding name, which a new version may spell
     /// differently.
     http_routes: HashMap<String, HttpRoute>,
@@ -1007,7 +1007,7 @@ impl SourceSinkRegistry {
 
     /// A [`LoweringContext`] holding everything this registry does.
     ///
-    /// Every compilation starts from one of these, so a `http_serve` naming a
+    /// Every compilation starts from one of these, so a run serving a
     /// route already open binds it and one naming anything else opens it.
     fn seed_lowering_context(&self) -> LoweringContext {
         let mut lowering = LoweringContext::default();
@@ -1321,7 +1321,7 @@ impl Default for GlobalContext {
 /// The `main` output carries the program's primary output (the value of its
 /// trailing expression for pure programs); sink outputs correspond to
 /// externally-managed [`DataSink`](crate::interpreter::DataSink)s such as
-/// `http_serve`'s response channel.
+/// an HTTP route's response Feed.
 pub struct CompiledOutput {
     /// Output name.  `"main"` for the program's primary output; otherwise the
     /// name of a registered sink binding.
@@ -1425,7 +1425,7 @@ pub struct CompiledProgram {
     /// trees ([`Self::sources`]). A version replacing this one compiles them
     /// again to tell how the two differ.
     pub loaded: LoadedProgram,
-    /// Every `http_serve` route this version binds, by the route's source name.
+    /// Every HTTP route this version binds, by the route's source name.
     ///
     /// What a route is retired against once more than one branch runs: the
     /// endpoint registry is the process's, so a route is retired only when no
@@ -3377,6 +3377,9 @@ fn run_passes(
         channelize::run(phase_out)
     })
     .map_err(|error| blame.channelize(error, ctx.lowering_ctx()))?;
+    ctx.lowering_ctx()
+        .check_sink_domains(&channelized)
+        .map_err(|error| blame.unsupported(error, Some(&channelized)))?;
     settle(
         &channelized,
         "post-channelize",
@@ -3552,7 +3555,7 @@ fn compile_to_in(
 /// - **Pure programs** (no sinks): a single `("main", op)` entry whose
 ///   producer is subscribed to `main_consumer`.  The caller drives the main
 ///   loop by repeatedly calling [`TileProducer::get`] on that producer.
-/// - **Sink programs** (e.g. `http_serve`): one entry per sink name of the
+/// - **Sink programs** (e.g. an HTTP route): one entry per sink name of the
 ///   trailing `Record{…}`, each wired to a [`SinkConsumer`] that dispatches
 ///   to the registered [`DataSink`](crate::interpreter::DataSink).  For
 ///   sink-only programs the supplied `main_consumer` is dropped before

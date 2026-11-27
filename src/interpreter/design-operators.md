@@ -523,7 +523,9 @@ tiles. It stands over its rows as a record does, and its arms partition them: ea
 rows carrying its tag, ascending, and its payloads as one tile over those rows. A collection payload
 is that arm tile's level, so it grows as it arrives. A variant with no collection in any payload
 stays a `ColumnValue::Union` column. `Tiling::from_extent` chooses between the two by
-`Extent::holds_a_collection`.
+`Extent::holds_a_collection`. A union column emits each row once its payload is complete,
+including its aggregates and record fields. At level zero the whole payload must be terminal;
+under enclosing keys, complete rows emit independently.
 
 `VariantWrap` places its payload, at the level the payload's type names, as the wrapped tag's arm
 over every row. Every other arm is present and empty, so the union is total over its tags.
@@ -666,7 +668,7 @@ Each operator answers a projection as its row of this table states.
 | `Constant` | A collection constant answers the admitted keys at any level (`Restates::Every`), since it holds its whole tile. A scalar constant answers the whole value or nothing. |
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is read whole. A collection function is read at the outermost keys named by the actual arguments, including arguments beneath nested input levels. Where the input's values are its keys and the arguments stand at the first level, the projection reaches the function directly and those keys are released with the input's. Other lookups retain function keys because later input rows may reference them again. A scalar function is read whole. Beneath the outermost keys the input projection must be above the level the function applies at (`Restates::Above`). |
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
-| `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
+| `MapResultWithSource` | The input is pulled at the projection through its value level (`Restates::Above`). Levels opened inside a source value have no corresponding input level. A morsel reads only its own source keys. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
 | `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. Releasing enclosing keys releases those records only; partial cell releases retain collection-valued sibling fields for later rows, while unused keyless fields can be released whole. A bare product releases unused fields whole. |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
@@ -1146,13 +1148,26 @@ pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
 nodes include a label, tiling, and input edges; boundary nodes have no tiling. Walk roots are
 derived from the edges on both sides of the wire rather than serialized separately.
 
+### Materialized source values
+
+`MapResultWithSource` opens each complete `ColumnValue` returned by a source into
+`Tiling::from_extent(output_extent)`. Record fields and collection-valued fields use the same
+`column_value_to_tile` and `open_collections` adapters as other materialized values. Newly opened
+collection completion predicates are qualified by the input rows fetched in that pull. An empty
+pull therefore closes no collection beneath a request that has not arrived.
+
+A release can cover individual output fields or collection cells. `through_shared_levels`
+projects the accumulated obsolete guard back to the source key tiling. The source receives a
+key release only when the complete value at that key is released. Partial output releases remain
+recorded by the producer and do not discard fields another consumer still needs.
+
 ### Operator catalog
 
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
 | `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::from_bindings`, any tiling from `Constant::collection` | Produces a fixed tile. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
 | `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
-| `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
+| `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Tiling::from_extent(output))` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. A row stands where every arm holds it, and a level beneath the pair is complete only beneath the rows the pair holds or calls complete: an arm may call its own collection under a row complete before another arm reaches that row ([qualified predicates](#qualified-predicates)). |
 | `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. Construction asserts that the function's domain extent includes the data's value extent, with one exception: a `UInt` or range value extent at a `0..𝑛` domain, the erasure of a refined `UInt` or range that inference proved inside the range. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. Keys beneath more than one level of the data are looked up the same way: each key's group stands in its place beneath the data's levels, an unanswered key is withheld (`Tile::withhold`, so no level calls a prefix of its path complete), a key the function settled without holding is dropped, and each group is complete beneath a complete path. A one-level function drops such a row too, beneath any level of the data: the function is read with its deleted keys removed, which are the keys a gated leg's `Restrict` rejected. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
@@ -1343,7 +1358,27 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the item finished" — only the release of its **newest live row** is the ack, exactly as a release from the body alone is not one.
 - **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it, in the tiling of `V` (`Tiling::from_extent`), so a collection-valued key arrives as a level, as every store read hands it out. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_read`, an induction accumulator's trailing read. It samples through `store_current` at the store's closure, so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. It reads the store whole and cuts the settled value and its completeness to the requested output keys. Without enclosing rows, a partial output release hides those keys while retaining the store slot. A universal release retires it and releases the store slot; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream, commit time ⇀ `V`, out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
-- **`RekeySorted` / `RekeySortedProducer`** (`tile_operators/rekey_sorted.rs`) — re-keys a collection of pairs by each pair's first component, `𝐾 ⇀ (𝐽, 𝑉)` to `𝐽 ⇀ 𝑉`, for an input whose new keys are distinct and rise with its own order: the `map` constructor's re-keying, with completeness passing through. No CCL term names it. Op-conversion builds it for every reply tap of a commit store, a `with begin():` block's value among them ([mutability.md](../ccl/design/mutability.md#replies-ride-their-transaction), "Replies ride their transaction"): the tap's `StoreValueStream` holds `(item position, value)` at each commit, the `TransactWriter` having paired the value with the position the `TransactDriver`'s row carries (`F_ITEM_POSITION`), and a site commits each item once and in its source's order. Once the input is complete through a position, the output is complete through the key carried there, so an item's value is final at its commit rather than when the source ends. That prefix is spelled over the output's domain, the pairs' first component's extent, which names a union key's tags: a concatenation's positions are a union, and the loop over one commits its parts in tag order. A release of keys reaches the input as the longest prefix of positions whose every row has its key released, which is exact for a prefix of keys; the rows above a gap stay with the input, and the operator drops them from its output. Keys that do not rise stop it with a panic in every build.
+- **`RekeySorted` / `RekeySortedProducer`** (`tile_operators/rekey_sorted.rs`) re-keys a
+  collection of pairs by each pair's first component, `𝐾 ⇀ (𝐽, 𝑉)` to `𝐽 ⇀ 𝑉`. The new keys
+  are distinct and rise with the input's order. This is the `map` constructor's re-keying,
+  with completeness passing through. No CCL term names it.
+
+  Op-conversion builds it for every reply tap of a commit store, including a `with begin():`
+  block's value ([Replies ride their transaction](../ccl/design/mutability.md#replies-ride-their-transaction)).
+  The tap's `StoreValueStream` holds `(item position, value)` at each commit. The `TransactWriter`
+  pairs the value with the position its `TransactDriver` row carries (`F_ITEM_POSITION`). A site
+  commits each item once and in its source's order.
+
+  Once the input is complete through a position, the output is complete through the key carried
+  there. An item's value is final at its commit. The prefix uses the output domain's extent to
+  name a union key's tags: concatenation positions are a union, and a loop over one commits its
+  parts in tag order. Predicates inside collection-valued payloads name the input positions.
+  Rekeying extracts each payload at its original position and qualifies its statements beneath
+  the new key, including collections inside records and variants.
+
+  A release reaches the input as the longest prefix of positions whose every row has its key
+  released. The rows above a gap stay with the input and are dropped from the output. Keys that
+  do not rise stop the operator with a panic in every build.
 
 A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` serves both engines.
 
@@ -1612,6 +1647,10 @@ The pipeline always bottoms out at one of three consumer shapes:
    `FanOut` / `Memo` of let-bound upstream) across every entry.  Each entry
    is subscribed by its corresponding `SinkConsumer`.
 
+`DataSink::process` returns the consumed region as a `TileGuard`. `SinkConsumer` releases that
+region to the producer. A sink that dispatches whole values leaves incomplete rows unconsumed;
+their already-arrived fields remain available on later pulls.
+
 In all three cases planning has ensured every iteration site has an explicit
 `iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
 what to emit based only on its own AST shape and the input flowing in.
@@ -1723,6 +1762,10 @@ The answer keeps the input's keys at every level above the rows, so a release pa
 to the input, each row's collection going with its row.
 
 ### Where a collection is materialized
+
+Materialization requires complete values. A terminal aggregate extracts its accumulator with
+`AggregateKind::extract` before its result becomes a cell. A variant withholds a partial payload,
+including an aggregate, until that payload is complete.
 
 A collection reaches an operator in one of two shapes. A **streamed** one carries its keys in
 a domain column, one row per key, and is what every consumer that iterates a collection reads.

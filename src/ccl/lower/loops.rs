@@ -523,6 +523,7 @@ fn lower_for_body_stmts_scoped(
                 value,
                 transparency,
             } => {
+                #[cfg(test)]
                 refuse_nested_sink(target, value, stmt.span)?;
                 let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
                 let names = assignment.names();
@@ -572,7 +573,14 @@ fn lower_for_body_stmts_scoped(
                     transparency: BindingTransparency::Transparent,
                 });
             }
-            ChlStmt::Declare { target, annotation } => {
+            ChlStmt::Declare {
+                target,
+                annotation,
+                builtin,
+            } => {
+                if let Some(at) = builtin {
+                    return Err(builtin_misplaced(*at));
+                }
                 let (name, occurrence, channel, ty) =
                     feed_declaration(target, annotation, stmt.span, ctx)?;
                 if mutation_scope.contains(&name) {
@@ -626,10 +634,7 @@ fn lower_for_body_stmts_scoped(
                 builtin: Some(builtin),
                 ..
             } => {
-                return Err(LoweringError::unsupported(
-                    *builtin,
-                    "a `@Builtin` function is declared at a std module's top level",
-                ));
+                return Err(builtin_misplaced(*builtin));
             }
             ChlStmt::FunctionDef {
                 owner: None,
@@ -1641,6 +1646,7 @@ fn lower_loop_body_chain_scoped(
                 value,
                 transparency,
             } => {
+                #[cfg(test)]
                 refuse_nested_sink(target, value, stmt.span)?;
                 let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
@@ -1753,7 +1759,14 @@ fn lower_loop_body_chain_scoped(
                     stmt.span,
                 )
             }
-            ChlStmt::Declare { target, annotation } => {
+            ChlStmt::Declare {
+                target,
+                annotation,
+                builtin,
+            } => {
+                if let Some(at) = builtin {
+                    return Err(builtin_misplaced(*at));
+                }
                 let (name, occurrence, channel, ty) =
                     feed_declaration(target, annotation, stmt.span, ctx)?;
                 ctx.tag_image(

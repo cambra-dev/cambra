@@ -770,6 +770,41 @@ impl NominalDecl {
         })
     }
 
+    /// Copy the declaration with its constructor parameter types transported. The transport
+    /// preserves type parameters and variance, as renaming a source-domain atom does. A
+    /// declaration whose constructors are not defined yet has no types to transport.
+    pub fn map_declared_types(&self, map: &mut dyn FnMut(&mut Type) -> bool) -> Option<Rc<Self>> {
+        let body = self.body.get()?;
+        let mut changed = false;
+        let ctors = body
+            .ctors
+            .iter()
+            .map(|ctor| NominalCtor {
+                name: ctor.name.clone(),
+                span: ctor.span,
+                orders: ctor.orders.clone(),
+                params: ctor
+                    .params
+                    .iter()
+                    .map(|(name, ty)| {
+                        let mut ty = ty.clone();
+                        changed |= map(&mut ty);
+                        (name.clone(), ty)
+                    })
+                    .collect(),
+            })
+            .collect();
+        changed.then(|| {
+            Rc::new(Self {
+                body: Rc::new(OnceCell::from(NominalBody {
+                    ctors,
+                    variances: body.variances.clone(),
+                })),
+                ..self.instance()
+            })
+        })
+    }
+
     /// Record the declaring module's `const` parameters the type reaches
     /// ([`Self::implicit_consts`]).
     ///

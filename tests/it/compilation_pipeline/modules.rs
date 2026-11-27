@@ -825,7 +825,7 @@ fn public_place_declarations_are_refused(#[case] declaration: &str) {
     pub n = 1
 "}, "its top level causes `WriteTxn(stock)`", "stock: Mut(Int, Txn) := 0")]
 #[case::a_route(indoc! {"
-    run std::http(port=\"8080\", method=\"GET\", path=\"/x\") as server
+    run std::http::serve(port=\"8080\", method=\"GET\", path=\"/x\") as server
     pub n = 1
 "}, "it runs another module", "run std::http")]
 #[timeout(Duration::from_secs(10))]

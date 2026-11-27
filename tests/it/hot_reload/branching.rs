@@ -42,64 +42,67 @@ use super::serving::{
 /// divergent edit to the stateful loop, observable on a route `main` does not
 /// serve.
 const DASHED_LOG: &str = indoc! {r#"
-    run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-    http_set_resps_replies: Feed(String)
-    set_reqs = http_set_resps::requests
-    run std::http(port="{PORT}", method="GET", path="/get2") as http_get_resps
-    http_get_resps_replies: Feed(String)
-    get_reqs = http_get_resps::requests
+    import std::http as http_api
+    run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+    http_set_resps_replies: Feed(http_api::Response)
+    set_reqs = [request.body() for request in http_set_resps::requests]
+    run std::http::serve(port="{PORT}", method="GET", path="/get2") as http_get_resps
+    http_get_resps_replies: Feed(http_api::Response)
+    get_reqs = [request.body() for request in http_get_resps::requests]
 
     log: Mut(String, Txn) := ""
 
     for msg in set_reqs:
         with begin():
             log := log + "-" + msg
-        http_set_resps_replies << "ok\n"
+        http_set_resps_replies << http_api::ok_text("ok\n")
 
     for req in get_reqs:
         with begin():
-            http_get_resps_replies << log
+            http_get_resps_replies << http_api::ok_text(log)
     http_set_resps::respond(http_set_resps_replies)
     http_get_resps::respond(http_get_resps_replies)
 "#};
 
 /// A second divergent edit of the same shape, read on `/get2`.
 const PLUSSED_LOG: &str = indoc! {r#"
-    run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-    http_set_resps_replies: Feed(String)
-    set_reqs = http_set_resps::requests
-    run std::http(port="{PORT}", method="GET", path="/get2") as http_get_resps
-    http_get_resps_replies: Feed(String)
-    get_reqs = http_get_resps::requests
+    import std::http as http_api
+    run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+    http_set_resps_replies: Feed(http_api::Response)
+    set_reqs = [request.body() for request in http_set_resps::requests]
+    run std::http::serve(port="{PORT}", method="GET", path="/get2") as http_get_resps
+    http_get_resps_replies: Feed(http_api::Response)
+    get_reqs = [request.body() for request in http_get_resps::requests]
 
     log: Mut(String, Txn) := ""
 
     for msg in set_reqs:
         with begin():
             log := log + "+" + msg
-        http_set_resps_replies << "ok\n"
+        http_set_resps_replies << http_api::ok_text("ok\n")
 
     for req in get_reqs:
         with begin():
-            http_get_resps_replies << log
+            http_get_resps_replies << http_api::ok_text(log)
     http_set_resps::respond(http_set_resps_replies)
     http_get_resps::respond(http_get_resps_replies)
 "#};
 
 /// `running-log` with `log` dropped, which no version holding it may become.
 const LOG_DROPPED: &str = indoc! {r#"
-    run std::http(port="{PORT}", method="POST", path="/set") as http_set_resps
-    http_set_resps_replies: Feed(String)
-    set_reqs = http_set_resps::requests
-    run std::http(port="{PORT}", method="GET", path="/get2") as http_get_resps
-    http_get_resps_replies: Feed(String)
-    get_reqs = http_get_resps::requests
+    import std::http as http_api
+    run std::http::serve(port="{PORT}", method="POST", path="/set") as http_set_resps
+    http_set_resps_replies: Feed(http_api::Response)
+    set_reqs = [request.body() for request in http_set_resps::requests]
+    run std::http::serve(port="{PORT}", method="GET", path="/get2") as http_get_resps
+    http_get_resps_replies: Feed(http_api::Response)
+    get_reqs = [request.body() for request in http_get_resps::requests]
 
     for msg in set_reqs:
-        http_set_resps_replies << "ok\n"
+        http_set_resps_replies << http_api::ok_text("ok\n")
 
     for req in get_reqs:
-        http_get_resps_replies << "none\n"
+        http_get_resps_replies << http_api::ok_text("none\n")
     http_set_resps::respond(http_set_resps_replies)
     http_get_resps::respond(http_get_resps_replies)
 "#};

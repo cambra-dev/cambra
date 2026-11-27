@@ -707,7 +707,7 @@ Every collection is indexed by some type, the type of its **positions**: a list'
 indices, a set's and a map's are its keys, and a comprehension result's are its generators'
 ([3.12 Comprehensions](#312-comprehensions)). Positions are generally not visible to users. They
 fix the order of an ordered loop, and they match up data between coupled source/sink pairs like
-`http_serve`.
+an HTTP route's requests and responses.
 
 The single way to introduce inter-iteration ordering is an **ordered loop**: one whose iterations
 interact through a loop-carried accumulator (§4.6) or an exception escaping its body. It runs in
@@ -831,7 +831,7 @@ introduce such dependencies are:
 - written order within one evaluation, between statements, arguments or operands that
   interact through effects ([8.5 Ordering and concurrency](#85-ordering-and-concurrency)): one
   writes a variable the other reads or writes, or one may raise and the other causes something,
-- sink contracts (e.g. `http_serve`'s response-paired-with-request
+- sink contracts (e.g. an HTTP route's response-paired-with-request
   rule — §7.3), which fix ordering at the boundary between the
   program and the outside world.
 
@@ -1661,7 +1661,7 @@ A CHL program is a [top-level block](#21-top-level-block) of statements. Nonterm
 introduce bindings, perform effects ([feeds and effecting calls](#49-expression-statement)), or
 contribute nothing (`pass`). A value-producing
 block takes its value from its final contributing statement. A program that registers sinks,
-such as `http_serve`, instead has an implicit record of those sinks as its program value.
+such as an HTTP route's, instead has an implicit record of those sinks as its program value.
 
 For example:
 
@@ -4005,7 +4005,7 @@ is resolved when the program is compiled, so each call path is fixed.
 #### Output outside the program
 
 `AffectWorld` is the effect of every output outside the program. A **sink** is an operation that
-hands data out: binding a feed to a sink, as `http_serve` binds its responses ([7.3
+hands data out: binding a feed to a sink, as `std::http::serve` binds its responses ([7.3
 Sources](#73-sources)), or calling a sink function, which takes a collection and writes it out. Each
 causes `AffectWorld`. A call that sends a request out and returns the reply causes `AffectWorld` and
 requires `ObserveWorld`.
@@ -4970,58 +4970,72 @@ of a `@Builtin` function a std module declares ([9.16 The std root](#916-the-std
 
 
 ```python
-run std::http(port="8080", method="POST", path="/echo") as server
-replies: Feed(String)
-for request in server::requests:
-    replies << request
+import std::http
+run std::http::serve(port="8080", method="POST", path="/echo") as server
+replies: server::Reqs |=> http::Response = [
+    http::ok_text(request.body()) for request in server::requests
+]
 server::respond(replies)
 ```
 
-`std::http` takes three string constants, `port`, `method`, and `path`
-([9.19 Constants](#919-constants)). Each run opens its route when the program starts.
-`requests` contains incoming request bodies as Strings. `respond(values)` consumes an ordinary
-String collection. Each response's position pairs it with the request that triggered that
-iteration. The module keeps its writable response place private.
+`std::http` is importable. It declares nominal `Header`, `Request`, and `Response` types shared
+by all routes. A header holds a String name and value. A request holds its method, target,
+headers, and body; `.method()`, `.target()`, `.headers()`, and `.body()` read those fields.
+A response holds its final status, headers, and body. `Response::new(status, headers, body)`
+accepts statuses from 200 through 599. Header collections are `List(Header)` values that preserve
+order and repeated names. `http::ok_text(body)` and `http::ok_html(body)` construct 200
+responses with the corresponding UTF-8 Content-Type header.
+
+Bodies are UTF-8 Strings. An invalid UTF-8 request body receives 400 before entering the request
+source. Binary bodies, streaming bodies, informational responses, protocol upgrades, and TLS are
+**[Open]**.
+
+Response header names are HTTP tokens. Values contain visible ASCII, spaces, and internal tabs;
+leading or trailing whitespace and control characters are rejected. The transport owns
+Content-Length, Transfer-Encoding, Connection, Trailer, and Upgrade; a response that supplies
+those fields receives 500. Repeated Content-Type fields are rejected. Other repeated headers,
+such as Set-Cookie, retain their order. Field syntax follows
+[RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#name-field-values). The route matches the
+path before the query string; `Request.target()` retains the query string.
+
+A route's method is an HTTP token and matches exactly: methods are case-sensitive, so `GET` and
+`get` are two methods. A route's path begins with `/` and holds only URI path characters and
+percent-encodings. Two paths are one path when they have one normal form
+([RFC 3986](https://www.rfc-editor.org/rfc/rfc3986.html#section-6.2.2)): a percent-encoded
+unreserved character equals the character, hex digits match in either case, and `.` and `..`
+segments are resolved. `/a%62`, `/ab` and `/x/../ab` are one path, and `/ping` and `/ping/` are
+two. A request reaches the route whose path is its target's path in that sense. Any other method
+or path is refused.
+
+`std::http::serve` takes three String constants, `port`, `method`, and `path`
+([9.19 Constants](#919-constants)). Each run opens its route when the program starts and exports
+its request-position type `Reqs`. `requests` has type `Reqs |=> http::Request`.
+`respond(values: Reqs |=> http::Response)` connects one complete response definition. The domain
+must be the route's exact request domain: filtering out keys, adding contribution-site tags, or
+supplying another route's requests is rejected. A response becomes available when its complete
+nominal value is available, including its header list. The type contract establishes coverage;
+it does not guarantee that an arbitrary data dependency eventually becomes available.
+
+The response connection is defined exactly once per run. Its private response Feed uses `<<=`;
+callers pass ordinary data functions and receive no writable place. A total comprehension or an
+exhaustive branch per request provides the response function without a keyed feed.
 
 Runs sharing a port share an HTTP listener. The `(port, method, path)` triple must be unique
 across all runs in the program. A module can take an address from `const param` declarations
-and run `std::http` with those arguments. The internal `http_serve` declaration primitive is
-reserved for the embedded standard module and is unavailable to user code.
+and run `std::http::serve` with those arguments. The module declares its route with `@Builtin`
+declarations ([9.16 The std root](#916-the-std-root)), so no name is reserved in other modules.
 
 Additional sources can be registered for tests and demos. The proposed `std::time` API adds a
 clock read ([7.5 Time [Decided]](#75-time-decided)).
 
-> **Direction [Open].** The HTTP module exposes request bodies and String responses. Extensions
-> for status codes, the structured-request surface
-> (`req.body`, `req.query`, `req.time`, headers), response pairing via
-> feed-at-index (`resps[req.id] = …`, as the north-star `txn_kv`
-> writes it), and structured response serialization remain unspecified. The sketch the
-> north-star `storefront` handlers are
-> written against: a response is a record,
-> `{code: {Int where 100 <= _ <= 599}, body: String}`, and the status
-> constructors are ordinary library functions over it
-> (`def not_found(body): (code=404, body=body)`, likewise `ok` /
-> `bad_request` / `conflict`), with the record literal as the escape
-> hatch for other codes. The HTTP module is a module of the std root
-> ([9.16 The std root](#916-the-std-root)). It is run to
-> expose its request collection and response function. A function may return collection values.
-> The location of pure response constructors remains to be specified.
-> A response feed's
-> element type would be per-endpoint: a bare serializable value,
-> answered as a 200 carrying it (`txn_kv` writes `String` bodies; the
-> north-star `storefront` `/stats` answers with its revenue map
-> directly), or the response record — one type, **not** the union of
-> the two, since unions are structural, for records and variants, not
-> a pattern-matchable set algebra over arbitrary types; a handler with
-> any non-200 arm therefore wraps every arm. How the sink accepts
-> either element type (an instance riding §8's typeclass solver?),
-> the wire serialization of bare structured values, and whether an
-> endpoint's response type can carry a contract refinement
-> (`{Response where _.code < 500}`, "never answers 500") ride on the
-> same library design. So does the typing of the response sink
-> itself: a *keyed feed* — supporting both
-> `resps[req.id] = …` and a feed form `resps << …` — that needs CCL
-> and CHL definitions.
+> **Direction.** **[Planned]**: a response map defined key by key,
+> `resps: OnceMap(server::Reqs, http::Response)` with `resps[k] = …` on every path, passed whole to
+> `respond`, which lets a handler answer from several places rather than in one comprehension
+> ([mutability-model.md, "Sinks"](../src/ccl/design/mutability-model.md#sinks)). **[Open]**: a
+> route's response type carrying a contract refinement,
+> `{http::Response where _.status() < 500}` ("never answers 500"), and a bare structured value
+> answered as a 200 carrying its serialization, as the north-star `storefront` `/stats` answers
+> with its revenue map.
 >
 > **Request validation derived from the handler's type**, in the same
 > **[Open]** design. A request is untrusted input, so the endpoint is a
@@ -5179,7 +5193,7 @@ arrives on the source once the clock reads at or after the row's `time::at` fiel
   row refers to. A session-expiry handler compares `e.time::at` with the session's current
   expiry before expiring it.
 - **No feed cycle.** A loop over the source that feeds the sink closes no cycle of feeds: the path
-  from the sink to the source passes through the runtime, as `http_serve`'s responses and requests
+  from the sink to the source passes through the runtime, as an HTTP route's responses and requests
   pass through a client.
 - **Reload keeps held rows; a process exit discards them.** The run's identity is its module path
   and name. A reload that keeps the run keeps its held rows. Durable state is **[Tentative]**
@@ -6573,10 +6587,11 @@ that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
 ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), answer that declaration
 in every module, a module that declares its own `Option` included.
 
-`std::http` is embedded in the compiler. `run std::http(…) as server` exposes
-`server::requests` and `server::respond(values)` ([7.3 Sources](#73-sources)). It declares state and
-IO, so it is run rather than imported. Its address arguments are constants
-([9.19 Constants](#919-constants)), and each run serves its own address.
+`std::http` is embedded and importable; it declares nominal HTTP values and pure helpers.
+`run std::http::serve(…) as server` exposes `server::requests` and `server::respond(values)`
+([7.3 Sources](#73-sources)). The module `std::http::serve` declares state and IO, so it is run.
+Its address arguments are constants ([9.19 Constants](#919-constants)), and each run serves its
+own address.
 
 **[Planned]** — `std::time`: `import std::time` binds `time`, then `time::now()`
 ([7.5 Time [Decided]](#75-time-decided)).
@@ -6597,6 +6612,27 @@ def clock() => Int requires ObserveWorld
 pub def now() => Instant:
     Instant::new(clock())
 ```
+
+A `@Builtin type T` is a type the compiler supplies, with no parameters and no constructors. A
+`@Builtin x: T` is a value the compiler supplies, of the annotated type. The compiler finds each by
+its path, as it finds a function. `std::http::serve` declares its route this way, and the compiler
+supplies the route at the address the module's constant parameters give:
+
+```python
+@Builtin
+pub type Reqs
+
+@Builtin
+_requests: Reqs |=> {String, String, List({String, String}), String}
+
+@Builtin
+_responses: Feed(http::Response)
+```
+
+`Reqs` is the type of a request's key, and a diagnostic prints it as the run reaches it, as
+`server::Reqs` for `run std::http::serve(…) as server`. `_requests` holds each request's method,
+target, headers and body, and `_responses` is the Feed whose definition answers them
+([7.3 Sources](#73-sources)).
 
 **[Decided]** — `Set`, `Map` and `FullMap` stay compiler builtins, as nominal types with no
 constructors
@@ -6825,7 +6861,7 @@ If the parse succeeds, the compiler may still reject the program for
 semantic reasons:
 
 - Use of an unsupported construct (e.g. `yield` outside a generator
-  function, `while` loops, `http_serve` not at top level).
+  function, `while` loops, `@Builtin` outside a std module's top level).
 - Type mismatches (e.g. comparing values of incompatible types,
   feeding a name that is not a feed).
 - Unsupported operator combination that the current planner can't

@@ -141,7 +141,7 @@ fn run_program(
 
     // Pull every branch's `main` output until each has released everything,
     // and keep the scheduler running until every branch's sinks signal
-    // completion. Long-lived servers (e.g. `http_serve`) never signal, so for
+    // completion. Long-lived servers (e.g. an HTTP route) never signal, so for
     // them this loop runs until the process exits. The control port is serviced
     // once per pass: a swap sits between two pulls, so a source delivering
     // without pause must not be able to starve it of its turn.

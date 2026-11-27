@@ -406,7 +406,10 @@ impl Printer {
             Type::Base(BaseType::Unit) => "{}".to_string(),
             Type::Base(b) => b.keyword().to_string(),
             Type::UIntRange(n) => format!("{{UInt where _ < {n}}}"),
-            Type::DataSource(name) => format!("Source({name})"),
+            // A key type a declaration names prints as the program reaches it, `server::Reqs`.
+            Type::DataSource(name) => name
+                .spelling()
+                .map_or_else(|| format!("Source({name})"), str::to_string),
             Type::Txn => "Txn".to_string(),
             Type::Hole => "_".to_string(),
             Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) => self.variable(ty),
@@ -649,7 +652,8 @@ impl Printer {
         // theirs by a length and a source.
         let shown_domain = !(is_data
             && dependent.is_none()
-            && matches!(domain, Type::UIntRange(_) | Type::DataSource(_)));
+            && (matches!(domain, Type::UIntRange(_))
+                || matches!(domain, Type::DataSource(source) if source.spelling().is_none())));
         let dom = if shown_domain {
             self.ty(domain)
         } else {
@@ -678,7 +682,9 @@ impl Printer {
         let binder = binder.map(|(_, s)| s).unwrap_or_default();
         match (dependent, domain) {
             (None, Type::UIntRange(n)) if is_data => format!("Array({n}, {cod})"),
-            (None, Type::DataSource(source)) if is_data => format!("Source({source}, {cod})"),
+            (None, Type::DataSource(source)) if is_data && source.spelling().is_none() => {
+                format!("Source({source}, {cod})")
+            }
             // `_ |=> V` lowers to a funkind hole, which admits a sum; a plain collection over
             // a hole domain is written `FullMap(_, V)`, which lowers back to it.
             (None, Type::Hole) if matches!(fun_kind, FunKind::Data(None)) => {
@@ -1534,6 +1540,13 @@ mod tests {
             chl_type(&Type::ChanDom(Name::raw("d"), ChanLevel(0))),
             NOT_PRINTABLE
         );
+    }
+
+    #[test]
+    fn a_collection_names_its_written_source_domain() {
+        let source = Type::DataSource(crate::ccl::SourceName::spelled("internal", "route::Reqs"));
+        let ty = Type::full_map_of(source, Type::Base(BaseType::String));
+        assert_eq!(chl_type(&ty), "route::Reqs |=> String");
     }
 
     fn int() -> Type {

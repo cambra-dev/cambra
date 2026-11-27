@@ -322,7 +322,7 @@ fn websocket_key(request: &Request) -> Option<String> {
     request
         .headers()
         .iter()
-        .find(|header| header.field.equiv("Sec-WebSocket-Key"))
+        .find(|header| header.field == "Sec-WebSocket-Key")
         .map(|header| header.value.as_str().to_string())
 }
 
