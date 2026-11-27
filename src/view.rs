@@ -1,14 +1,24 @@
-//! A borrowed region of a column: stored values, or one value repeated.
+//! A borrowed region of a column: stored values, one value repeated, or stored values at a list
+//! of positions.
 //!
 //! Shared by `crate::scalar_ops` and the interpreter; both import `View` from this module.
 
+use crate::interpreter::RowIndex;
 use std::ops::Range;
 
-/// A borrowed region of a column: stored values, or one value repeated `len` times.
+/// A borrowed region of a column: stored values, one value repeated `len` times, or the stored
+/// values at `positions`, in that order.
 #[derive(Debug)]
 pub enum View<'a, T> {
     Slice(&'a [T]),
-    Constant { value: &'a T, len: usize },
+    Constant {
+        value: &'a T,
+        len: usize,
+    },
+    Selected {
+        values: &'a [T],
+        positions: &'a [RowIndex],
+    },
 }
 
 impl<T> Clone for View<'_, T> {
@@ -30,6 +40,7 @@ impl<'a, T> View<'a, T> {
         match *self {
             View::Slice(values) => values.len(),
             View::Constant { len, .. } => len,
+            View::Selected { positions, .. } => positions.len(),
         }
     }
 
@@ -46,6 +57,7 @@ impl<'a, T> View<'a, T> {
                 assert!(i < len, "index {i} out of a view of {len}");
                 value
             }
+            View::Selected { values, positions } => &values[positions[i]],
         }
     }
 
@@ -60,6 +72,26 @@ impl<'a, T> View<'a, T> {
                     len: range.len(),
                 }
             }
+            View::Selected { values, positions } => View::Selected {
+                values,
+                positions: &positions[range],
+            },
+        }
+    }
+
+    /// The values at `positions`, in that order, without copying them, or `None` for a view that
+    /// is already a selection: composing two selections would build a new list of positions.
+    pub fn select(self, positions: &'a [RowIndex]) -> Option<Self> {
+        match self {
+            View::Slice(values) => Some(View::Selected { values, positions }),
+            View::Constant { value, len } => {
+                debug_assert!(positions.iter().all(|&p| p < len));
+                Some(View::Constant {
+                    value,
+                    len: positions.len(),
+                })
+            }
+            View::Selected { .. } => None,
         }
     }
 }
@@ -72,6 +104,9 @@ mod tests {
         match view {
             View::Slice(values) => values.to_vec(),
             View::Constant { value, len } => vec![value.clone(); len],
+            View::Selected { values, positions } => {
+                positions.iter().map(|&p| values[p].clone()).collect()
+            }
         }
     }
 
@@ -94,6 +129,28 @@ mod tests {
         let part = View::repeated(&nine, 5).range(2..4);
         assert_eq!(part.len(), 2);
         assert_eq!(values(part), vec![9, 9]);
+    }
+
+    /// A selection reads a slice's values at its positions, in their order, and a range of it
+    /// is a range of those positions. A repeated value selects a shorter repeat, and a selection
+    /// of a selection is refused rather than built.
+    #[test]
+    fn a_selection_reads_the_values_at_its_positions() {
+        let stored = vec![10, 11, 12, 13, 14];
+        let positions = [4, 0, 2];
+        let selected = View::Slice(&stored)
+            .select(&positions)
+            .expect("a slice selects");
+        assert_eq!(selected.len(), 3);
+        assert_eq!(*selected.get(0), 14);
+        assert_eq!(values(selected), vec![14, 10, 12]);
+        assert_eq!(values(selected.range(1..3)), vec![10, 12]);
+        let five = 5;
+        let repeat = View::repeated(&five, 9)
+            .select(&positions)
+            .expect("a repeat selects");
+        assert!(matches!(repeat, View::Constant { len: 3, .. }));
+        assert!(selected.select(&[0]).is_none());
     }
 
     #[test]

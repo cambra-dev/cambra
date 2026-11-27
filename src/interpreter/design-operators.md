@@ -1335,24 +1335,40 @@ conditionals nest by recursion.
 
 A `Case` hands its `CaseFn` each capture's block as a `Captured`: a view of a column the program
 already holds, the input's own column with the block's offset, or a column built for the block, for
-a `Case` that constructs. `CaseFn::eval` keeps the positions no arm has taken as an
-ascending `Vec<RowIndex>`. An arm's input is a record of the captures its body reads, gathered to its
-rows, with `~rows`, a `Units` column of their count, so the body runs on dense columns holding only
-those rows. A partial operation such as `//` never runs on a row its gate rejected. A `Holds`
-program reads the captures it names at the rows left. A `Tag` gate finds its union arm's first row
-in the block by binary search and walks the arm's rows from there beside the positions left; it
-gathers their payloads into the arm's input field `~payload`. A tag the column does not carry takes
-no row, and its payload is the empty column the gate holds. When one arm that reads no payload takes
-every row, its body's result is the `CaseFn`'s, with no merge.
+a `Case` that constructs. `CaseFn::eval_into` keeps the rows no arm has taken as a `Rows`: the whole
+block, which lists no position, or ascending positions. A `Holds` gate whose program holds at every
+row of that set moves the whole set to its arm, and one that holds at no row leaves the set as it
+is. A `Holds` gate that holds at some rows and not others lists positions and splits the set row by
+row. A `Tag` gate lists the positions of the set it reads. So a block that no gate splits lists no
+position unless a `Tag` gate reads it. An arm that takes no row is skipped and merges nothing. When
+one arm that reads no payload takes every row, its body's result is the `CaseFn`'s, with no merge.
 
-The arms' results merge in row order (`merge_parts`). A base type places each arm's values at its
-positions (`ColumnView::scatter_into`). A record merges field by field, and a union arm by arm: each
-row keeps the tag its arm gave it. A `Case` of `Int`, `UInt`, `String` or `Bool` is an operation: it
-writes a scratch column that later operations read like any other, or the output when it is the last
-instruction. A `Case` of a record, a union or `Unit` constructs. A `Case` holds the empty column of
-its result's type, `shape`, so finding a program's empty columns evaluates no arm. An arm's body may
-answer with a value it reads, such as `else x`, so its last instruction may be an input or a
-constant.
+A gate's or body's program reads a capture that has a view through a selection view at the arm's
+positions (`Captures::selected`, `View::Selected`), and reads the view itself at the whole block, so
+the capture is not copied. A capture without a view, and a capture whose view is already a
+selection, is gathered to the arm's rows into the arm's input. That input is a record which also
+holds `~rows`, a `Units` column of the arm's row count, so a program that reads no capture still
+has rows. A body computes only its arm's rows, so a partial operation such as `//` never runs on a
+row its gate rejected. A `Tag` gate finds its union arm's first row in the block by binary search
+and walks the arm's rows from there beside the positions left, noting each taken row's index in
+the tag's payload column. The body reads a payload of `Int`, `UInt`, `String` or `Bool` at those
+indices through a selection view (`Captures::payload`); any other payload is gathered into the
+arm's input field `~payload`. A tag the column does not carry takes no row, so its arm is skipped.
+
+A `CaseFn` keeps its buffers across the blocks of the program holding it (`CaseBuffers`): the rows
+left, each arm's rows, input and result, its gate's and body's scratch columns (`eval::Buffers`),
+and the merged column a last-instruction `Case` copies into the output. A block reuses these. It
+still builds a capture without a view, a `Tag` gate's payloads without a view, a union result, and
+three short lists of borrows: the captures, the arms' results to merge and their views.
+
+The results of the arms that ran merge in row order (`merge_into`). A base type writes each arm's
+values at its positions in the output (`ColumnView::scatter_into`). A record merges field by field,
+and a union arm by arm: each row keeps the tag its arm gave it. A `Case` of `Int`, `UInt`, `String`
+or `Bool` is an operation: it writes a scratch column that later operations read like any other, or
+the output when it is the last instruction. A `Case` of a record, a union or `Unit` constructs. A
+`Case` holds the empty column of its result's type, `shape`, so finding a program's empty columns
+evaluates no arm. An arm's body may answer with a value it reads, such as `else x`, so its last
+instruction may be an input or a constant.
 
 `[x // 2 if x > 0 else 0 - x for x in source1()]` compiles to the program below. `Display` prints
 it on one line; it is broken here after each `; `. The captures are listed in the parentheses, and
@@ -1372,7 +1388,11 @@ For a block whose `x` is `[3, -1, 4, 0]`, the first arm takes positions `[0, 2]`
 
 #### Column views
 
-`View<T>` (`src/view.rs`) borrows either a slice or one value repeated over a specified length.
+`View<T>` (`src/view.rs`) borrows a slice, one value repeated over a specified length, or the
+values of a slice at a list of positions (`Selected`). `View::select` makes a selection of a slice,
+and of a repeated value a shorter repeat, without copying. It builds no selection of a selection,
+which would need a new list of positions, so such a view is copied instead. Each kernel reads a
+selection through its positions.
 `ColumnView` (`types/column_view.rs`) wraps views of `Int`, `UInt`, `String`, or `Bool`. Record,
 union, and `Units` columns have no view. Taking a view or subrange does not copy the operand into
 another column. `ColumnValue::extend_from_view` copies a view into a column of the same element

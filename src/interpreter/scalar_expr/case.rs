@@ -12,8 +12,10 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 
 use super::ScalarProgram;
+use super::eval::{Buffers, Captures};
 use crate::ccl::{FieldKey, TagMap};
-use crate::interpreter::{ColumnValue, ColumnView, RowIndex, UnionArm};
+use crate::interpreter::RowIndex;
+use crate::interpreter::{ColumnValue, ColumnView, UnionArm};
 
 /// The field of an arm's input holding the payloads of a `Tag` gate's rows.
 pub(super) const PAYLOAD: &str = "~payload";
@@ -22,7 +24,74 @@ pub(super) const PAYLOAD: &str = "~payload";
 /// reads no capture still has rows.
 const ROWS: &str = "~rows";
 
-/// The empty column of a payload's type, which an arm reads when its union column lacks the tag.
+/// The buffers a [`CaseFn`] reuses across the blocks of the program holding it: the rows left,
+/// each arm's rows, input, programs' scratch columns and result, and the merged column. A capture
+/// without a view, a `Tag` gate's payloads without a view and a union result are still built per
+/// block.
+#[derive(Default)]
+pub(super) struct CaseBuffers {
+    /// The rows of the block no earlier arm took.
+    rest: Rows,
+    /// The positions of `rest` the current gate leaves, swapped into `rest` after the gate.
+    left: Vec<RowIndex>,
+    arms: Vec<ArmBuffers>,
+    /// The merged block that `Scratch::append_case_block` copies into its program's result.
+    pub(super) merged: Option<ColumnValue>,
+}
+
+/// One arm's buffers: its gate's input, program buffers and result, then its body's.
+#[derive(Default)]
+struct ArmBuffers {
+    /// The rows of the block this arm took.
+    taken: Rows,
+    /// For a `Tag` gate, the index in its tag's payload column of each row it took.
+    slots: Vec<RowIndex>,
+    /// Whether this arm took a row of the current block.
+    ran: bool,
+    gate_input: Option<ColumnValue>,
+    gate: Buffers,
+    holds: Option<ColumnValue>,
+    input: Option<ColumnValue>,
+    body: Buffers,
+    result: Option<ColumnValue>,
+}
+
+/// A set of rows of a block: every row, without listing them, or the positions listed. A `Holds`
+/// gate that selects every row of a set moves the whole set, and one that selects none leaves it,
+/// so a block that no gate splits lists no position unless a `Tag` gate reads it.
+#[derive(Default)]
+struct Rows {
+    block: bool,
+    positions: Vec<RowIndex>,
+}
+
+impl Rows {
+    /// The positions, or `None` for every row of the block.
+    fn positions(&self) -> Option<&[RowIndex]> {
+        (!self.block).then_some(self.positions.as_slice())
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.block && self.positions.is_empty()
+    }
+
+    fn set_empty(&mut self) {
+        self.block = false;
+        self.positions.clear();
+    }
+
+    /// List the positions of a set of every row of a block of `len` rows.
+    fn list(&mut self, len: usize) {
+        if self.block {
+            self.block = false;
+            self.positions.clear();
+            self.positions.extend(0..len);
+        }
+    }
+}
+
+/// The empty column of a `Case`'s result type, which finding a program's empty columns reads
+/// instead of evaluating an arm.
 ///
 /// `ColumnValue` has no `Hash`, so a shape hashes as nothing; `Eq` still compares it, which keeps
 /// equal values hashing equally.
@@ -66,13 +135,8 @@ pub(super) enum CaseGate {
     },
     /// Every row: the final `else`.
     Rest,
-    /// The rows whose value in the union field `scrutinee` carries `tag`, with `shape` the empty
-    /// column of the tag's payload.
-    Tag {
-        scrutinee: SmolStr,
-        tag: FieldKey,
-        shape: Shape,
-    },
+    /// The rows whose value in the union field `scrutinee` carries `tag`.
+    Tag { scrutinee: SmolStr, tag: FieldKey },
 }
 
 impl CaseGate {
@@ -109,68 +173,178 @@ impl CaseFn {
         })
     }
 
-    /// One value per row of a block of `len` rows, whose captures are `captures`.
-    pub(super) fn eval(&self, captures: &[(SmolStr, Captured)], len: usize) -> ColumnValue {
-        // Positions of the block no earlier arm took, ascending.
-        let mut rest: Vec<RowIndex> = (0..len).collect();
-        let mut results: Vec<ColumnValue> = Vec::with_capacity(self.arms.len());
-        let mut takens: Vec<Vec<RowIndex>> = Vec::with_capacity(self.arms.len());
-        for arm in &self.arms {
-            let (taken, payload) = arm.select(captures, len, &mut rest);
+    /// Write one value per row of a block of `len` rows, whose captures are `captures`, to `out`,
+    /// an empty column of the result's type.
+    pub(super) fn eval_into(
+        &self,
+        captures: &[(SmolStr, Captured)],
+        len: usize,
+        buffers: &mut CaseBuffers,
+        out: &mut ColumnValue,
+    ) {
+        debug_assert!(out.is_empty(), "a `CaseFn` writes an empty column");
+        if len == 0 {
+            return;
+        }
+        let CaseBuffers {
+            rest, left, arms, ..
+        } = buffers;
+        arms.resize_with(self.arms.len(), ArmBuffers::default);
+        rest.block = true;
+        rest.positions.clear();
+        for (arm, buffers) in self.arms.iter().zip(arms.iter_mut()) {
+            let payload = arm.select(captures, len, rest, left, buffers);
+            let ArmBuffers {
+                taken,
+                slots,
+                ran,
+                input,
+                body,
+                result,
+                ..
+            } = buffers;
+            *ran = !taken.is_empty();
+            if !*ran {
+                continue;
+            }
             // One arm taking every row answers the whole block, so its result is not merged.
-            if taken.len() == len && payload.is_none() && len > 0 {
-                return arm.body.eval(&gather(captures, &arm.reads, None, len));
-            }
-            let mut arm_input = gather(captures, &arm.reads, Some(&taken), len);
-            if let Some(payload) = payload {
-                let ColumnValue::Records(fields) = &mut arm_input else {
-                    unreachable!("a `CaseFn`'s input is a record column")
+            // Listed positions that hold every row are `0..len`, so the arm reads the block whole.
+            if (taken.block || taken.positions.len() == len) && payload.is_none() {
+                let input = gather_into(captures, &arm.reads, None, len, input);
+                let selection = Captures {
+                    captures,
+                    positions: None,
+                    payload: None,
                 };
-                fields.insert(PAYLOAD.into(), payload);
+                arm.body.eval_into(input, selection, body, out);
+                return;
             }
-            results.push(arm.body.eval(&arm_input));
-            takens.push(taken);
+            taken.list(len);
+            let taken = &taken.positions;
+            let input = gather_into(captures, &arm.reads, Some(taken), len, input);
+            // A payload with a view is read in place at its slots; any other is copied into the
+            // arm's input.
+            let payload = match payload {
+                None => None,
+                Some(values) => {
+                    debug_assert_eq!(slots.len(), taken.len(), "one slot per row taken");
+                    match values.view() {
+                        Some(view) => Some(view.select(slots).expect("a column's view is a slice")),
+                        None => {
+                            let copied = values.select_indices(slots.iter().copied(), slots.len());
+                            let ColumnValue::Records(fields) = &mut *input else {
+                                unreachable!("a `CaseFn`'s input is a record column")
+                            };
+                            fields.insert(PAYLOAD.into(), copied);
+                            None
+                        }
+                    }
+                }
+            };
+            let selection = Captures {
+                captures,
+                positions: Some(taken),
+                payload,
+            };
+            let result = cleared(result, || arm.body.empty_result(input, selection, body));
+            arm.body.eval_into(input, selection, body, result);
         }
         debug_assert!(rest.is_empty(), "the arms' gates split the rows");
-        let parts = results.into_iter().zip(takens.iter().map(Vec::as_slice));
-        merge_parts(parts.collect(), len)
+        let parts: Vec<(&ColumnValue, &[RowIndex])> = arms
+            .iter()
+            .filter(|arm| arm.ran)
+            .map(|arm| {
+                let result = arm.result.as_ref().expect("an arm that ran has a result");
+                (result, arm.taken.positions.as_slice())
+            })
+            .collect();
+        merge_into(&parts, len, out);
+    }
+}
+
+/// The column in `kept`, cleared, or on its first use the column that `empty` makes.
+fn cleared(
+    kept: &mut Option<ColumnValue>,
+    empty: impl FnOnce() -> ColumnValue,
+) -> &mut ColumnValue {
+    match kept {
+        Some(column) => {
+            column.clear();
+            column
+        }
+        None => kept.insert(empty()),
     }
 }
 
 impl CaseArm {
-    /// The positions of `rest` this arm takes, removed from `rest`, and for a `Tag` gate their
-    /// payloads, in a block of `len` rows.
-    fn select(
-        &self,
-        captures: &[(SmolStr, Captured)],
+    /// Move the rows of `rest` this arm takes to its `taken` buffer, in a block of `len` rows, and
+    /// for a `Tag` gate whose tag the union column carries return that tag's payload column, with
+    /// each taken row's index in it in the `slots` buffer. A tag the column does not carry takes
+    /// no row, so its arm is skipped and needs no payload. `left` is scratch for the positions
+    /// that `rest` keeps.
+    fn select<'a>(
+        &'a self,
+        captures: &'a [(SmolStr, Captured<'a>)],
         len: usize,
-        rest: &mut Vec<RowIndex>,
-    ) -> (Vec<RowIndex>, Option<ColumnValue>) {
+        rest: &mut Rows,
+        left: &mut Vec<RowIndex>,
+        buffers: &mut ArmBuffers,
+    ) -> Option<&'a ColumnValue> {
+        let ArmBuffers {
+            taken,
+            slots,
+            gate_input,
+            gate,
+            holds,
+            ..
+        } = buffers;
+        taken.set_empty();
+        left.clear();
+        if rest.is_empty() {
+            return None;
+        }
         match &self.gate {
-            CaseGate::Rest => (std::mem::take(rest), None),
+            CaseGate::Rest => {
+                std::mem::swap(taken, rest);
+                rest.set_empty();
+                None
+            }
             CaseGate::Holds { program, reads } => {
-                let holds = program.eval(&gather(captures, reads, Some(rest), len));
+                let positions = rest.positions();
+                let input = gather_into(captures, reads, positions, len, gate_input);
+                let selection = Captures {
+                    captures,
+                    positions,
+                    payload: None,
+                };
+                let holds = cleared(holds, || program.empty_result(input, selection, gate));
+                program.eval_into(input, selection, gate, holds);
                 let ColumnValue::Bools(holds) = holds else {
                     unreachable!("a gate yields a `Bool` column, got {holds:?}")
                 };
-                let mut taken = Vec::new();
-                let mut left = Vec::with_capacity(rest.len());
-                for (&p, holds) in rest.iter().zip(holds) {
-                    if holds {
-                        taken.push(p);
-                    } else {
-                        left.push(p);
+                debug_assert_eq!(
+                    holds.len(),
+                    rest.positions().map_or(len, <[RowIndex]>::len),
+                    "a gate yields one value per row left"
+                );
+                let selected = holds.iter().filter(|&&holds| holds).count();
+                if selected == holds.len() {
+                    std::mem::swap(taken, rest);
+                    rest.set_empty();
+                } else if selected > 0 {
+                    rest.list(len);
+                    for (&p, &holds) in rest.positions.iter().zip(holds.iter()) {
+                        if holds {
+                            taken.positions.push(p);
+                        } else {
+                            left.push(p);
+                        }
                     }
+                    std::mem::swap(&mut rest.positions, left);
                 }
-                *rest = left;
-                (taken, None)
+                None
             }
-            // The rows of the union arm and of `rest` are both ascending, so one walk pairs them.
-            CaseGate::Tag {
-                scrutinee,
-                tag,
-                shape,
-            } => {
+            CaseGate::Tag { scrutinee, tag } => {
                 let (union, offset) = match captured(captures, scrutinee) {
                     Captured::Column(column, offset) => (*column, *offset),
                     Captured::Owned(column) => (column, 0),
@@ -179,12 +353,9 @@ impl CaseArm {
                 let ColumnValue::Union(arms) = union else {
                     unreachable!("a `Tag` gate reads a union column, got {union:?}")
                 };
-                let Some(arm) = arms.get(tag) else {
-                    return (Vec::new(), Some(shape.0.clone()));
-                };
-                let mut taken = Vec::new();
-                let mut slots = Vec::new();
-                let mut left = Vec::with_capacity(rest.len());
+                let arm = arms.get(tag)?;
+                rest.list(len);
+                slots.clear();
                 // The arm's rows before the block are skipped by a search, not a walk.
                 let first = arm.rows().partition_point(|&row| row < offset);
                 let mut rows = arm.rows()[first..]
@@ -192,22 +363,19 @@ impl CaseArm {
                     .enumerate()
                     .map(|(i, &row)| (row, first + i))
                     .peekable();
-                for &p in rest.iter() {
+                for &p in rest.positions.iter() {
                     let row_of_p = offset + p;
                     while rows.next_if(|(row, _)| *row < row_of_p).is_some() {}
                     match rows.peek() {
                         Some(&(row, slot)) if row == row_of_p => {
-                            taken.push(p);
+                            taken.positions.push(p);
                             slots.push(slot);
                         }
                         _ => left.push(p),
                     }
                 }
-                *rest = left;
-                let payload = arm
-                    .values()
-                    .select_indices(slots.iter().copied(), slots.len());
-                (taken, Some(payload))
+                std::mem::swap(&mut rest.positions, left);
+                Some(arm.values())
             }
         }
     }
@@ -223,38 +391,72 @@ fn captured<'c, 'a>(captures: &'c [(SmolStr, Captured<'a>)], name: &str) -> &'c 
 }
 
 /// The record of the captures named in `reads`, with [`ROWS`], at `positions` of a block of `len`
-/// rows, in order, or at every row of it when `positions` is `None`.
-fn gather(
+/// rows, or at every row with no positions, written into the record kept in `kept`. A capture
+/// with a view is left out, since the program reads it through [`Captures::selected`]: the view
+/// itself at every row, or a selection of it at the positions. A view that is already a selection
+/// is copied at listed positions instead. A capture without a view is rebuilt.
+fn gather_into<'k>(
     captures: &[(SmolStr, Captured)],
     reads: &[SmolStr],
     positions: Option<&[RowIndex]>,
     len: usize,
-) -> ColumnValue {
+    kept: &'k mut Option<ColumnValue>,
+) -> &'k mut ColumnValue {
+    let record = kept.get_or_insert_with(|| {
+        let mut fields: HashMap<SmolStr, ColumnValue> = reads
+            .iter()
+            .map(|name| {
+                let empty = match captured(captures, name) {
+                    Captured::View(view) => view.empty_like(),
+                    Captured::Column(column, _) => column.empty_like(),
+                    Captured::Owned(column) => column.empty_like(),
+                };
+                (name.clone(), empty)
+            })
+            .collect();
+        fields.insert(ROWS.into(), ColumnValue::Units(0));
+        ColumnValue::Records(fields)
+    });
+    let ColumnValue::Records(fields) = record else {
+        unreachable!("an arm's input is a record column")
+    };
     let rows = positions.map_or(len, <[RowIndex]>::len);
-    let mut fields: HashMap<SmolStr, ColumnValue> = reads
-        .iter()
-        .map(|name| {
-            let column = match (captured(captures, name), positions) {
-                (Captured::View(view), Some(positions)) => view.gather(positions),
-                (Captured::View(view), None) => {
-                    let mut column = view.empty_like();
-                    column.extend_from_view(*view);
-                    column
-                }
-                (Captured::Column(column, offset), Some(positions)) => {
-                    column.select_indices(positions.iter().map(|&p| offset + p), positions.len())
-                }
-                (Captured::Column(column, offset), None) => column.slice(*offset..offset + len),
-                (Captured::Owned(column), Some(positions)) => {
-                    column.select_indices(positions.iter().copied(), positions.len())
-                }
-                (Captured::Owned(column), None) => column.clone(),
-            };
-            (name.clone(), column)
-        })
-        .collect();
+    for name in reads {
+        let capture = captured(captures, name);
+        if let Captured::View(view) = capture
+            && positions.is_none_or(|positions| view.select(positions).is_some())
+        {
+            fields.remove(name);
+            continue;
+        }
+        let column = fields.entry(name.clone()).or_insert_with(|| match capture {
+            Captured::View(view) => view.empty_like(),
+            Captured::Column(column, _) => column.empty_like(),
+            Captured::Owned(column) => column.empty_like(),
+        });
+        match (captured(captures, name), positions) {
+            (Captured::View(view), Some(positions)) => {
+                column.clear();
+                view.gather_into(positions, column);
+            }
+            (Captured::View(_), None) => {
+                unreachable!("a view is read whole through `Captures::selected`")
+            }
+            (Captured::Column(source, offset), Some(positions)) => {
+                *column =
+                    source.select_indices(positions.iter().map(|&p| offset + p), positions.len());
+            }
+            (Captured::Column(source, offset), None) => {
+                *column = source.slice(*offset..offset + len);
+            }
+            (Captured::Owned(source), Some(positions)) => {
+                *column = source.select_indices(positions.iter().copied(), positions.len());
+            }
+            (Captured::Owned(source), None) => *column = source.clone(),
+        }
+    }
     fields.insert(ROWS.into(), ColumnValue::Units(rows));
-    ColumnValue::Records(fields)
+    record
 }
 
 /// One arm of a merged union column: its tag, the parts' payloads for it concatenated, and each
@@ -264,40 +466,32 @@ type MergedArm = (FieldKey, ColumnValue, Vec<(RowIndex, usize)>);
 /// One column of `len` rows from `parts`: the row at position `p` is the next row of the one part
 /// whose positions hold `p`. The parts' positions are ascending and together hold each of `0..len`
 /// once. A record merges field by field, and a union arm by arm, each row keeping its tag.
-fn merge_parts(parts: Vec<(ColumnValue, &[RowIndex])>, len: usize) -> ColumnValue {
-    let first = &parts.first().expect("a `Case` has an arm").0;
+fn merge_into(parts: &[(&ColumnValue, &[RowIndex])], len: usize, out: &mut ColumnValue) {
+    debug_assert!(out.is_empty(), "a merge writes an empty column");
+    let first = parts.first().expect("a `Case` has an arm").0;
     if first.view().is_some() {
-        let mut out = first.empty_like();
         let views: Vec<_> = parts
             .iter()
             .map(|(column, positions)| (column.view().expect("parts of one type"), *positions))
             .collect();
-        ColumnView::scatter_into(&views, len, &mut out);
-        return out;
+        ColumnView::scatter_into(&views, len, out);
+        return;
     }
-    match first {
-        ColumnValue::Units(_) => ColumnValue::Units(len),
+    match out {
+        ColumnValue::Units(rows) => *rows = len,
         ColumnValue::Records(fields) => {
-            let names: Vec<SmolStr> = fields.keys().cloned().collect();
-            let mut parts = parts;
-            ColumnValue::Records(
-                names
-                    .into_iter()
-                    .map(|name| {
-                        let field_parts = parts
-                            .iter_mut()
-                            .map(|(column, positions)| {
-                                let ColumnValue::Records(fields) = column else {
-                                    panic!("parts of one type")
-                                };
-                                let field = fields.remove(&name).expect("parts of one type");
-                                (field, *positions)
-                            })
-                            .collect();
-                        (name, merge_parts(field_parts, len))
+            for (name, field) in fields.iter_mut() {
+                let field_parts: Vec<(&ColumnValue, &[RowIndex])> = parts
+                    .iter()
+                    .map(|(column, positions)| {
+                        let ColumnValue::Records(fields) = column else {
+                            panic!("parts of one type")
+                        };
+                        (fields.get(name).expect("parts of one type"), *positions)
                     })
-                    .collect(),
-            )
+                    .collect();
+                merge_into(&field_parts, len, field);
+            }
         }
         ColumnValue::Union(_) => {
             // Each part's union rows are numbered within the part; a row's position in the
@@ -308,11 +502,11 @@ fn merge_parts(parts: Vec<(ColumnValue, &[RowIndex])>, len: usize) -> ColumnValu
                 let ColumnValue::Union(arms) = column else {
                     panic!("parts of one type")
                 };
-                for (tag, arm) in arms {
-                    let i = match by_tag.iter().position(|(t, ..)| *t == tag) {
+                for (tag, arm) in arms.iter() {
+                    let i = match by_tag.iter().position(|(t, ..)| t == tag) {
                         Some(i) => i,
                         None => {
-                            by_tag.push((tag, arm.values().empty_like(), Vec::new()));
+                            by_tag.push((tag.clone(), arm.values().empty_like(), Vec::new()));
                             by_tag.len() - 1
                         }
                     };
@@ -327,7 +521,7 @@ fn merge_parts(parts: Vec<(ColumnValue, &[RowIndex])>, len: usize) -> ColumnValu
                     values.append(arm.values().clone());
                 }
             }
-            ColumnValue::Union(TagMap::from_arms(
+            *out = ColumnValue::Union(TagMap::from_arms(
                 by_tag
                     .into_iter()
                     .map(|(tag, values, mut rows)| {
@@ -338,7 +532,7 @@ fn merge_parts(parts: Vec<(ColumnValue, &[RowIndex])>, len: usize) -> ColumnValu
                         (tag, UnionArm::new(rows, values))
                     })
                     .collect(),
-            ))
+            ));
         }
         other => panic!("a `Case` merges columns of base types, records and unions, got {other:?}"),
     }

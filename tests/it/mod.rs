@@ -22,7 +22,7 @@ mod serving;
 #[path = "../type_gen/mod.rs"]
 mod type_gen;
 
-mod alloc_probe;
+pub(crate) mod alloc_probe;
 mod binding_nodes;
 mod chl_parser_roundtrip;
 mod cli_driver_convergence;

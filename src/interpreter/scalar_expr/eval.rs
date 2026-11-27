@@ -1,12 +1,14 @@
 //! Evaluate a [`ScalarProgram`] on a column, block by block.
 
-use std::mem::replace;
+use std::cell::RefCell;
+use std::mem::take as take_buffers;
 
 use smol_str::SmolStr;
 
-use super::case::Captured;
+use super::case::{Captured, CaseBuffers, PAYLOAD};
 use super::{Instr, ScalarProgram};
 use crate::ccl::TagMap;
+use crate::interpreter::RowIndex;
 use crate::interpreter::{
     ColumnValue, ColumnView, UnionArm, Value, apply_binop_views, apply_unaryop_views,
     binop_result_column, unaryop_result_column,
@@ -40,39 +42,100 @@ fn const_view(value: &Value, len: usize) -> ColumnView<'_> {
     }
 }
 
-/// Per-evaluation buffers reused across blocks. Inputs and constants are borrowed views.
+/// The buffers one program's evaluation reuses across blocks. A `Case` arm's gate and body keep
+/// theirs across the blocks of the enclosing program, so an arm allocates them once.
+#[derive(Default)]
+pub(super) struct Buffers {
+    /// The empty column of each slot's type ([`ScalarProgram::empties`]). Empty until the first
+    /// evaluation, which finds them from its input's columns.
+    empties: Vec<ColumnValue>,
+    /// The scratch column of each operation, `None` until its first block. Inputs, constants,
+    /// constructors, and the last instruction never write a slot.
+    slots: Vec<Option<ColumnValue>>,
+    /// The buffers of the `Case` in each slot. A slot holding no `Case` keeps the empty default.
+    cases: Vec<RefCell<CaseBuffers>>,
+}
+
+impl Buffers {
+    /// Size the buffers for `program` over the columns of `input`, unless an earlier evaluation
+    /// did. Every evaluation reusing them reads an input with the same column types, though a
+    /// capture's field may be present in one block's input and read through a view in another.
+    fn prepare(&mut self, program: &ScalarProgram, input: &ColumnValue, captures: Captures) {
+        if self.slots.len() == program.instrs.len() {
+            return;
+        }
+        self.empties = program.empties(input, captures);
+        self.slots = vec![None; program.instrs.len()];
+        self.cases = (0..program.instrs.len())
+            .map(|_| RefCell::default())
+            .collect();
+    }
+}
+
+/// The captures of the `Case` running a gate or body, and the positions of the block that
+/// program reads. An input naming a capture with a view reads it at those positions through a
+/// selection view rather than from a gathered copy ([`View::select`]).
+#[derive(Clone, Copy)]
+pub(super) struct Captures<'a> {
+    pub(super) captures: &'a [(SmolStr, Captured<'a>)],
+    pub(super) positions: Option<&'a [RowIndex]>,
+    /// A `Tag` arm's payloads at its rows, when they have a view; the program reads [`PAYLOAD`]
+    /// through it rather than from a copy in its input.
+    pub(super) payload: Option<ColumnView<'a>>,
+}
+
+impl<'a> Captures<'a> {
+    /// No captures: every input is read from the input column.
+    pub(super) const NONE: Captures<'static> = Captures {
+        captures: &[],
+        positions: None,
+        payload: None,
+    };
+
+    /// The capture `path` names, as a view at the positions, where it has a view that is not
+    /// already a selection. [`PAYLOAD`] names the `Tag` arm's payloads, read through `payload`.
+    pub(super) fn selected(&self, path: &[SmolStr]) -> Option<ColumnView<'a>> {
+        let [name] = path else { return None };
+        if name == PAYLOAD {
+            return self.payload;
+        }
+        let (_, Captured::View(view)) = self.captures.iter().find(|(n, _)| n == name)? else {
+            return None;
+        };
+        match self.positions {
+            None => Some(*view),
+            Some(positions) => view.select(positions),
+        }
+    }
+}
+
+/// One evaluation: its input, the block being evaluated, and the program's buffers. Inputs and
+/// constants are borrowed views.
 struct Scratch<'a> {
     input: &'a ColumnValue,
-    /// The empty column of each slot's type ([`ScalarProgram::empties`]).
-    empties: Vec<ColumnValue>,
-    /// `Units(0)` marks unwritten slots; no operation produces that column variant. Inputs,
-    /// constants, constructors, and the last instruction never write a scratch slot.
-    slots: Vec<ColumnValue>,
+    captures: Captures<'a>,
+    buffers: Buffers,
     /// The current block: the rows `start..start + len` of the input.
     start: usize,
     len: usize,
 }
 
-impl<'a> Scratch<'a> {
-    fn new(input: &'a ColumnValue, program: &ScalarProgram) -> Self {
-        Self {
-            input,
-            empties: program.empties(input),
-            slots: vec![ColumnValue::Units(0); program.instrs.len()],
-            start: 0,
-            len: 0,
-        }
-    }
-
+impl Scratch<'_> {
     /// The block of instruction `slot` as a view.
     fn view<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> ColumnView<'s> {
         match &program.instrs[slot] {
+            Instr::Input { path } if self.captures.selected(path).is_some() => {
+                let view = self.captures.selected(path).expect("checked by the guard");
+                view.range(self.start..self.start + self.len)
+            }
             Instr::Input { path } => field(self.input, path)
                 .view()
                 .unwrap_or_else(|| panic!("the input at {path:?} is a column of a base type"))
                 .range(self.start..self.start + self.len),
             Instr::Const(value) => const_view(value, self.len),
-            Instr::Bin(..) | Instr::Un(..) | Instr::Case { .. } => self.slots[slot]
+            Instr::Bin(..) | Instr::Un(..) | Instr::Case { .. } => self.buffers.slots[slot]
+                .as_ref()
+                .unwrap_or_else(|| panic!("s{slot} is written before an instruction reads it"))
                 .view()
                 .unwrap_or_else(|| panic!("the result s{slot} is a column of a base type")),
             Instr::Record(_) | Instr::Wrap { .. } => {
@@ -88,6 +151,9 @@ impl<'a> Scratch<'a> {
         let rows = self.start..self.start + self.len;
         match &program.instrs[slot] {
             instr if instr.is_constructor() => self.run(program, slot, out),
+            Instr::Input { path } if self.captures.selected(path).is_some() => {
+                out.extend_from_view(self.view(program, slot))
+            }
             Instr::Input { path } if field(self.input, path).view().is_none() => {
                 out.append(field(self.input, path).slice(rows))
             }
@@ -116,7 +182,15 @@ impl<'a> Scratch<'a> {
             constructs: false, ..
         } = instr
         {
-            self.slots[slot] = self.case_block(program, slot);
+            let mut column = match self.buffers.slots[slot].take() {
+                Some(mut column) => {
+                    column.clear();
+                    column
+                }
+                None => self.buffers.empties[slot].clone(),
+            };
+            self.case_block(program, slot, &mut column);
+            self.buffers.slots[slot] = Some(column);
             return;
         }
         if !matches!(instr, Instr::Bin(..) | Instr::Un(..)) {
@@ -124,14 +198,13 @@ impl<'a> Scratch<'a> {
         }
         let mut column = self.slot_column(program, slot, instr);
         self.run(program, slot, &mut column);
-        self.slots[slot] = column;
+        self.buffers.slots[slot] = Some(column);
     }
 
     /// The column an operation writes its block into: its slot's buffer, cleared, or on the first
     /// block a new empty column of the operation's result type.
     fn slot_column(&mut self, program: &ScalarProgram, slot: usize, instr: &Instr) -> ColumnValue {
-        let mut column = take(&mut self.slots[slot]);
-        if !matches!(column, ColumnValue::Units(_)) {
+        if let Some(mut column) = self.buffers.slots[slot].take() {
             column.clear();
             return column;
         }
@@ -182,14 +255,15 @@ impl<'a> Scratch<'a> {
                     self.append(program, *payload as usize, values)
                 });
             }
-            Instr::Case { .. } => out.append(self.case_block(program, slot)),
+            Instr::Case { .. } => self.append_case_block(program, slot, out),
             // An arm's body may answer with a value it reads: `else x`.
             Instr::Input { .. } | Instr::Const(_) => self.append(program, slot, out),
         }
     }
 
-    /// The current block of the `Case` in `slot`: its conditional applied to its captures.
-    fn case_block(&self, program: &ScalarProgram, slot: usize) -> ColumnValue {
+    /// Write the current block of the `Case` in `slot`, its conditional applied to its captures,
+    /// to `out`, an empty column of its type.
+    fn case_block(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
         let Instr::Case { case, captures, .. } = &program.instrs[slot] else {
             unreachable!("s{slot} is a `Case`")
         };
@@ -197,13 +271,37 @@ impl<'a> Scratch<'a> {
             .iter()
             .map(|(name, capture)| (name.clone(), self.captured(program, *capture as usize)))
             .collect();
-        case.eval(&captured, self.len)
+        let mut buffers = self.buffers.cases[slot].borrow_mut();
+        case.eval_into(&captured, self.len, &mut buffers, out);
+    }
+
+    /// Append the current block of the `Case` in `slot` to `out`. The `Case` writes an empty
+    /// column, so a union's rows are numbered from the block's first before `append` renumbers
+    /// them into `out`. A column with a view is copied out and kept for the next block.
+    fn append_case_block(&self, program: &ScalarProgram, slot: usize, out: &mut ColumnValue) {
+        let cell = &self.buffers.cases[slot];
+        let kept = cell.borrow_mut().merged.take();
+        let mut column = kept.unwrap_or_else(|| self.buffers.empties[slot].clone());
+        column.clear();
+        self.case_block(program, slot, &mut column);
+        let copied = column
+            .view()
+            .map(|view| out.extend_from_view(view))
+            .is_some();
+        if copied {
+            cell.borrow_mut().merged = Some(column);
+        } else {
+            out.append(column);
+        }
     }
 
     /// The current block of `slot` as a capture: a view of a column with one, the input's own
     /// column with the block's offset, or a column built for the block.
     fn captured<'s>(&'s self, program: &'s ScalarProgram, slot: usize) -> Captured<'s> {
         match &program.instrs[slot] {
+            Instr::Input { path } if self.captures.selected(path).is_some() => {
+                Captured::View(self.view(program, slot))
+            }
             Instr::Input { path } => {
                 let column = field(self.input, path);
                 match column.view() {
@@ -218,7 +316,11 @@ impl<'a> Scratch<'a> {
             } => Captured::View(self.view(program, slot)),
             // `case_block` numbers a union's rows from the block's first, as `Captured::Owned`
             // reads them.
-            Instr::Case { .. } => Captured::Owned(self.case_block(program, slot)),
+            Instr::Case { .. } => {
+                let mut column = self.buffers.empties[slot].clone();
+                self.case_block(program, slot, &mut column);
+                Captured::Owned(column)
+            }
             Instr::Const(_) | Instr::Record(_) | Instr::Wrap { .. } => unreachable!(
                 "s{slot} is no capture: outlining copies constants, and `Record` and `Wrap` are \
                  emitted only after a conditional's arms, at or after its start"
@@ -227,51 +329,83 @@ impl<'a> Scratch<'a> {
     }
 }
 
-/// The column in `slot`, leaving the unwritten marker behind.
-fn take(slot: &mut ColumnValue) -> ColumnValue {
-    replace(slot, ColumnValue::Units(0))
-}
-
 impl ScalarProgram {
     /// Return one result row per input row, evaluating in blocks of [`BLOCK_ROWS`].
     ///
     /// Reserve the output for all input rows before evaluation. Intermediate operations retain
     /// only one block each; inputs and constants are read through borrowed views.
     pub fn eval(&self, input: &ColumnValue) -> ColumnValue {
-        let len = input.len();
-        let mut scratch = Scratch::new(input, self);
-        let mut out = scratch
+        let mut buffers = Buffers::default();
+        let mut out = self.empty_result(input, Captures::NONE, &mut buffers);
+        out.reserve(input.len());
+        self.eval_into(input, Captures::NONE, &mut buffers, &mut out);
+        out.debug_assert_union_invariants();
+        out
+    }
+
+    /// The empty column of the result's type, sizing `buffers` for an input with the columns of
+    /// `input`.
+    pub(super) fn empty_result(
+        &self,
+        input: &ColumnValue,
+        captures: Captures,
+        buffers: &mut Buffers,
+    ) -> ColumnValue {
+        buffers.prepare(self, input, captures);
+        buffers
             .empties
             .last()
             .cloned()
-            .expect("a program has a last instruction");
-        out.reserve(len);
+            .expect("a program has a last instruction")
+    }
+
+    /// Write one result row per input row to `out`, an empty column of the result's type, reusing
+    /// `buffers` from earlier evaluations over inputs with the same columns.
+    pub(super) fn eval_into(
+        &self,
+        input: &ColumnValue,
+        captures: Captures,
+        buffers: &mut Buffers,
+        out: &mut ColumnValue,
+    ) {
+        debug_assert!(out.is_empty(), "a program writes an empty column");
+        buffers.prepare(self, input, captures);
+        let len = input.len();
+        let mut scratch = Scratch {
+            input,
+            captures,
+            buffers: take_buffers(buffers),
+            start: 0,
+            len: 0,
+        };
         let mut start = 0;
         loop {
             let rows = BLOCK_ROWS.min(len - start);
-            scratch.block(self, start, rows, &mut out);
+            scratch.block(self, start, rows, out);
             start += rows;
             if start >= len {
                 break;
             }
         }
+        *buffers = scratch.buffers;
         debug_assert_eq!(
             out.len(),
             len,
             "ScalarProgram::eval: one result row per input row"
         );
-        out.debug_assert_union_invariants();
-        out
     }
 
     /// The empty column of each slot's type, found from the input's columns and the instructions'
     /// types without evaluating any block. A `Case`'s is its conditional applied to its captures'
     /// empty columns.
-    fn empties(&self, input: &ColumnValue) -> Vec<ColumnValue> {
+    fn empties(&self, input: &ColumnValue, captures: Captures) -> Vec<ColumnValue> {
         let mut empties: Vec<ColumnValue> = Vec::with_capacity(self.instrs.len());
         for instr in &self.instrs {
             let empty = match instr {
-                Instr::Input { path } => field(input, path).empty_like(),
+                Instr::Input { path } => match captures.selected(path) {
+                    Some(view) => view.empty_like(),
+                    None => field(input, path).empty_like(),
+                },
                 Instr::Const(value) => ColumnValue::single(value.clone()).empty_like(),
                 Instr::Un(op, a) => {
                     let operand = empties[*a as usize]
@@ -390,23 +524,29 @@ mod tests {
         let fused = fuse(&conjunction(), &int()).unwrap();
         let total = 3 * BLOCK_ROWS;
         let input = ramp(total);
-        let mut scratch = Scratch::new(&input, &fused.program);
-        let mut out = scratch.empties.last().cloned().unwrap();
+        let mut buffers = Buffers::default();
+        let mut out = fused
+            .program
+            .empty_result(&input, Captures::NONE, &mut buffers);
+        let mut scratch = Scratch {
+            input: &input,
+            captures: Captures::NONE,
+            buffers,
+            start: 0,
+            len: 0,
+        };
         out.reserve(total);
         scratch.block(&fused.program, 0, BLOCK_ROWS, &mut out);
         let result = pointer(&out);
-        let (output, body) = scratch.slots.split_last().unwrap();
+        let (output, body) = scratch.buffers.slots.split_last().unwrap();
         assert!(
-            matches!(output, ColumnValue::Units(0)),
+            output.is_none(),
             "the output writes to the result, not a slot"
         );
         // An input and a scalar constant are read in place and own no buffer; only an
         // operation's slot holds a column.
-        let written = |slot: &ColumnValue| !matches!(slot, ColumnValue::Units(_));
-        let buffers: Vec<Option<*const u8>> = body
-            .iter()
-            .map(|slot| written(slot).then(|| pointer(slot)))
-            .collect();
+        let buffers: Vec<Option<*const u8>> =
+            body.iter().map(|slot| slot.as_ref().map(pointer)).collect();
         for (slot, instr) in buffers.iter().zip(&fused.program.instrs) {
             assert_eq!(
                 slot.is_some(),
@@ -416,13 +556,9 @@ mod tests {
         }
         for start in [BLOCK_ROWS, 2 * BLOCK_ROWS] {
             scratch.block(&fused.program, start, BLOCK_ROWS, &mut out);
-            let body = &scratch.slots[..buffers.len()];
+            let body = &scratch.buffers.slots[..buffers.len()];
             for (slot, before) in body.iter().zip(&buffers) {
-                assert_eq!(
-                    written(slot).then(|| pointer(slot)),
-                    *before,
-                    "block at {start}"
-                );
+                assert_eq!(slot.as_ref().map(pointer), *before, "block at {start}");
             }
             assert_eq!(pointer(&out), result, "block at {start}");
         }

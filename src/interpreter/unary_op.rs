@@ -54,16 +54,21 @@ pub fn apply_unaryop_views(op: UnaryOpKind, operand: &ColumnView, out: &mut Colu
     match (op, operand, out) {
         (UnaryOpKind::Neg, ColumnView::Ints(v), ColumnValue::Ints(o)) => match *v {
             View::Slice(values) => o.extend(values.iter().map(|&x| -x)),
+            View::Selected { values, positions } => o.extend(positions.iter().map(|&p| -values[p])),
             View::Constant { value, len } if len > 0 => o.extend(repeat_n(-*value, len)),
             View::Constant { .. } => {}
         },
         (UnaryOpKind::Not, ColumnView::Bools(v), ColumnValue::Bools(o)) => match *v {
             View::Slice(values) => o.extend(values.iter().map(|&x| !x)),
+            View::Selected { values, positions } => o.extend(positions.iter().map(|&p| !values[p])),
             View::Constant { value, len } if len > 0 => o.extend(repeat_n(!*value, len)),
             View::Constant { .. } => {}
         },
         (UnaryOpKind::IntToUint, ColumnView::Ints(v), ColumnValue::UInts(o)) => match *v {
             View::Slice(values) => o.extend(values.iter().map(|&x| int_to_uint(x))),
+            View::Selected { values, positions } => {
+                o.extend(positions.iter().map(|&p| int_to_uint(values[p])))
+            }
             View::Constant { value, len } if len > 0 => {
                 o.extend(repeat_n(int_to_uint(*value), len))
             }
@@ -98,6 +103,34 @@ pub fn apply_unaryop_column(op: UnaryOpKind, operand: &ColumnValue) -> ColumnVal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every unary operation reads a selection at its positions.
+    #[test]
+    fn a_unary_operation_reads_a_selection() {
+        let ints = [3_i64, -1, 4];
+        let bools = [true, false];
+        let at = [2, 0];
+        let selected = |values| {
+            ColumnView::Ints(View::Selected {
+                values,
+                positions: &at,
+            })
+        };
+        let mut negated = ColumnValue::Ints(Vec::new());
+        apply_unaryop_views(UnaryOpKind::Neg, &selected(&ints), &mut negated);
+        assert_eq!(negated, ColumnValue::Ints(vec![-4, -3]));
+        let mut uints = ColumnValue::UInts(Vec::new());
+        apply_unaryop_views(UnaryOpKind::IntToUint, &selected(&ints), &mut uints);
+        assert_eq!(uints, ColumnValue::UInts(vec![4, 3]));
+        let mut nots = ColumnValue::Bools(Vec::new());
+        let one_zero = [1, 0];
+        let view = ColumnView::Bools(View::Selected {
+            values: &bools,
+            positions: &one_zero,
+        });
+        apply_unaryop_views(UnaryOpKind::Not, &view, &mut nots);
+        assert_eq!(nots, ColumnValue::Bools(vec![true, false]));
+    }
 
     /// The call appends to the caller's column, which the caller has cleared for reuse.
     #[test]

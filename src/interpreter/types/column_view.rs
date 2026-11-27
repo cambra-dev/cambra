@@ -4,7 +4,8 @@ use smol_str::SmolStr;
 
 use crate::view::View;
 
-use super::{ColumnValue, RowIndex};
+use super::ColumnValue;
+use super::RowIndex;
 
 /// A column of `Int`, `UInt`, `String` or `Bool` values, borrowed from a [`ColumnValue`] or
 /// built from a literal.
@@ -44,16 +45,27 @@ impl<'a> ColumnView<'a> {
         }
     }
 
-    /// The values at `positions`, in that order, as a column.
-    pub(crate) fn gather(&self, positions: &[RowIndex]) -> ColumnValue {
-        fn pick<T: Clone>(view: &View<'_, T>, positions: &[RowIndex]) -> Vec<T> {
-            positions.iter().map(|&p| view.get(p).clone()).collect()
+    /// Append the values at `positions`, in that order, to `out`, a column of this view's type.
+    pub(crate) fn gather_into(&self, positions: &[RowIndex], out: &mut ColumnValue) {
+        fn pick<T: Clone>(view: View<'_, T>, positions: &[RowIndex], out: &mut Vec<T>) {
+            match view {
+                View::Slice(values) => out.extend(positions.iter().map(|&p| values[p].clone())),
+                View::Constant { value, len } => {
+                    debug_assert!(positions.iter().all(|&p| p < len));
+                    out.extend(std::iter::repeat_n(value, positions.len()).cloned())
+                }
+                View::Selected {
+                    values,
+                    positions: selected,
+                } => out.extend(positions.iter().map(|&p| values[selected[p]].clone())),
+            }
         }
-        match self {
-            ColumnView::Ints(v) => ColumnValue::Ints(pick(v, positions)),
-            ColumnView::UInts(v) => ColumnValue::UInts(pick(v, positions)),
-            ColumnView::Strings(v) => ColumnValue::Strings(pick(v, positions)),
-            ColumnView::Bools(v) => ColumnValue::Bools(pick(v, positions)),
+        match (self, out) {
+            (ColumnView::Ints(v), ColumnValue::Ints(out)) => pick(*v, positions, out),
+            (ColumnView::UInts(v), ColumnValue::UInts(out)) => pick(*v, positions, out),
+            (ColumnView::Strings(v), ColumnValue::Strings(out)) => pick(*v, positions, out),
+            (ColumnView::Bools(v), ColumnValue::Bools(out)) => pick(*v, positions, out),
+            (view, out) => panic!("cannot gather a view of {view:?} into {out:?}"),
         }
     }
 
@@ -65,25 +77,62 @@ impl<'a> ColumnView<'a> {
         len: usize,
         out: &mut ColumnValue,
     ) {
+        debug_assert_eq!(
+            parts
+                .iter()
+                .map(|(_, positions)| positions.len())
+                .sum::<usize>(),
+            len,
+            "the parts hold len positions in all"
+        );
+        // Disjointness is the caller's invariant: a `CaseFn`'s arms take disjoint rows.
+        debug_assert!(
+            parts.iter().all(|(_, positions)| {
+                positions.windows(2).all(|pair| pair[0] < pair[1])
+                    && positions.last().is_none_or(|&p| p < len)
+            }),
+            "each part's positions ascend and lie below len"
+        );
+        // The new rows are first filled with one part's first value, then each is overwritten
+        // by the value of the part holding its position.
         fn place<'v, T: Clone + 'v>(
-            parts: impl Iterator<Item = (View<'v, T>, &'v [RowIndex])>,
+            parts: impl Iterator<Item = (View<'v, T>, &'v [RowIndex])> + Clone,
             len: usize,
             out: &mut Vec<T>,
         ) {
-            let mut placed: Vec<Option<T>> = vec![None; len];
+            let Some(fill) = parts
+                .clone()
+                .find(|(view, _)| !view.is_empty())
+                .map(|(view, _)| view.get(0).clone())
+            else {
+                return;
+            };
+            let base = out.len();
+            out.resize(base + len, fill);
+            let placed = &mut out[base..];
             for (view, positions) in parts {
                 debug_assert_eq!(view.len(), positions.len(), "one value per position");
-                for (i, &p) in positions.iter().enumerate() {
-                    let slot = &mut placed[p];
-                    debug_assert!(slot.is_none(), "position {p} is held by two parts");
-                    *slot = Some(view.get(i).clone());
+                match view {
+                    View::Slice(values) => {
+                        for (value, &p) in values.iter().zip(positions) {
+                            placed[p] = value.clone();
+                        }
+                    }
+                    View::Constant { value, .. } => {
+                        for &p in positions {
+                            placed[p] = value.clone();
+                        }
+                    }
+                    View::Selected {
+                        values,
+                        positions: selected,
+                    } => {
+                        for (&s, &p) in selected.iter().zip(positions) {
+                            placed[p] = values[s].clone();
+                        }
+                    }
                 }
             }
-            out.extend(
-                placed
-                    .into_iter()
-                    .map(|value| value.expect("every position is held by a part")),
-            );
         }
         macro_rules! scatter {
             ($variant:ident, $out:expr) => {
@@ -120,6 +169,17 @@ impl<'a> ColumnView<'a> {
             ColumnView::Bools(v) => ColumnView::Bools(v.range(range)),
         }
     }
+
+    /// The values at `positions` without copying them, or `None` for a view that is already a
+    /// selection ([`View::select`]).
+    pub(crate) fn select(self, positions: &'a [RowIndex]) -> Option<Self> {
+        Some(match self {
+            ColumnView::Ints(v) => ColumnView::Ints(v.select(positions)?),
+            ColumnView::UInts(v) => ColumnView::UInts(v.select(positions)?),
+            ColumnView::Strings(v) => ColumnView::Strings(v.select(positions)?),
+            ColumnView::Bools(v) => ColumnView::Bools(v.select(positions)?),
+        })
+    }
 }
 
 impl ColumnValue {
@@ -151,12 +211,53 @@ fn extend<T: Clone>(out: &mut Vec<T>, view: View<'_, T>) {
     match view {
         View::Slice(values) => out.extend_from_slice(values),
         View::Constant { value, len } => out.extend(std::iter::repeat_n(value, len).cloned()),
+        View::Selected { values, positions } => {
+            out.extend(positions.iter().map(|&p| values[p].clone()))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A selection appends, gathers and scatters the values at its positions.
+    #[test]
+    fn a_selection_appends_gathers_and_scatters_its_values() {
+        let stored = [10_i64, 11, 12, 13];
+        let positions = [3, 1];
+        let selected = ColumnView::Ints(View::Selected {
+            values: &stored,
+            positions: &positions,
+        });
+        let mut appended = ColumnValue::Ints(Vec::new());
+        appended.extend_from_view(selected);
+        assert_eq!(appended, ColumnValue::Ints(vec![13, 11]));
+        let mut gathered = ColumnValue::Ints(Vec::new());
+        selected.gather_into(&[1, 0, 1], &mut gathered);
+        assert_eq!(gathered, ColumnValue::Ints(vec![11, 13, 11]));
+        let others = [7_i64];
+        let mut scattered = ColumnValue::Ints(vec![0]);
+        ColumnView::scatter_into(
+            &[
+                (selected, &[0, 2]),
+                (ColumnView::Ints(View::Slice(&others)), &[1]),
+            ],
+            3,
+            &mut scattered,
+        );
+        assert_eq!(scattered, ColumnValue::Ints(vec![0, 13, 7, 11]));
+        let mut with_repeat = ColumnValue::Ints(Vec::new());
+        ColumnView::scatter_into(
+            &[
+                (ColumnView::Ints(View::repeated(&5, 2)), &[0, 2]),
+                (selected, &[1, 3]),
+            ],
+            4,
+            &mut with_repeat,
+        );
+        assert_eq!(with_repeat, ColumnValue::Ints(vec![5, 13, 5, 11]));
+    }
 
     /// A slice and a repeated value append their values, for every element type.
     #[test]
