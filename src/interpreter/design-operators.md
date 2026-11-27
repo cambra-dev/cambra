@@ -1272,11 +1272,13 @@ slot 𝑖, and operands refer only to earlier slots. The last instruction produc
 | `Un(op, a)` | Unary operation on slot `a` |
 | `Record(fields)` | Record column with a slot per field, sorted by field name |
 | `Wrap { tag, payload }` | Union column whose one arm, `tag`, holds every row, with its payloads in slot `payload` |
+| `Case { case, captures, constructs, shape }` | A conditional applied to the slots `captures` ([Conditional programs](#conditional-programs)) |
 
-`Record` and `Wrap` are the constructors. Operations consume columns of `Int`, `UInt`, `String` and
-`Bool`, never a constructor or a `Unit` or union column (`ScalarProgram::operands_have_views`). A
-constructor is the last instruction or a field or payload of a later constructor, so constructors
-build only the result (`ScalarProgram::constructors_build_only_the_result`). A variant constant is
+`Record`, `Wrap` and a `Case` that constructs are the constructors. Operations consume columns of
+`Int`, `UInt`, `String` and `Bool`, never a constructor or a `Unit` or union column
+(`ScalarProgram::operands_have_views`). A constructor is the last instruction or a field, payload or
+capture of a later constructor or `Case`, so constructors build only the result
+(`ScalarProgram::constructors_build_only_the_result`). A variant constant is
 recognized as the `Wrap` of its payload.
 
 `==` and `!=` are expanded during recognition (`Parser::comparison`). Two records compare the fields
@@ -1291,10 +1293,10 @@ decides the whole comparison otherwise. A comparison decided as a whole computes
 has no program. Operands may be input records, constants, or products and variants constructed in
 the chain. A union read from the input is compared by no program.
 
-Equal instructions share one slot: `Parser::emit` returns the slot of an equal `Input`, `Const`,
-`Bin` or `Un` emitted before, so a path read twice, a constant written twice, and an operation
-written twice on the same slots are each computed once. A constructor is always a new slot, since it
-is the last instruction or a field or payload of exactly one later constructor. The result is the
+Equal instructions share one slot: `Parser::emit` returns the slot of an equal instruction emitted
+before, other than a constructor, so a path read twice, a constant written twice, and an operation
+written twice on the same slots are each computed once. A constructor is always a new slot, since a
+later constructor or `Case` reads it where it is built. The result is the
 last instruction, so a prefix whose computed value shares an earlier slot is not taken there. Failed
 recognition, output probes, and comparisons decided while parsing discard their temporary
 instructions; field-name sorting makes record instruction order deterministic. `ScalarProgram`
@@ -1316,6 +1318,57 @@ Output capacity for all input rows is reserved before evaluation, except in a un
 arms grow block by block. Intermediate columns hold at most one block each rather than one column
 per full input. An empty input still runs one zero-length block and produces a correctly typed empty
 output.
+
+#### Conditional programs
+
+A fused conditional is a `Case` instruction applying a `CaseFn` (`interpreter/case_fn.rs`) to its
+captures, the values its arms read. A `CaseFn`'s arms are tried in order. Each arm takes, among the
+rows no earlier arm took, the rows its gate selects, and its body, a `ScalarProgram`, computes their
+values. A conditional inside an arm is a `Case` instruction of that arm's body, so conditionals nest
+by recursion.
+
+| Gate | Rows |
+|---|---|
+| `Holds { program }` | Those where the `Bool` program holds |
+| `Rest` | Every row left: the final `else` |
+| `Tag { scrutinee, tag }` | Those whose value in the union capture `scrutinee` carries `tag` |
+
+A `Case` hands its `CaseFn` each capture's block as a `Captured`: a view of a column the program
+already holds, the input's own column with the block's offset, or a column built for the block, for
+a `Case` that constructs. `CaseFn::eval` keeps the positions no arm has taken as an
+ascending `Vec<RowIndex>`. An arm's input is a record of the captures its body reads, gathered to its
+rows, with `~rows`, a `Units` column of their count, so the body runs on dense columns holding only
+those rows. A partial operation such as `//` never runs on a row its gate rejected. A `Holds`
+program reads the captures it names at the rows left. A `Tag` gate finds its union arm's first row
+in the block by binary search and walks the arm's rows from there beside the positions left; it
+gathers their payloads into the arm's input field `~payload`. A tag the column does not carry takes
+no row, and its payload is the empty column the gate holds. When one arm that reads no payload takes
+every row, its body's result is the `CaseFn`'s, with no merge.
+
+The arms' results merge in row order (`merge_parts`). A base type places each arm's values at its
+positions (`ColumnView::scatter_into`). A record merges field by field, and a union arm by arm: each
+row keeps the tag its arm gave it. A `Case` of `Int`, `UInt`, `String` or `Bool` is an operation: it
+writes a scratch column that later operations read like any other, or the output when it is the last
+instruction. A `Case` of a record, a union or `Unit` constructs. A `Case` holds the empty column of
+its result's type, `shape`, so finding a program's empty columns evaluates no arm. An arm's body may
+answer with a value it reads, such as `else x`, so its last instruction may be an input or a
+constant.
+
+`[x // 2 if x > 0 else 0 - x for x in source1()]` compiles to the program below. `Display` prints
+it on one line; it is broken here after each `; `. The captures are listed in the parentheses, and
+each arm shows its gate's and its body's program.
+
+```
+s0 = _;
+s1 = case(c0: s0) {
+  [s0 = _.c0; s1 = 0; s2 = >(s0, s1); => s2] -> [s0 = _.c0; s1 = 2; s2 = //(s0, s1); => s2];
+  else -> [s0 = 0; s1 = _.c0; s2 = -(s0, s1); => s2];
+};
+=> s1
+```
+
+For a block whose `x` is `[3, -1, 4, 0]`, the first arm takes positions `[0, 2]` and divides
+`[3, 4]`. The second takes `[1, 3]` and negates `[-1, 0]`, and the merge gives `[1, 1, 2, 0]`.
 
 #### Column views
 

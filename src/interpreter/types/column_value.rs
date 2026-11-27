@@ -325,6 +325,15 @@ impl ColumnValue {
                     .map(|(k, v)| (k.clone(), v.slice(range.clone())))
                     .collect(),
             ),
+            ColumnValue::Units(_) => ColumnValue::Units(range.len()),
+            // An arm's rows are ascending, so those in `range` are one run of its slots.
+            ColumnValue::Union(arms) => ColumnValue::Union(arms.map(|_, arm| {
+                let rows = arm.rows();
+                let run = rows.partition_point(|&r| r < range.start)
+                    ..rows.partition_point(|&r| r < range.end);
+                let shifted = rows[run.clone()].iter().map(|r| r - range.start).collect();
+                UnionArm::new(shifted, arm.values().slice(run))
+            })),
             _ => {
                 let len = range.len();
                 self.select_indices(range, len)
@@ -1061,6 +1070,47 @@ impl ColumnValue {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A slice of a union column keeps each arm's rows in the range, renumbered from its start,
+    /// with their payloads, and an arm with no row in it is empty: rows `2..5` of six rows that
+    /// alternate between `a` (`Int` payloads) and `b` (`Unit`), and of a column whose `c` arm holds
+    /// only row 0.
+    #[test]
+    fn a_union_slice_keeps_each_arms_rows_in_range() {
+        let tag = |t: &str| FieldKey::Name(t.into());
+        let column = ColumnValue::Union(TagMap::from_arms(vec![
+            (
+                tag("a"),
+                UnionArm::new(vec![0, 2, 4], ColumnValue::Ints(vec![10, 12, 14])),
+            ),
+            (
+                tag("b"),
+                UnionArm::new(vec![1, 3, 5], ColumnValue::Units(3)),
+            ),
+            (
+                tag("c"),
+                UnionArm::new(Vec::new(), ColumnValue::Ints(Vec::new())),
+            ),
+        ]));
+        let ColumnValue::Union(arms) = column.slice(2..5) else {
+            panic!("a slice of a union column is a union column")
+        };
+        let a = arms.get(&tag("a")).expect("the a arm");
+        assert_eq!(a.rows(), [0, 2]);
+        assert_eq!(a.values(), &ColumnValue::Ints(vec![12, 14]));
+        let b = arms.get(&tag("b")).expect("the b arm");
+        assert_eq!(b.rows(), [1]);
+        assert_eq!(b.values(), &ColumnValue::Units(1));
+        assert!(arms.get(&tag("c")).expect("the c arm").is_empty());
+        let edge = ColumnValue::Union(TagMap::from_arms(vec![(
+            tag("c"),
+            UnionArm::new(vec![0], ColumnValue::Ints(vec![7])),
+        )]));
+        let ColumnValue::Union(arms) = edge.slice(1..1) else {
+            panic!("a slice of a union column is a union column")
+        };
+        assert!(arms.get(&tag("c")).expect("the c arm").is_empty());
+    }
 
     #[test]
     fn single_unit_is_canonical_units_column() {
