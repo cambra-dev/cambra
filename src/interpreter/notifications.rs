@@ -754,7 +754,7 @@ fn rows_reached(region: &Projection, at: CurryLevel) -> Option<crate::interprete
     match region {
         Projection::Everything => Some(Predicate::True),
         Projection::Nothing => Some(Predicate::False),
-        Projection::Fields { .. } => None,
+        Projection::Fields { .. } | Projection::Arms(_) => None,
         Projection::Or(arms) => arms.iter().try_fold(Predicate::False, |rows, arm| {
             Some(rows.union(&rows_reached(arm, at)?))
         }),
@@ -1137,7 +1137,7 @@ fn paths_at(region: &Projection, to: CurryLevel) -> Option<crate::interpreter::P
         Projection::Nothing => return Some(Predicate::False),
         Projection::Keys { level, keys } => (level.index(), keys.clone()),
         // A region of a record's fields names no keys of the rows.
-        Projection::Fields { .. } => return None,
+        Projection::Fields { .. } | Projection::Arms(_) => return None,
     };
     if level > to.index() {
         return None;

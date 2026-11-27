@@ -662,8 +662,10 @@ A projection guard names the part of a producer's tile that a `get` asks for. Th
 returns that part and nothing outside it, and states completeness only for that part.
 
 A projection (`Projection`) is everything, nothing, the keys of one collection level that a
-predicate 𝑝 admits (`Projection::Keys`), or a projection per field of a record of values
-(`Projection::Fields`). At the outermost level its guard is `Domain(𝑝)`. At level 𝑛 beneath it, 𝑝
+predicate 𝑝 admits (`Projection::Keys`), or a region of a structured value. Records name each
+field's region (`Projection::Fields`). A tagged value names a region of each constructor's payload
+(`Projection::Arms`), so a group key inside one constructor can be delivered independently.
+At the outermost collection level the key projection's guard is `Domain(𝑝)`. At level 𝑛 beneath it, 𝑝
 admits whole paths ([Qualified predicates](#qualified-predicates)), and its guard wraps the domain
 guard in 𝑛 codomain guards (`CurryLevel::wrap_guard`). Two projections meet at the deeper of their
 levels, where a key above is every path beneath it, and a region of every path beneath some keys is

@@ -1172,7 +1172,9 @@ mod pull_levels {
             Ok(or @ Projection::Or(_)) => Some(or.level()),
             // A record of values has no level of keys, so a pull of part of its fields is held to
             // the declaration of a whole read.
-            Ok(Projection::Everything | Projection::Fields { .. }) => Some(None),
+            Ok(Projection::Everything | Projection::Fields { .. } | Projection::Arms(_)) => {
+                Some(None)
+            }
             Ok(Projection::Nothing) | Err(_) => None,
         }
     }

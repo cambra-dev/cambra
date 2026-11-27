@@ -2387,6 +2387,15 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
         Projection::Everything => Some(input.universal_guard()),
         // A push of a row's remainder lands as itself: it states the row's end.
         Projection::Keys { .. } => Some(closed_keeping_row_ends(region.guard(input), input)),
+        // A tagged delta closes only the selected parts of each payload.
+        Projection::Arms(parts) => {
+            let Tiling::Union(arms) = input else {
+                panic!("{region:?} selects arms of {input}")
+            };
+            Some(TileGuard::Union(arms.map(|tag, ty| {
+                pushed_guard(parts.get(tag).unwrap(), ty).unwrap_or_else(|| ty.empty_guard())
+            })))
+        }
         // Each field is closed over its own tiling, as a push of that field alone would be.
         Projection::Fields { .. } => {
             let Tiling::Record(fields) = input else {
