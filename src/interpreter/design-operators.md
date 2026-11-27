@@ -624,16 +624,18 @@ level. A producer that declares more than the outermost keys reads its projectio
 `TileGuard::projection_for`, and any other with `TileGuard::projection`. Either panics with the
 guard on a shape that is no projection or that names keys at a level the producer does not restate,
 as [Guard operations are exact](#guard-operations-are-exact) requires of a restatement with no
-spelling. A debug build's `get` panics on a pull at such a level. `Tile::restrict_to_paths` cuts a
-tile at a level beneath the outermost (`src/interpreter/design-path-projections.md`,
-"Representation").
+spelling. A pull at such a level therefore never reaches `get_impl`. The `get` wrapper pulls the
+keys above it at the nearest level the producer restates (`Projection::restated_by`) and cuts the
+answer to the projection, since a `get` may pull more than it is asked for.
+`Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
+(`src/interpreter/design-path-projections.md`, "Representation").
 
 Each producer also declares, for each input, the deepest level a pull at the keys of level 𝑛 pulls
 that input at, or a whole read (`TileProducer::input_level`). The declaration is monotone in 𝑛. A
 debug build checks every pull against it in the `get` wrapper (`check_input_level`): no input is
 pulled beneath its declared level, and an input declared read whole is pulled whole. A pull may stop
-above the declaration, as `Uncurry` does for pairs named by their first component alone and for an
-input that does not restate the declared level.
+above the declaration, as `Uncurry` does for pairs named by their first component alone. The check
+runs on the widened pull, so an input that does not restate the declared level passes it.
 
 - **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
   under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
@@ -677,12 +679,12 @@ Each operator answers a projection as its row of this table states.
 | `Filter` | A predicate or input that is a collection is pulled at the projection, since they share the keys of the level the mask names. A side that is not a collection is read whole. With a collection predicate it takes a projection at any level down to the masked one (`Restates::Above`). The predicate holds no level beneath that one. With a function predicate, which masks the outermost keys, it takes a projection at any level (`Restates::Every`). |
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
-| `Uncurry` | Above the pairs the input is pulled at the projection. At and beneath them a pair is its outer key with its inner key on the next input level, so the input is pulled one level deeper, at the paths the pairs spell; pairs named by their first component alone are pulled at the outer keys. An input that does not restate the level it would be pulled at is pulled at the nearest level above that it restates (`Projection::restated_by`), and `input_level` declares that level (`Restates::nearest`). The pairs are cut after. |
+| `Uncurry` | Above the pairs the input is pulled at the projection. At and beneath them a pair is its outer key with its inner key on the next input level, so the input is pulled one level deeper, at the paths the pairs spell; pairs named by their first component alone are pulled at the outer keys. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
 | `Converse` | Every level is restated (`Restates::Every`). A projection of the input's keys one level beneath the inverted one under every value pulls the input at those keys ([Converse](#converse)). Otherwise, beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and inverting the outermost collection reads the whole input; the groups are cut to the projection, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
 | `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. The regions it has read and must read again are projections at any level, so a projection beneath the outermost keys is read and cached as one of the outermost keys is. |
-| `UnionOperator` | A flat union sends the projection to every arm; a tagged union routes it by tag, preserving enclosing paths for projections beneath the outermost keys. Each arm is read at the nearest level above or at its projection that it restates, which `input_level` declares (`Restates::nearest`), and the combined answer is cut to the requested projection. An arm named by no key is not read. A fully released arm contributes an empty tile stating its outermost keys complete. |
+| `UnionOperator` | A flat union sends the projection to every arm; a tagged union routes it by tag, preserving enclosing paths for projections beneath the outermost keys. Each arm is read at the projection, and the combined answer is cut to the requested projection. An arm named by no key is not read. A fully released arm contributes an empty tile stating its outermost keys complete. |
 | `CheckedLookup` | A stream of keys, or of `(collection, key)` rows, is pulled at the projection, since each answer sits at its key's position; the collection is read whole, because every key is answered against all of it. One key has no keys to project and admits only `Everything` and `Nothing`. |
 | `ExtractFinal` | Admits `Everything` and `Nothing`. The last position of a stream is not known before the stream ends, so the source is read whole, and the one value or collection it yields is released whole. A key projection panics, a collection-valued final position included. |
 | `PermuteRecordDomain` | Reads its input whole and cuts the answer to the projection over the permuted keys: a region of record keys is componentwise, and the input's fields are renamed, so the projection is not forwarded. |

@@ -1513,10 +1513,25 @@ pub trait TileProducer {
     /// checks require debug assertions. Probe observations occur after those checks.
     /// A debug build also checks that the answer holds only what the projection guard names
     /// ([`Tile::within`]); an operator that forwards the projection to its input answers inside
-    /// it because the input does, and any other cuts its own answer. It panics on a pull whose
-    /// projection names keys at a level [`restates`](Self::restates) refuses.
+    /// it because the input does, and any other cuts its own answer. A pull whose projection
+    /// names keys at a level [`restates`](Self::restates) refuses is widened to the nearest level
+    /// it restates, and the answer is cut to the projection.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
+        // A pull at keys of a level the producer does not restate pulls the keys above them at
+        // the nearest level it restates, and the answer is cut to the keys asked for: pulling
+        // more is sound for a `get`, so every producer answers a projection at every level.
+        // Every producer restates the outermost keys, so a guard that cannot name a deeper level
+        // skips building the projection, which copies the guard's predicates.
+        if Projection::may_name_inner_level(&projection_guard)
+            && let Ok(asked) = Projection::of(&projection_guard)
+            && let Some(level) = asked.level()
+            && self.restates().refuses(level)
+        {
+            let mut answer = self.get(asked.restated_by(&self.restates()).guard(self.tiling()));
+            answer.restrict_to(&asked, self.tiling());
+            return answer;
+        }
         // Cleared before the pull, so a notification arriving while it runs passes: the
         // pull may already have read past the input that sent it.
         if let Some(gate) = &self.base().gate {
@@ -1534,19 +1549,6 @@ pub trait TileProducer {
             pull_levels::PullFrame::enter(&*self, &projection_guard)
         };
         let asked = cfg!(debug_assertions).then(|| projection_guard.clone());
-        // A producer has no exact answer to a pull at keys it does not restate, so the pull is
-        // its consumer's bug.
-        if let Some(asked) = &asked
-            && let Ok(projection) = Projection::of(asked)
-            && let Some(level) = projection.level()
-            && self.restates().refuses(level)
-        {
-            panic!(
-                "{} was pulled at {asked:?}, at the keys of {level}, and restates {}",
-                self.name(),
-                self.restates()
-            );
-        }
         let mut result = self.get_impl(projection_guard);
         // Released scalar cells are removed while their enclosing rows remain open;
         // see `src/interpreter/design-operators.md`, "The release contract".
@@ -1986,6 +1988,8 @@ pub(crate) mod test_helpers {
         script: Option<std::rc::Rc<std::cell::RefCell<Tile>>>,
         pub(crate) pulled: GuardLog,
         pub(crate) released: GuardLog,
+        /// The levels it restates, every level unless a test narrows it.
+        pub(crate) restates: crate::interpreter::Restates,
     }
 
     /// The two logs of a [`ProjectionSpy`]: the projection guards it was pulled with, and the
@@ -2003,6 +2007,7 @@ pub(crate) mod test_helpers {
                     script: None,
                     pulled: pulled.clone(),
                     released: released.clone(),
+                    restates: crate::interpreter::Restates::Every,
                 },
                 pulled,
                 released,
@@ -2018,7 +2023,12 @@ pub(crate) mod test_helpers {
         }
 
         fn restates(&self) -> crate::interpreter::Restates {
-            crate::interpreter::Restates::Every
+            use crate::interpreter::Restates;
+            match &self.restates {
+                Restates::Outermost => Restates::Outermost,
+                Restates::Above(level) => Restates::Above(*level),
+                Restates::Every => Restates::Every,
+            }
         }
 
         fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
