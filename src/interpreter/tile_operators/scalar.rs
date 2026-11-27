@@ -164,7 +164,7 @@ impl TileProducer for ConstantProducer {
     /// A collection constant answers the keys the projection admits, which is how a worker reads
     /// the table a list literal denotes one morsel at a time. A scalar constant has one position,
     /// so its projection is the whole value or nothing.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -383,7 +383,7 @@ impl TileProducer for VariantWrapProducer {
 
     /// A projection above the wrap reaches the input unchanged. A projection at or below
     /// the wrap reads the input whole.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -746,7 +746,7 @@ fn release_bare_scrutinee(scrutinee: &mut dyn TileProducer, released: &TileGuard
 
 impl VariantProjectProducer {
     /// The payloads of the scrutinee's rows carrying the tag.
-    fn project(&mut self, projection: &Projection) -> Tile {
+    fn project(&self, projection: &Projection) -> Tile {
         let tile = self.input.get(scrutinee_guard(&*self.input, projection));
         // Under standing levels the projection runs one enclosing row at a time: its keys
         // are the rows it keeps, and which rows those are is a fact about one group.
@@ -778,7 +778,7 @@ impl TileProducer for VariantProjectProducer {
     /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
     /// the projection. A bare union is one value with no keys of its own, so it is read whole,
     /// and the projection and the parts already released are cut from its payload after.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
@@ -1097,7 +1097,7 @@ impl TileProducer for VariantIsProducer {
     /// Every key in is a key out, so the scrutinee is pulled at the projection, or whole where
     /// the scrutinee does not restate the projection's level, and the answer is cut to the
     /// projection after.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&self, projection_guard: TileGuard) -> Tile {
         // A test answers every position, so the scrutinee's levels, keys, groupings and
         // deletions stand as they are, and only its values change: each union value becomes
         // whether it carries the tag. A union of arm tiles holds levels inside its arms, but
@@ -1648,7 +1648,7 @@ mod tests {
         );
         assert!(matches!(op.tiling(), Tiling::Union(_)), "{}", op.tiling());
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let tile = producer.get(producer.tiling().universal_guard());
         let Some((tag, arm, slot)) = tile.union_arm_at(0) else {
             panic!("the wrapped value's one row carries a tag: {tile:?}");
@@ -1692,7 +1692,7 @@ mod tests {
             extents.get(&some).unwrap().clone(),
         );
         let mut cx = SubscribeContext::new();
-        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
+        let producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(
             producer.get(producer.tiling().universal_guard()),
             growing_collection()
@@ -1843,7 +1843,7 @@ mod projection_tests {
 
     #[test]
     fn nothing_names_no_keys_of_a_collection() {
-        let mut literal = list_literal();
+        let literal = list_literal();
         let nothing = literal.tiling().empty_guard();
         assert_eq!(literal.get(nothing), literal.tiling().empty_tile());
     }
@@ -2286,7 +2286,7 @@ mod variant_projection_tests {
 
     #[test]
     fn nothing_tests_nothing() {
-        let (mut is_commit, pulled) = is_commit();
+        let (is_commit, pulled) = is_commit();
         let nothing = is_commit.tiling().empty_guard();
         assert_eq!(is_commit.get(nothing), is_commit.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
@@ -2294,7 +2294,7 @@ mod variant_projection_tests {
 
     #[test]
     fn nothing_projects_nothing() {
-        let (mut commits, pulled) = commit_arm();
+        let (commits, pulled) = commit_arm();
         let nothing = commits.tiling().empty_guard();
         assert_eq!(commits.get(nothing), commits.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
@@ -2302,7 +2302,7 @@ mod variant_projection_tests {
 
     #[test]
     fn nothing_wraps_nothing() {
-        let (mut wrap, pulled) = wrapped_payloads();
+        let (wrap, pulled) = wrapped_payloads();
         let nothing = wrap.tiling().empty_guard();
         assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
