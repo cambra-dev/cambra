@@ -907,66 +907,6 @@ impl TileGuard {
         }
     }
 
-    /// Subtract completed cells across any shape, including independently completed
-    /// variant payloads. Whole keys of a collection exclude every field below them.
-    pub(crate) fn difference_over(&self, previous: &TileGuard, ty: &Tiling) -> TileGuard {
-        if self.is_empty() || previous.is_empty() {
-            return self.clone();
-        }
-        fn remaining(known: Option<&TileGuard>, above: &Predicate, ty: &Tiling) -> TileGuard {
-            let parts = Parts::of(known);
-            let leaves = |cells: &Predicate| {
-                Predicate::True
-                    .minus(&above.union(TileGuard::leaf_rows(cells)))
-                    .descend(1)
-            };
-            match ty {
-                Tiling::Scalar(_) => TileGuard::Scalar(leaves(&parts.scalar)),
-                Tiling::Aggregation { .. } => TileGuard::Aggregation(leaves(&parts.aggregation)),
-                Tiling::Record(fields) => TileGuard::Record(
-                    fields
-                        .iter()
-                        .map(|(name, field)| {
-                            (
-                                name.clone(),
-                                remaining(
-                                    parts.record.as_ref().and_then(|fs| fs.get(name)),
-                                    above,
-                                    field,
-                                ),
-                            )
-                        })
-                        .collect(),
-                ),
-                Tiling::Union(arms) => TileGuard::Union(arms.map(|tag, arm| {
-                    remaining(
-                        parts.union.as_ref().and_then(|tags| tags.get(tag)),
-                        above,
-                        arm,
-                    )
-                })),
-                Tiling::DataFunction { codomain, .. } if parts.codomain.is_some() => {
-                    let whole = above.descend(1).union(&parts.domain);
-                    TileGuard::Function(FunctionGuard::Codomain(Box::new(remaining(
-                        parts.codomain.as_ref(),
-                        &whole,
-                        codomain,
-                    ))))
-                }
-                Tiling::DataFunction { .. } | Tiling::Store { .. } => {
-                    TileGuard::Function(FunctionGuard::Domain(
-                        Predicate::True.minus(&above.descend(1).union(&parts.domain)),
-                    ))
-                }
-            }
-        }
-        TileGuard::flatten_or(vec![self.intersect(&remaining(
-            Some(previous),
-            &Predicate::False,
-            ty,
-        ))])
-    }
-
     /// Accumulate the regions of two guards for the same tiling.
     /// Panics on incompatible variants or different record field sets.
     /// Function regions that cannot combine into one arm remain a normalized `Or`.

@@ -1,6 +1,6 @@
 //! Insert-only writes to a memo's materialized tile.
 use super::*;
-use crate::interpreter::Projection;
+use crate::interpreter::{Projection, tile_operators::guard_minus};
 
 // A broad delivery may inspect prior coverage once. Reading this same cache a
 // second time inside the direct calculation would reintroduce the snapshot fallback.
@@ -42,7 +42,7 @@ pub(super) fn check_cache_snapshot(tile: &Tile) {
 
 impl Tile {
     /// Materialize a delivery and return the newly completed region. Reclaimed
-    /// fields still count towards completing their enclosing record.
+    /// regions are excluded even when a later statement covers them.
     pub(crate) fn append(
         &mut self,
         incoming: Tile,
@@ -60,7 +60,7 @@ impl Tile {
             drop(snapshots);
             // Whole-cache reads are an independent oracle for all the direct append paths.
             let after = self.to_guard().union(released);
-            let expected = after.difference_over(&before, tiling);
+            let expected = guard_minus(&after, &before);
             assert!(
                 delta.subsumes(&expected) && expected.subsumes(&delta),
                 "memo append must return its exact delta for {projection:?}: returned {delta:?}, expected {expected:?}"
@@ -76,18 +76,19 @@ impl Tile {
         tiling: &Tiling,
         released: &TileGuard,
     ) -> TileGuard {
-        #[cfg(debug_assertions)]
-        self.check_memo_row(&incoming, Some(0), 0, &mut Vec::new(), false);
+        #[cfg(any(test, debug_assertions))]
+        self.check_memo_row(
+            &incoming,
+            Some(0),
+            0,
+            &mut Vec::new(),
+            false,
+            cfg!(test).then_some(released),
+        );
 
         // The fast paths track cells still in the cache. A closing statement can
         // also cover cells the reader previously took and the cache has reclaimed.
-        let unreleased = |delta: TileGuard| {
-            if released.is_empty() {
-                delta
-            } else {
-                delta.difference_over(released, tiling)
-            }
-        };
+        let unreleased = |delta: TileGuard| guard_minus(&delta, released);
 
         if let (
             Tile::DataFunction {
@@ -121,10 +122,7 @@ impl Tile {
             )));
         }
 
-        let nested_record_items = contains_record_item_below(tiling, 2);
-        if !nested_record_items
-            && let Some(delta) = self.insert_memo_items(&mut incoming, projection, tiling)
-        {
+        if let Some(delta) = self.insert_memo_items(&mut incoming, projection, tiling) {
             return unreleased(delta);
         }
 
@@ -133,9 +131,7 @@ impl Tile {
             return tiling.empty_guard();
         }
 
-        if !nested_record_items
-            && let Some(nested) = NestedAppend::prepare(self, &incoming, projection, tiling)
-        {
+        if let Some(nested) = NestedAppend::prepare(self, &incoming, projection, tiling) {
             self.merge(incoming);
             // merge already compacts earlier statements. Readers projecting below a
             // newly closed ancestor still need the child statement recorded by settle.
@@ -150,20 +146,9 @@ impl Tile {
         if let Some(nested) = nested {
             nested.merge_into(self, tiling);
         }
-        let mut delta = arrived.difference_over(&known, tiling);
-        if !delta.is_empty() && contains_record_item_below(tiling, 1) {
-            let ends = self.settle_record_items(
-                tiling,
-                &known.union(&arrived),
-                &delta,
-                &[(0, Vec::new())],
-                0,
-            );
-            delta = delta.union(&ends.difference_over(&known, tiling));
-        }
         self.close_memo_positions(tiling);
-        // Cache statements can grow during the merge even without a physical item.
-        delta.union(&self.statements_guard(0).difference_over(&known, tiling))
+        // A closure can add a statement without adding a physical item.
+        guard_minus(&arrived.union(&self.statements_guard(0)), &known)
     }
 
     /// Previously held facts relevant to this delivery or a row end it can establish.
@@ -216,133 +201,6 @@ impl Tile {
         rows.to_guard().union(&self.statements_guard(0))
     }
 
-    /// Record fields settle independently. Their union may now cover an item, and the
-    /// finished items together can exhaust their day's finite domain. Carry those ends
-    /// upwards using the same qualified key paths as the original delivery.
-    fn settle_record_items(
-        &mut self,
-        ty: &Tiling,
-        coverage: &TileGuard,
-        arrived: &TileGuard,
-        rows: &[(usize, Vec<Value>)],
-        depth: usize,
-    ) -> TileGuard {
-        use super::super::guard::Parts;
-        let known = Parts::of(Some(coverage));
-        let changes = Parts::of(Some(arrived));
-        match (self, ty) {
-            (Tile::Record { fields, .. }, Tiling::Record(types)) => {
-                let mut ends = ty.empty_guard();
-                let TileGuard::Record(output) = &mut ends else {
-                    unreachable!()
-                };
-                for (name, change) in changes.record.into_iter().flatten() {
-                    let ty = &types[&name];
-                    if change.is_empty() {
-                        continue;
-                    }
-                    let Some(part) = known.record.as_ref().and_then(|fields| fields.get(&name))
-                    else {
-                        continue;
-                    };
-                    let end = fields
-                        .get_mut(&name)
-                        .unwrap()
-                        .settle_record_items(ty, part, &change, rows, depth);
-                    output.insert(name, end);
-                }
-                ends
-            }
-            (Tile::Union(arms), Tiling::Union(types)) => {
-                let mut ends = types.map(|_, t| t.empty_guard());
-                if let (Some(changes), Some(known)) = (changes.union, known.union) {
-                    for (tag, change) in changes.iter() {
-                        let ty = types.get(tag).unwrap();
-                        if change.is_empty() {
-                            continue;
-                        }
-                        let arm = arms.get_mut(tag).unwrap();
-                        let own = rows
-                            .iter()
-                            .filter_map(|(r, p)| Some((arm.rows.binary_search(r).ok()?, p.clone())))
-                            .collect::<Vec<_>>();
-                        *ends.get_mut(tag).unwrap() = arm.tile.settle_record_items(
-                            ty,
-                            known.get(tag).unwrap(),
-                            change,
-                            &own,
-                            depth,
-                        );
-                    }
-                }
-                TileGuard::Union(ends)
-            }
-            (
-                Tile::DataFunction {
-                    domain,
-                    row_starts,
-                    codomain,
-                    domain_predicate,
-                    ..
-                },
-                Tiling::DataFunction {
-                    domain: extent,
-                    codomain: values,
-                },
-            ) => {
-                let touched = arrived.touched_keys();
-                let mut complete = known.domain;
-                let mut below = values.empty_guard();
-                if let (Some(held), Some(change)) = (known.codomain, changes.codomain) {
-                    let mut children = Vec::new();
-                    for (row, parent) in rows {
-                        let (begin, end) = level_run(row_starts, *row, domain.len());
-                        for index in begin..end {
-                            let mut path = parent.clone();
-                            path.push(domain.index_at(index));
-                            if touched.contains_path(&path) {
-                                children.push((index, path));
-                            }
-                        }
-                    }
-                    below =
-                        codomain.settle_record_items(values, &held, &change, &children, depth + 1);
-                    complete =
-                        complete.union(&super::super::guard::whole_rows(&held.union(&below)));
-                }
-                let affected = complete.intersect(&touched);
-                let all = domain_predicate.union(&complete);
-                let parents = completed_parents(
-                    rows.iter().map(|(_, path)| path.as_slice()),
-                    &affected,
-                    &all,
-                    Some(extent),
-                );
-                let closed = if depth == 0 {
-                    parents
-                } else {
-                    parents.descend(1)
-                };
-                let ends = affected.union(&closed);
-                // A scalar column already records each held key. Only an inferred
-                // row end adds information that its cells cannot express.
-                let stated = if matches!(**values, Tiling::Scalar(_)) {
-                    &closed
-                } else {
-                    &ends
-                };
-                *domain_predicate = domain_predicate.union(stated);
-                TileGuard::Function(FunctionGuard::Domain(ends)).union(&TileGuard::Function(
-                    FunctionGuard::Codomain(Box::new(below)),
-                ))
-            }
-            (Tile::Scalar(_), Tiling::Scalar(_))
-            | (Tile::Aggregation { .. }, Tiling::Aggregation { .. })
-            | (Tile::Store { .. }, Tiling::Store { .. }) => ty.empty_guard(),
-            _ => panic!("memo tile does not match its declared tiling {ty}"),
-        }
-    }
-
     fn state_nested_memo_items(&mut self) {
         let nested_scalars = |tile: &Tile| {
             tile.innermost_depth().is_some_and(|d| d > 0)
@@ -383,7 +241,7 @@ impl Tile {
     /// Validate a delivery before mutating the cache. A repeated parent can carry new
     /// children or only a completion statement. A settled leaf can carry no second value,
     /// and a previously closed group can acquire no key, even one with an empty collection.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     fn check_memo_row(
         &self,
         incoming: &Tile,
@@ -391,7 +249,9 @@ impl Tile {
         row: usize,
         path: &mut Vec<Value>,
         closed: bool,
+        released: Option<&TileGuard>,
     ) {
+        let release = released.map(|guard| super::super::guard::Parts::of(Some(guard)));
         match (self, incoming) {
             (
                 Self::DataFunction {
@@ -420,7 +280,14 @@ impl Tile {
                         seen.insert(key.clone()) && (!final_key || previous.is_some()),
                         "memo received a value for an already completed key at {path:?}"
                     );
-                    codomain.check_memo_row(values, previous, i, path, final_key);
+                    codomain.check_memo_row(
+                        values,
+                        previous,
+                        i,
+                        path,
+                        final_key,
+                        release.as_ref().and_then(|p| p.codomain.as_ref()),
+                    );
                     path.pop();
                 }
             }
@@ -448,11 +315,42 @@ impl Tile {
                     }
                     (i < field.rows()).then_some(i)
                 };
+                let released_fields = release.as_ref().and_then(|p| p.record.as_ref());
+                #[cfg(test)]
+                if path.len() >= 2 {
+                    // Readers can release an unused field before the item reaches this Memo.
+                    // Among the remaining scalar siblings a delivery carries all or none.
+                    let mut present = added.iter().filter_map(|(name, value)| {
+                        if !matches!(value, Tile::Scalar(_)) {
+                            return None;
+                        }
+                        if let Some(TileGuard::Scalar(rows)) =
+                            released_fields.and_then(|f| f.get(name))
+                            && TileGuard::leaf_rows(rows).contains_path(path)
+                        {
+                            return None;
+                        }
+                        Some(physical(value, missing.get(name), row).is_some())
+                    });
+                    if let Some(first) = present.next() {
+                        assert!(
+                            present.all(|here| here == first),
+                            "memo needs direct delta support for split scalar fields of a nested record at {path:?}"
+                        );
+                    }
+                }
                 for (name, value) in added {
                     if let Some(at) = physical(value, missing.get(name), row) {
                         let old = &fields[name];
                         let cached = cached_row.and_then(|i| physical(old, absent.get(name), i));
-                        old.check_memo_row(value, cached, at, path, closed);
+                        old.check_memo_row(
+                            value,
+                            cached,
+                            at,
+                            path,
+                            closed,
+                            released_fields.and_then(|f| f.get(name)),
+                        );
                     }
                 }
             }
@@ -471,7 +369,14 @@ impl Tile {
                                  {path:?}"
                             );
                         }
-                        old.tile.check_memo_row(&arm.tile, cached, at, path, closed);
+                        old.tile.check_memo_row(
+                            &arm.tile,
+                            cached,
+                            at,
+                            path,
+                            closed,
+                            release.as_ref().and_then(|p| p.union.as_ref()?.get(tag)),
+                        );
                         break;
                     }
                 }
@@ -695,24 +600,6 @@ impl Tile {
 }
 
 /// Records keep their collection depth through both fields and variant arms.
-fn contains_record_item_below(ty: &Tiling, levels: usize) -> bool {
-    match ty {
-        Tiling::DataFunction { codomain, .. } => {
-            contains_record_item_below(codomain, levels.saturating_sub(1))
-        }
-        Tiling::Record(fields) => {
-            levels == 0
-                || fields
-                    .values()
-                    .any(|ty| contains_record_item_below(ty, levels))
-        }
-        Tiling::Union(arms) => arms
-            .values()
-            .any(|ty| contains_record_item_below(ty, levels)),
-        Tiling::Scalar(_) | Tiling::Store { .. } | Tiling::Aggregation { .. } => false,
-    }
-}
-
 /// The single field of existing or arriving outer rows named by an exact pull.
 fn projected_field(projection: &Projection) -> Option<&SmolStr> {
     let Projection::Within {
@@ -1263,136 +1150,61 @@ mod tests {
     }
 
     #[test]
-    fn a_day_end_in_a_tagged_record_field_only_publishes_the_new_arm_region() {
-        use crate::ccl::FieldKey;
-        let sale = FieldKey::Name("sale".into());
-        let other = FieldKey::Name("other".into());
-        let item = Tiling::Record([("sku".into(), integer()), ("qty".into(), integer())].into());
-        let days = keyed(Tiling::data_function(Extent::uint_range(1), item));
-        let tag_types = Tiling::Union(TagMap::from_arms(vec![
-            (sale.clone(), days.clone()),
-            (other.clone(), integer()),
-        ]));
-        let ty = Tiling::Record([("event".into(), tag_types), ("note".into(), integer())].into());
-        let wrap = |part| {
-            Tile::record(
-                [
-                    ("note".into(), integer().empty_tile()),
-                    (
-                        "event".into(),
-                        Tile::Union(TagMap::from_arms(vec![
-                            (
-                                sale.clone(),
-                                UnionArmTile {
-                                    rows: vec![0],
-                                    tile: part,
-                                },
-                            ),
-                            (
-                                other.clone(),
-                                UnionArmTile {
-                                    rows: vec![],
-                                    tile: integer().empty_at_rows(0),
-                                },
-                            ),
-                        ])),
-                    ),
-                ]
-                .into(),
-            )
-        };
-        let mut day = ints(&[3], &[]);
-        let mut items = ints(&[0], &[]);
-        *items.deepest_values_mut() = Tile::record(
+    fn a_complete_record_item_closes_its_single_item_day() {
+        let record = Tile::record(
             [
                 ("sku".into(), Tile::Scalar(ColumnValue::Ints(vec![812]))),
                 ("qty".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
             ]
             .into(),
         );
-        *day.deepest_values_mut() = items;
-        let mut cache = ty.empty_tile();
-        let mut published = ty.empty_guard();
-        for field in ["sku", "qty"] {
-            let projection = Projection::within(
-                CurryLevel::new(1),
-                Predicate::exactly(&[Value::UInt(3), Value::UInt(0)]),
-                Projection::of_field(field, Projection::Everything),
-            );
-            let mut delivery = day.clone();
-            delivery.restrict_to(&projection, &days);
-            let delta = cache.append_unreleased(wrap(delivery), &Projection::Everything, &ty);
-            assert!(published.intersect(&delta).is_empty());
-            published = published.union(&delta);
-            assert!(published.subsumes(&cache.to_guard()) && cache.to_guard().subsumes(&published));
-            let Tile::Record { fields, .. } = &cache else {
-                unreachable!()
-            };
-            let Tile::Union(arms) = &fields["event"] else {
-                unreachable!()
-            };
-            assert_eq!(
-                arms.get(&sale)
-                    .unwrap()
-                    .tile
-                    .level_statement()
-                    .contains(&Value::UInt(3)),
-                field == "qty"
-            );
-        }
-    }
-
-    #[test]
-    fn a_tagged_item_closes_when_its_active_record_arm_finishes() {
-        use crate::ccl::FieldKey;
-        let sale = FieldKey::Name("sale".into());
-        let unit = FieldKey::Name("empty".into());
-        let item = Tiling::Record([("sku".into(), integer()), ("qty".into(), integer())].into());
         let ty = keyed(Tiling::data_function(
             Extent::uint_range(1),
-            Tiling::Union(TagMap::from_arms(vec![
-                (sale.clone(), item.clone()),
-                (unit.clone(), integer()),
-            ])),
+            Tiling::Record([("sku".into(), integer()), ("qty".into(), integer())].into()),
         ));
+        let mut day = ints(&[3], &[]);
+        let mut items = ints(&[0], &[]);
+        *items.deepest_values_mut() = record;
+        *day.deepest_values_mut() = items;
         let mut cache = ty.empty_tile();
-        let mut published = ty.empty_guard();
-        for name in ["sku", "qty"] {
-            let mut record = item.empty_tile();
-            let Tile::Record { fields, absent } = &mut record else {
-                unreachable!()
-            };
-            fields.insert(name.into(), Tile::Scalar(ColumnValue::Ints(vec![1])));
-            let absent_name = if name == "sku" { "qty" } else { "sku" };
-            absent.insert(absent_name.into(), [0].into_iter().collect());
-            let mut day = ints(&[3], &[]);
-            let mut child = ints(&[0], &[]);
-            *child.deepest_values_mut() = Tile::Union(TagMap::from_arms(vec![
-                (
-                    sale.clone(),
-                    UnionArmTile {
-                        rows: vec![0],
-                        tile: record,
-                    },
-                ),
-                (
-                    unit.clone(),
-                    UnionArmTile {
-                        rows: vec![],
-                        tile: integer().empty_at_rows(0),
-                    },
-                ),
-            ]));
-            *day.deepest_values_mut() = child;
-            let delta = cache.append_unreleased(day, &Projection::Everything, &ty);
-            assert!(published.intersect(&delta).is_empty());
-            published = published.union(&delta);
-            assert_eq!(
-                cache.level_statement().contains(&Value::UInt(3)),
-                name == "qty"
-            );
-            assert!(published.subsumes(&cache.to_guard()) && cache.to_guard().subsumes(&published));
-        }
+        let delta = cache.append_unreleased(day, &Projection::Everything, &ty);
+        let closed = Projection::admitting(Predicate::point(Value::UInt(3))).guard(&ty);
+        assert!(delta.subsumes(&closed));
+        assert!(cache.level_statement().contains(&Value::UInt(3)));
+    }
+
+    #[rstest::rstest]
+    #[case::record(false)]
+    #[case::tagged_record(true)]
+    #[should_panic(expected = "memo needs direct delta support for split scalar fields")]
+    fn a_nested_item_cannot_deliver_one_unreleased_scalar_field(#[case] tagged: bool) {
+        let record = Tiling::Record([("sku".into(), integer()), ("qty".into(), integer())].into());
+        let mut item = record.empty_tile();
+        let Tile::Record { fields, absent } = &mut item else {
+            unreachable!()
+        };
+        fields.insert("sku".into(), Tile::Scalar(ColumnValue::Ints(vec![812])));
+        absent.insert("qty".into(), [0].into_iter().collect());
+        let item_ty = if tagged {
+            let tag = crate::ccl::FieldKey::Name("sale".into());
+            item = Tile::Union(TagMap::from_arms(vec![(
+                tag.clone(),
+                UnionArmTile {
+                    rows: vec![0],
+                    tile: item,
+                },
+            )]));
+            Tiling::Union(TagMap::from_arms(vec![(tag, record)]))
+        } else {
+            record
+        };
+        let ty = keyed(keyed(item_ty));
+        let mut day = ints(&[3], &[]);
+        let mut items = ints(&[0], &[]);
+        *items.deepest_values_mut() = item;
+        *day.deepest_values_mut() = items;
+        ty.empty_tile()
+            .append_unreleased(day, &Projection::Everything, &ty);
     }
 
     #[test]
