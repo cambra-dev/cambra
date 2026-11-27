@@ -22,8 +22,9 @@ use crate::interpreter::{
 /// one buffer. The gallery programs `source_shared` and `source_two_runs` pin
 /// the two cases.
 ///
-/// Lines are read by a background thread so that `check_for_new_data` never
-/// blocks — it simply drains whatever the reader thread has buffered so far.
+/// Lines are read by a background thread, so `check_for_new_data` never blocks. It takes at most
+/// [`POLL_BUDGET`](crate::interpreter::stream_buffer::POLL_BUDGET) of the lines the thread has
+/// buffered, and leaves the rest to the next poll.
 pub struct StdinDataSource {
     /// Shared buffer, indexing, and predicate bookkeeping.
     buf: UIntStreamBuffer,
@@ -34,7 +35,7 @@ pub struct StdinDataSource {
 }
 
 /// What the stdin reader thread sends.
-enum StdinMessage {
+pub(crate) enum StdinMessage {
     Line(SmolStr),
     /// Stdin reached end of file, and the reader has returned.
     Eof,
@@ -71,6 +72,15 @@ fn read_lines(mut reader: impl BufRead, sender: Sender<StdinMessage>) {
 }
 
 impl StdinDataSource {
+    /// A source reading `receiver`, with no reader thread on stdin.
+    #[cfg(test)]
+    pub(crate) fn reading(receiver: Receiver<StdinMessage>) -> Self {
+        Self {
+            buf: UIntStreamBuffer::new(),
+            receiver: std::sync::Mutex::new(Some(receiver)),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             buf: UIntStreamBuffer::new(),
@@ -106,8 +116,9 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Some(self.buf.retained_window())
     }
 
-    /// Drains the lines the reader thread has sent, starting it on the first call, and never
-    /// blocks.
+    /// Takes the lines the reader thread has sent, at most
+    /// [`POLL_BUDGET`](crate::interpreter::stream_buffer::POLL_BUDGET) of them, starting the thread
+    /// on the first call, and never blocks.
     ///
     /// Returns `true` if at least one line or the end of file arrived, which tells the scheduler
     /// to notify consumers. Panics on the error that stopped the reader: the stream can neither
@@ -123,7 +134,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
             .unwrap_or_else(PoisonError::into_inner)
             .get_or_insert_with(spawn_reader);
         let mut got_data = false;
-        loop {
+        for _ in 0..crate::interpreter::stream_buffer::POLL_BUDGET {
             match receiver.try_recv() {
                 Ok(StdinMessage::Line(line)) => {
                     self.buf.push(line);
@@ -200,7 +211,7 @@ mod tests {
     use crate::interpreter::{
         ColumnValue, DataSourceDomainExtentImpl, Value,
         stdio::{StdinDataSource, StdinMessage, read_lines},
-        stream_buffer::UIntStreamBuffer,
+        stream_buffer::POLL_BUDGET,
         tiling::Predicate,
     };
     use test_log::test;
@@ -211,10 +222,26 @@ mod tests {
         for message in messages {
             sender.send(message).unwrap();
         }
-        StdinDataSource {
-            buf: UIntStreamBuffer::new(),
-            receiver: std::sync::Mutex::new(Some(receiver)),
+        StdinDataSource::reading(receiver)
+    }
+
+    /// A poll takes at most [`POLL_BUDGET`] lines, so a backlog the reader keeps full is taken
+    /// over several polls, each of which returns, rather than by one poll that drains it.
+    #[test]
+    fn a_poll_takes_at_most_its_budget_of_lines() {
+        let lines = 3 * POLL_BUDGET;
+        let mut messages: Vec<StdinMessage> = (0..lines)
+            .map(|line| StdinMessage::Line(line.to_string().into()))
+            .collect();
+        messages.push(StdinMessage::Eof);
+        let mut source = source_reading(messages);
+        let mut taken = Vec::new();
+        while source.check_for_new_data() {
+            taken.push(source.buf.ready_size);
         }
+        let budget = POLL_BUDGET as u64;
+        assert_eq!(taken, [budget, 2 * budget, 3 * budget, 3 * budget]);
+        assert!(source.buf.eof_reached);
     }
 
     /// `Predicate::False` means nothing is obsolete: all indices in `start_idx..ready_size`.

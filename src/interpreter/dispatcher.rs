@@ -64,6 +64,18 @@ pub struct WorkPackage {
     pub(crate) index: usize,
 }
 
+/// What a source's notify did with a region ([`Dispatcher::try_notify`]).
+pub enum Admission {
+    /// The region is queued, or names nothing.
+    Queued,
+    /// The source has as many packages outstanding as its [limit](Dispatcher::limit); nothing is
+    /// queued.
+    Full,
+    /// The run's claims have stopped or the run has failed, so no claim takes a package; nothing
+    /// is queued.
+    Stopped,
+}
+
 /// What a worker does next, as [`Dispatcher::try_claim`] answers.
 #[cfg_attr(test, derive(Debug))]
 pub enum Next {
@@ -217,15 +229,22 @@ impl Queue {
         ))
     }
 
-    /// Remove a matching claim. Monotonic indices distinguish repeated reads of the same guard.
-    fn acknowledge(&self, package: &WorkPackage, on_ack: impl FnOnce()) -> bool {
+    /// Remove a matching claim, and answer whether it was one: `None` where no claim matches, and
+    /// otherwise whether the package at the head of the queue met the removed one, which
+    /// [`claim`](Self::claim) holds back while they overlap. Monotonic indices distinguish
+    /// repeated reads of the same guard.
+    fn acknowledge(&self, package: &WorkPackage, on_ack: impl FnOnce()) -> Option<bool> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.in_flight.get(&package.index) != Some(&package.guard) {
-            return false;
+            return None;
         }
         on_ack();
         state.in_flight.remove(&package.index);
-        true
+        let freed_head = state
+            .ready
+            .front()
+            .is_some_and(|(_, next)| !next.intersect(&package.guard).is_empty());
+        Some(freed_head)
     }
 
     /// Reserve `count` indices while the queue is open, and answer the first; `None` once it is
@@ -930,7 +949,7 @@ impl Dispatcher {
 
     /// Let a notify of the source `pipeline` queue more only while fewer than `packages` of its
     /// packages are queued and not acknowledged: [`notify`](Self::notify) waits
-    /// until then, and [`try_notify`](Self::try_notify) answers that it did not queue. A notify
+    /// until then, and [`try_notify`](Self::try_notify) answers [`Admission::Full`]. A notify
     /// admitted below the limit queues all its morsels, so the packages outstanding exceed
     /// `packages` by at most one notify's morsels less one, for one thread that notifies.
     ///
@@ -1056,42 +1075,52 @@ impl Dispatcher {
     /// (`Value::UInt` keys), and whole otherwise. The workers claim them as they are queued.
     ///
     /// A source [limited](Self::limit) to as many packages outstanding as it has waits until one
-    /// is acknowledged, so the thread that notifies is held back by the workers. After a failure
-    /// it returns at once, having queued nothing.
+    /// is acknowledged, so the thread that notifies is held back by the workers. A notify that
+    /// checks after the run's claims stop ([`stop_claims`](Self::stop_claims)) or the run fails
+    /// returns at once with [`Admission::Stopped`] and queues nothing, a notify already waiting
+    /// for credit included. A notify that checks just before a stop may still queue, which no
+    /// claim then takes. It answers [`Admission::Queued`] or [`Admission::Stopped`].
     ///
     /// # Panics
     ///
     /// When `pipeline` takes no arrivals ([`take_arrivals`](Self::take_arrivals))
     /// or is closed; in a debug build, when `guard` meets a region queued for a source before.
-    pub fn notify(&self, pipeline: PipelineId, guard: &TileGuard) {
+    pub fn notify(&self, pipeline: PipelineId, guard: &TileGuard) -> Admission {
         loop {
-            // Read before the check: an acknowledgement the check misses advances the generation
-            // past this one, so the wait returns at once.
+            // Read before the check: an acknowledgement or a stop the check misses advances the
+            // generation past this one, so the wait returns at once.
             let generation = self.generation.load(Ordering::SeqCst);
-            if self.try_notify(pipeline, guard) {
-                return;
+            match self.try_notify(pipeline, guard) {
+                Admission::Full => self.wait(Generation(generation)),
+                admitted => return admitted,
             }
-            self.wait(Generation(generation));
         }
     }
 
-    /// [`notify`](Self::notify) without waiting: whether `guard` is queued, which it is not while
-    /// the source has as many packages outstanding as its [limit](Self::limit). After a failure
-    /// it queues nothing and answers `true`, since nothing will acknowledge a package.
+    /// [`notify`](Self::notify) without waiting: [`Admission::Full`] while the source has as many
+    /// packages outstanding as its [limit](Self::limit), and [`Admission::Stopped`] where it
+    /// checks after the run's claims stop or the run fails, since no claim will take a package.
+    /// Neither queues anything.
     ///
     /// # Panics
     ///
     /// As [`notify`](Self::notify).
-    pub fn try_notify(&self, pipeline: PipelineId, guard: &TileGuard) -> bool {
+    pub fn try_notify(&self, pipeline: PipelineId, guard: &TileGuard) -> Admission {
         let _publisher = self.publisher();
-        if self.failed.load(Ordering::SeqCst) || guard.is_empty() {
-            return true;
+        if self.failed.load(Ordering::SeqCst) {
+            return Admission::Stopped;
         }
         self.ensure_source(pipeline);
+        if self.stopped.load(Ordering::SeqCst) {
+            return Admission::Stopped;
+        }
+        if guard.is_empty() {
+            return Admission::Queued;
+        }
         let info = &self.infos[pipeline.0];
         // A limit is a source's alone (`limit`), whose every package its notifies queue.
         if info.limit != usize::MAX && self.state(pipeline).outstanding() >= info.limit {
-            return false;
+            return Admission::Full;
         }
         let morsels = cut_positions(guard, self.morsel_rows);
         debug_assert!(
@@ -1100,7 +1129,7 @@ impl Dispatcher {
             partition_gap(guard, &morsels).unwrap_or_default()
         );
         self.append_to_source(pipeline, &morsels);
-        true
+        Admission::Queued
     }
 
     /// Refuse `pipeline` unless it takes arrivals: a source, one that reads no pipeline, or one
@@ -1292,8 +1321,7 @@ impl Dispatcher {
     /// [`changed_since`](Self::changed_since), it misses no package: one that becomes claimable
     /// after it advances the generation. A package held back because its region meets one in
     /// flight becomes claimable at that package's acknowledgement, which advances the generation
-    /// only where it frees or completes a queue, so every claimant wakes the others once its claim
-    /// ends ([`wake_claimants`](Self::wake_claimants)).
+    /// ([`acknowledge`](Self::acknowledge)).
     pub(crate) fn may_claim_where(&self, takes: &dyn Fn(PipelineId) -> bool) -> bool {
         (0..self.infos.len())
             .filter(|&p| takes(PipelineId(p)))
@@ -1355,7 +1383,8 @@ impl Dispatcher {
     }
 
     /// End the run's claims at a drained boundary: every claim from now answers [`Next::Done`],
-    /// and every waiter wakes, so a worker of the pool stops before the run returns.
+    /// every notify that checks from now [`Admission::Stopped`], and every waiter wakes, so a
+    /// worker of the pool stops before the run returns and a publisher waiting for credit returns.
     pub(crate) fn stop_claims(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.advance();
@@ -1395,7 +1424,7 @@ impl Dispatcher {
         let p = package.pipeline.0;
         let state = self.state(package.pipeline);
         let mut acknowledged = 0;
-        let held = state.queue.acknowledge(&package, || {
+        let freed_head = state.queue.acknowledge(&package, || {
             // Record consumption before unlocking the next ordered claim or publishing finish.
             #[cfg(test)]
             self.record(Event::Consume {
@@ -1425,12 +1454,14 @@ impl Dispatcher {
                 package.guard
             ),
         };
-        self.ensure(held, refused);
-        // An acknowledgement frees an ordered pipeline's next package, may let the pipeline
-        // finish or a pipeline that follows it claim, and returns credit to a limited source's
-        // notify.
+        self.ensure(freed_head.is_some(), refused);
+        // An acknowledgement frees an ordered pipeline's next package or a package that waited
+        // on the acknowledged one's region, may let the pipeline finish or a pipeline that follows
+        // it claim, and returns credit to a limited source's notify. A claimant asleep on the
+        // generation wakes only where it advances.
         if self.infos[p].ordered
             || self.infos[p].limit != usize::MAX
+            || freed_head == Some(true)
             || acknowledged == state.queue.reserved()
         {
             self.advance();
@@ -3097,6 +3128,111 @@ mod tests {
         for package in [disjoint, overlapping] {
             dispatcher.acknowledge(package);
         }
+    }
+
+    /// The acknowledgement that frees a package waiting on an overlapping one wakes a claimant
+    /// asleep on the pipeline, with no other change to the dispatcher. The claimant is asleep in
+    /// [`Dispatcher::wait`] before the acknowledgement, and must return within a bounded wait.
+    #[test]
+    fn acknowledging_an_overlap_wakes_a_sleeping_claimant() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::time::{Duration, Instant};
+        let dispatcher = Dispatcher::new(vec![vec![]], 1 << 20).unrecorded();
+        let source = PipelineId(0);
+        dispatcher.notify(source, &keys_between(0, 9));
+        let first = dispatcher
+            .claim_of(source)
+            .expect("the first package claims");
+        dispatcher.notify(source, &keys_between(5, 14));
+        let (claimed, woke) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let next = dispatcher.claim(None);
+                claimed.send(next).expect("the test waits for the claim");
+            });
+            // The claimant finds only the overlapping package and sleeps.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while dispatcher.sleepers.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline, "the claimant never slept");
+                thread::sleep(Duration::from_millis(1));
+            }
+            dispatcher.acknowledge(first);
+            let next = woke.recv_timeout(Duration::from_secs(5));
+            if next.is_err() {
+                // Release the claimant so the scope can end, then report the missed wake.
+                dispatcher.fail();
+            }
+            let Ok(Next::Package(package)) = next else {
+                panic!("the acknowledgement left the claimant asleep: {next:?}")
+            };
+            assert_eq!(package.guard, keys_between(5, 14));
+            dispatcher.acknowledge(package);
+        });
+    }
+
+    /// A notify after the run's claims stop queues nothing: no claim will take it.
+    #[test]
+    fn a_notify_after_claims_stop_queues_nothing() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        let mut dispatcher = Dispatcher::new(vec![vec![]], 1).unrecorded();
+        let source = PipelineId(0);
+        dispatcher.limit(source, 1);
+        dispatcher.stop_claims();
+        for keys in [keys_between(0, 0), keys_between(1, 1)] {
+            assert!(matches!(
+                dispatcher.try_notify(source, &keys),
+                Admission::Stopped
+            ));
+        }
+        assert_eq!(
+            dispatcher.outstanding(source),
+            0,
+            "a stopped run queues nothing"
+        );
+    }
+
+    /// A publisher waiting for credit on a limited source returns once the run's claims stop,
+    /// since no claim will acknowledge a package to give it credit. It is asleep in
+    /// [`Dispatcher::wait`] before the stop, and must return within a bounded wait.
+    #[test]
+    fn a_publisher_waiting_for_credit_returns_when_claims_stop() {
+        use crate::interpreter::tile_operators::test_helpers::keys_between;
+        use std::time::{Duration, Instant};
+        let mut dispatcher = Dispatcher::new(vec![vec![]], 1).unrecorded();
+        let source = PipelineId(0);
+        dispatcher.limit(source, 1);
+        let _ = dispatcher.notify(source, &keys_between(0, 0));
+        let (returned, done) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let admitted = dispatcher.notify(source, &keys_between(1, 1));
+                returned
+                    .send(matches!(admitted, Admission::Stopped))
+                    .expect("the test waits for the publisher");
+            });
+            // The publisher finds no credit and sleeps.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while dispatcher.sleepers.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline, "the publisher never slept");
+                thread::sleep(Duration::from_millis(1));
+            }
+            dispatcher.stop_claims();
+            let outcome = done.recv_timeout(Duration::from_secs(5));
+            if outcome.is_err() {
+                // Release the publisher so the scope can end, then report that it stayed blocked.
+                dispatcher.fail();
+            }
+            assert_eq!(
+                outcome.ok(),
+                Some(true),
+                "the publisher returns stopped once the claims stop"
+            );
+        });
+        assert_eq!(
+            dispatcher.outstanding(source),
+            1,
+            "the stop admitted nothing more"
+        );
     }
 
     #[test]

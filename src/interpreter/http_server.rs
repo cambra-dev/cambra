@@ -630,14 +630,15 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         self.shared.answer_not_found();
     }
 
-    /// Drain the requests the dispatcher thread has queued. Returns `true` if at least one
-    /// arrived.
+    /// Take the requests the dispatcher thread has queued, at most
+    /// [`POLL_BUDGET`](crate::interpreter::stream_buffer::POLL_BUDGET) of them. Returns `true` if
+    /// at least one arrived.
     ///
     /// Panics when the dispatcher has failed or the route's channel has no sender. Either way no
     /// request reaches the route again, and the program has no way to go on serving it.
     fn check_for_new_data(&mut self) -> bool {
         let mut got_data = false;
-        loop {
+        for _ in 0..crate::interpreter::stream_buffer::POLL_BUDGET {
             match self
                 .receiver
                 .get_mut()
