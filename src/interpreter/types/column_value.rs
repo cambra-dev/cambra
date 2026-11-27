@@ -849,19 +849,6 @@ impl ColumnValue {
         }
     }
 
-    /// Whether one collection's incoming key run names each item once.
-    pub(crate) fn has_unique_keys(&self) -> bool {
-        match self {
-            Self::UInts(v) if v.windows(2).all(|w| w[0] < w[1]) => true,
-            Self::Ints(v) if v.windows(2).all(|w| w[0] < w[1]) => true,
-            Self::Units(n) => *n <= 1,
-            _ => {
-                let mut seen = std::collections::HashSet::new();
-                (0..self.len()).all(|i| seen.insert(self.index_at(i)))
-            }
-        }
-    }
-
     /// Insert a run at an enclosing row's end, keeping the following rows in order.
     pub(crate) fn insert_column(&mut self, at: usize, incoming: ColumnValue) {
         let len = self.len();

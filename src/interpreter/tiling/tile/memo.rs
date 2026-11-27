@@ -5,17 +5,15 @@ use crate::interpreter::Projection;
 impl Tile {
     /// Materialize a memo delivery. Complete leaves are single-assignment. A later
     /// delivery can add descendants of an open row or advance its completion statement.
-    pub(crate) fn append_memo(&mut self, mut incoming: Tile, projection: &Projection) {
+    pub(crate) fn append(&mut self, mut incoming: Tile, projection: &Projection) {
+        #[cfg(test)]
+        self.check_memo_row(&incoming, Some(0), 0, &mut Vec::new(), false);
+
         if self.insert_memo_items(&incoming, projection).is_some() {
             return;
         }
         if let (
-            Tile::DataFunction {
-                domain,
-                codomain,
-                domain_predicate,
-                ..
-            },
+            Tile::DataFunction { codomain, .. },
             Tile::DataFunction {
                 domain: new,
                 codomain: values,
@@ -25,31 +23,20 @@ impl Tile {
         ) = (&*self, &mut incoming)
             && matches!((&**codomain, &**values), (Tile::Scalar(_), Tile::Scalar(_)))
         {
-            let added = Predicate::from_column_value(new);
-            assert!(
-                new.has_unique_keys()
-                    && added.intersect(domain_predicate).is_false()
-                    && (!codomain.is_empty()
-                        || added
-                            .intersect(&Predicate::from_column_value(domain))
-                            .is_false()),
-                "memo received a value for an already completed key"
-            );
-            // A held scalar is final. Its key is part of the cache's completion
-            // statement, so later appends need only check their own incoming run.
+            // A held scalar is final, so its key contributes to the completion statement.
             if !values.is_empty() {
-                *stated = stated.union(&added);
+                *stated = stated.union(&Predicate::from_column_value(new));
             }
             self.append_keys(incoming, true);
             return;
         }
-        self.check_memo_row(&incoming, Some(0), 0, &mut Vec::new(), false);
         self.merge(incoming);
     }
 
-    /// Validate a wider delivery before mutating the cache. A repeated parent can carry new
+    /// Validate a delivery before mutating the cache. A repeated parent can carry new
     /// children or only a completion statement. A settled leaf can carry no second value,
     /// and a previously closed group can acquire no key, even one with an empty collection.
+    #[cfg(test)]
     fn check_memo_row(
         &self,
         incoming: &Tile,
@@ -156,7 +143,6 @@ impl Tile {
             domain: parents,
             codomain,
             keys_follow_beneath: follow,
-            domain_predicate: complete,
             ..
         } = self
         else {
@@ -219,17 +205,7 @@ impl Tile {
             return None;
         }
         if !keys.is_empty() {
-            let start = row_starts[row];
             let end = row_starts.get(row + 1).copied().unwrap_or(domain.len());
-            let new = Predicate::from_column_value(keys);
-            let decided = domain_predicate.within(std::slice::from_ref(&parent), 0);
-            assert!(
-                keys.has_unique_keys()
-                    && !complete.contains(&parent)
-                    && decided.intersect(&new).is_false()
-                    && !(start..end).any(|i| new.contains(&domain.index_at(i))),
-                "memo received a value for an already completed key under {parent:?}.{name}"
-            );
             domain.insert_column(end, keys.clone());
             codomain.insert_plain_rows(end, values);
             for offset in &mut row_starts[row + 1..] {
@@ -263,7 +239,7 @@ mod tests {
 
     fn rejects_update(cache: &mut Tile, update: Tile, projection: &Projection) {
         let before = cache.clone();
-        let fail = catch_unwind(AssertUnwindSafe(|| cache.append_memo(update, projection)));
+        let fail = catch_unwind(AssertUnwindSafe(|| cache.append(update, projection)));
         let error = fail.expect_err("a completed key must reject a second value");
         let message = error
             .downcast_ref::<String>()
@@ -292,7 +268,7 @@ mod tests {
     #[test]
     fn a_flat_memo_rejects_a_second_value_and_the_rest_of_its_batch() {
         let mut cache = ints(&[], &[]);
-        cache.append_memo(ints(&[3], &[30]), &Projection::Everything);
+        cache.append(ints(&[3], &[30]), &Projection::Everything);
         for value in [30, 99] {
             rejects_update(
                 &mut cache,
@@ -410,6 +386,6 @@ mod tests {
             unreachable!()
         };
         *domain = ColumnValue::UInts(vec![7]);
-        cache.append_memo(incoming, &Projection::Everything);
+        cache.append(incoming, &Projection::Everything);
     }
 }

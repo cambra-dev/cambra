@@ -1909,7 +1909,7 @@ impl MemoProducer {
 
 impl MemoProducer {
     /// An exact field pull carries its own publication delta. The input cache can serve
-    /// independent fields concurrently. Check and insert the delivered values under the same lock as local reclamation.
+    /// independent fields concurrently. Append the delivered values under the same lock as local reclamation.
     fn consume_fields(
         &self,
         guard: TileGuard,
@@ -1934,7 +1934,7 @@ impl MemoProducer {
             }
             let held = answer.to_guard();
             if !held.is_empty() {
-                cache.append_memo(answer, projection);
+                cache.append(answer, projection);
             }
             held
         };
@@ -1996,7 +1996,7 @@ impl MemoProducer {
         // still releasing its input owns the publication of everything it merged.
         let mut before =
             (pushes.is_some() && flat.is_none() && nested.is_none()).then(|| cache.to_guard());
-        cache.append_memo(input, &projection);
+        cache.append(input, &projection);
         let nested = nested.map(|answer| answer.merge_into(&mut cache, self.tiling()));
         for depth in (0..self.tiling().levels()).rev() {
             let level = CurryLevel::new(depth);
