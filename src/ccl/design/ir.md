@@ -791,6 +791,16 @@ to the `try` around it.
   one is not, a lambda's type stating the domain in terms of its parameter, the filter's pure form
   replaces it instead: the filter with each exception read as `false`, which agrees with it
   wherever nothing raised, and which the cast evaluates a second time.
+- An element or a filter may raise where an exception escapes it (`Cx::escapes`), not wherever it
+  holds a `raise` or a `try`. A comprehension whose element and filter hold only `try`s that no
+  exception escapes is eliminated in place, with no outcomes, no scan and no `__filter`.
+- A refinement predicate can hold a copy of a term that holds a `raise` or a `try`. Elimination
+  replaces each such predicate with its pure form: the predicate with every `try` in it
+  eliminated in place and each exception that escapes it read as `false`. The types inside a
+  predicate's terms, such as a lambda parameter's type, take their pure form too. A predicate is
+  an expression and cannot hold a statement. Eliminating a comprehension whose elements may raise
+  produces a scan, which is a statement, so a predicate holding such a comprehension has no pure
+  form.
 - A function an inlined call passes on stands in the tuple of the call's arguments,
   `(𝑓, 𝑥) ▷ .0`, and is applied where it stands (`ccl_utils::projected_element`).
 - A match on an outcome whose producer ends in an `if` or a `match` with each branch ending in a

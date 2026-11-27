@@ -2,7 +2,8 @@
 //! elimination (`src/ccl/design/ir.md`, "Exceptions").
 
 use super::helpers::*;
-use cambra::interpreter::Value;
+use bit_set::BitSet;
+use cambra::interpreter::{ColumnValue, Predicate, Tile, Value};
 use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
@@ -1447,5 +1448,68 @@ fn an_exception_through_a_function_parameter(
             {call}
         "},
         Value::Int(expected),
+    );
+}
+
+/// A `groupby` map the program returns, over a comprehension whose element or filter calls a
+/// function with a `try` that no exception escapes. The map's type states its keys through a copy
+/// of the comprehension, and elimination leaves that copy an expression
+/// (`src/ccl/design/ir.md`, "Exceptions").
+#[rstest]
+#[case::caught_in_the_element(indoc! {"
+    def g(x):
+        try:
+            if x > 0:
+                x
+            else:
+                raise 1
+        except Int:
+            0
+    lines = [(name=s, total=g(s)) for s in [150, 0]]
+"}, &[0, 150], &[0, 150])]
+#[case::caught_in_the_filter(indoc! {"
+    def p(x):
+        try:
+            if x > 0:
+                x > 100
+            else:
+                raise 1
+        except Int:
+            False
+    lines = [(name=s, total=s) for s in [150, 0, 7] if p(s)]
+"}, &[150], &[150])]
+#[case::caught_by_two_trys(indoc! {r#"
+    def g(x):
+        try:
+            if x > 0:
+                x
+            elif x == 0:
+                raise 1
+            else:
+                raise "neg"
+        except Int:
+            0
+    def h(x):
+        try:
+            g(x)
+        except String:
+            -1
+    lines = [(name=s, total=h(s)) for s in [150, 0, -5]]
+"#}, &[-5, 0, 150], &[-1, 0, 150])]
+fn a_caught_value_grouped_into_a_returned_map(
+    #[case] lines: &str,
+    #[case] keys: &[i64],
+    #[case] totals: &[i64],
+) {
+    check_tile(
+        &format!(
+            "{lines}\n[sum([l.total for l in grp]) for grp in groupby(lines, \\l -> l.name)]\n"
+        ),
+        Tile::data_function(
+            ColumnValue::Ints(keys.to_vec()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(totals.to_vec()))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     );
 }
