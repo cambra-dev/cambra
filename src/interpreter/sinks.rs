@@ -125,8 +125,9 @@ impl SinkConsumer {
         // A producer released whole answers nothing more, and the run's finish states what it
         // handed complete ([`pull_at_finish`]).
         let tile = pull_at_finish(&mut **producer);
-        self.sink.process(&tile);
         producer.release(tile.to_guard());
+        let tile = live_rows(tile);
+        self.sink.process(&tile);
         assert!(
             tile.is_terminal(),
             "a finished sink reconciles a terminal tile"
@@ -167,6 +168,32 @@ impl Consumer for SinkConsumer {
             landing.queue(pipeline, &guard);
         }
     }
+}
+
+/// `tile` without the rows it marks deleted ([`Tile::compact`]), which is what a sink is
+/// handed.
+///
+/// Removing the marked rows leaves whether the tile is terminal unchanged, which a debug build
+/// checks. `Tile::is_terminal` counts held keys toward closing a collection over a finite key
+/// type, and `MainOutput` reads it from the tile it is handed. A filter and `Restrict` state
+/// each key they reject complete (`Tile::reject_keys`), and a tagged union carries each arm's
+/// statement under the arm's tag, so a removed key stays stated.
+///
+/// A filter and `Restrict` mark the keys they reject, and a union carries its arms' marks. Every
+/// sink reads each row it is handed. `Collected`, which `Run.main` reads, and the CLI's
+/// `PrintedMain` would therefore print a marked row. `TestSink` and the HTTP sink check in a
+/// debug build, as each tile is handed to them, that it marks no row. The caller releases the
+/// producer at `tile.to_guard()` before this: the guard names the marked keys, so the release
+/// covers them and the producer is released whole.
+pub(crate) fn live_rows(mut tile: Tile) -> Tile {
+    let terminal = cfg!(debug_assertions).then(|| tile.is_terminal());
+    tile.compact();
+    debug_assert!(
+        terminal.is_none_or(|terminal| terminal == tile.is_terminal()),
+        "removing the rows a tile marks deleted leaves whether it is terminal unchanged: \
+         {tile:?}"
+    );
+    tile
 }
 
 /// What a sink's or a `main` output's producer answers at the run's finish: its pull at the

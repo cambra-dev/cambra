@@ -84,6 +84,11 @@ impl TestSink {
 
 impl DataSink for TestSink {
     fn process(&self, tile: &Tile) {
+        debug_assert!(
+            !tile.holds_deleted_rows(),
+            "a sink is handed only live rows (`sinks::live_rows`), so no level of a tile it is \
+             handed marks a row deleted: {tile:?}"
+        );
         let mut slot = self.accumulated.lock().unwrap();
         match slot.as_mut() {
             None => *slot = Some(tile.clone()),
@@ -164,10 +169,7 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
         // A collection groups rather than pairing: row `r` owns the key run
         // `row_starts[r] .. row_starts[r + 1]`, and the values tile is one row per key.
         Tile::DataFunction {
-            domain,
-            codomain,
-            deleted,
-            ..
+            domain, codomain, ..
         } => {
             if tile.rows() != rows {
                 return Err(SinkReadError::Malformed(format!(
@@ -180,7 +182,6 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
                 .map(|r| {
                     let (start, end) = tile.row_run(r);
                     let bindings = (start..end)
-                        .filter(|k| !deleted.contains(*k))
                         .map(|k| FuncBinding {
                             input: domain.index_at(k),
                             output: value_rows[k].clone(),
@@ -242,8 +243,12 @@ mod tests {
         );
     }
 
+    /// A tile handed to the sink without passing `sinks::live_rows` fails at the hand-off in a
+    /// debug build, before any read.
     #[test]
-    fn a_deleted_key_is_skipped() {
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a sink is handed only live rows")]
+    fn a_deleted_key_reaching_the_sink_panics() {
         let mut deleted = BitSet::new();
         deleted.insert(1);
         let tile = Tile::data_function(
@@ -252,10 +257,7 @@ mod tests {
             Predicate::True,
             deleted,
         );
-        assert_eq!(
-            read(tile).expect("a value").to_string(),
-            "Function [ u0 -> 1, u2 -> 3 ]"
-        );
+        TestSink::default().process(&tile);
     }
 
     /// A column that has not arrived is incomplete, at the top level and beneath keys that
