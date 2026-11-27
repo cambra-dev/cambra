@@ -73,6 +73,11 @@ impl ExtractFinal {
 }
 
 impl TileOperator for ExtractFinal {
+    /// A breaker: its pipeline pushes its output to the pipelines that read it.
+    fn keys_arrive_by_push(&self) -> bool {
+        true
+    }
+
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -263,11 +268,34 @@ impl TileProducer for ExtractFinalProducer {
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        if projection_of_one_value(&self.name(), "extracts one final value", &projection_guard)
-            == Projection::Nothing
-        {
+        let projection =
+            projection_of_one_value(&self.name(), "extracts one final value", &projection_guard);
+        if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
+        // A final record of values is pulled at a part of it as any record is, on every path that
+        // answers it: from the state, from the cache and from the first inline read.
+        let mut tile = self.final_value();
+        tile.restrict_to(&projection, self.tiling());
+        tile
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
+            self.final_tile = None;
+            self.merged = self.source.tiling().empty_tile();
+            self.source.release(self.source.tiling().universal_guard());
+            if let Some(d) = self.default.as_mut() {
+                d.release(d.tiling().universal_guard());
+            }
+        }
+    }
+}
+
+impl ExtractFinalProducer {
+    /// The whole final value: the state a consuming extractor holds, or, for one that reads its
+    /// source inline, the cached value or the source's last position, read whole.
+    fn final_value(&mut self) -> Tile {
         // Scalar columns use the declared extent, retaining variant arms absent from the
         // selected value so downstream merges see the declared layout.
         let empty = self.tiling().empty_tile();
@@ -332,17 +360,6 @@ impl TileProducer for ExtractFinalProducer {
                 tile
             }
             None => empty,
-        }
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.final_tile = None;
-            self.merged = self.source.tiling().empty_tile();
-            self.source.release(self.source.tiling().universal_guard());
-            if let Some(d) = self.default.as_mut() {
-                d.release(d.tiling().universal_guard());
-            }
         }
     }
 }
@@ -687,6 +704,89 @@ mod tests {
             None,
             "bug pin: Memo never retries extraction"
         );
+    }
+
+    /// A terminal source of one record `(a: 1, b: 2)` at key 0.
+    struct RecordSource {
+        tiling: Tiling,
+    }
+
+    struct RecordSourceProducer {
+        base: ProducerBase,
+    }
+
+    impl RecordSource {
+        fn new() -> Self {
+            let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+            RecordSource {
+                tiling: Tiling::data_function(
+                    Extent::Base(BaseType::UInt),
+                    Tiling::Record([("a".into(), int()), ("b".into(), int())].into()),
+                ),
+            }
+        }
+    }
+
+    impl TileOperator for RecordSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _cx: &mut SubscribeContext,
+        ) -> Box<dyn TileProducer> {
+            Box::new(RecordSourceProducer {
+                base: ProducerBase::unowned(RecordSourceProducer::alloc_id(), &self.tiling),
+            })
+        }
+    }
+
+    impl TileProducer for RecordSourceProducer {
+        impl_producer_base!();
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            let int = |v: i64| Tile::Scalar(ColumnValue::Ints(vec![v]));
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::record(
+                    [("a".into(), int(1)), ("b".into(), int(2))].into(),
+                )),
+                Predicate::True,
+                bit_set::BitSet::new(),
+            )
+        }
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// An extractor that reads its source inline, pulled at the field `a` of the final record
+    /// `(a: 1, b: 2)`, answers `a` alone: on the first read, which extracts the value, and on a
+    /// reread, which answers it from the cache. `get` checks each answer against the projection
+    /// in a debug build, and the test checks it in every build.
+    #[test]
+    fn an_inline_extractor_answers_only_the_field_it_is_pulled_at() {
+        let mut op = ExtractFinal::without_default(Box::new(RecordSource::new()));
+        let mut producer = op.subscribe(
+            op.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut SubscribeContext::new(),
+        );
+        let field_a = Projection::of_field("a", Projection::Everything);
+        let guard = field_a.guard(op.tiling());
+        for read in ["the first read", "a cached reread"] {
+            let answer = producer.read_in_pipeline(guard.clone());
+            let Tile::Record { fields, .. } = &answer else {
+                panic!("{read}: a record: {answer:?}")
+            };
+            assert_eq!(
+                fields["a"],
+                Tile::Scalar(ColumnValue::Ints(vec![1])),
+                "{read}"
+            );
+            assert!(fields["b"].is_empty(), "{read} answers b: {answer:?}");
+        }
     }
 
     /// A universal release drops the cached final value, from the source or from the fallback,

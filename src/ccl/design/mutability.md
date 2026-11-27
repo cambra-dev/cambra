@@ -1260,10 +1260,11 @@ recognition.
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
   the current store (backward / optimistic concurrency) ahead of allocating a timestamp — a valid
   proposal commits and consumes a tick, a stale one is skipped and retries against the advanced
-  snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. The store's
-  `release` to a writer transfers ownership of a decision when the store takes it, before it
-  validates it; the store states which decisions settled (`WriterTakes`), and a stale one retries
-  from the item the drive keeps. The store compacts by the MVCC law and GCs the released prefix.
+  snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. The store
+  releases a decision to its writer once the decision commits, and only then does the drive
+  release the item from its source. A stale decision is released to nobody, so the drive emits its
+  item again at the advanced frontier. The store compacts by the MVCC law and GCs the released
+  prefix.
 - **`StoreValueStream`** — projects one key's commit-value stream, commit time ⇀ `V`, by folding the
   store changelog, on the axis the key's registration fixes: a mutable variable's **carry** stream
   gains a position at every commit tick; an **in-block reply tap**

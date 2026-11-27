@@ -49,6 +49,10 @@ impl IterateExtent {
 impl TileOperator for IterateExtent {
     impl_operator_base!();
 
+    fn keys_arrive_by_push(&self) -> bool {
+        self.extent.reads_a_source()
+    }
+
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
     fn subscribe(
