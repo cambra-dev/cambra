@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::capabilities::CapabilityVarId;
+use crate::ccl::capabilities::{CapabilityVarId, ExceptionInstance};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::ty::{PolyParam, PolyType, TraitRequirement, TypeParam, TypeParamId};
 use crate::ccl::{InferVarId, Level, Type};
@@ -260,15 +260,15 @@ pub fn poly_for_display(solver: &mut Solver, ty: &Type, cutoff: Level) -> Option
         ty.walk_children_mut(|c| name_ordering(solver, c, positions));
     }
     name_ordering(solver, &mut body, &ordered_positions);
-    let raised_named: Vec<((NodeId, u32), Type)> = if raised.is_empty() {
+    let raised_named: Vec<((NodeId, ExceptionInstance), Type)> = if raised.is_empty() {
         Vec::new()
     } else {
         let Some(Type::Tuple(named)) = parts.last() else {
             unreachable!("the raised types are compacted as the last part, a tuple");
         };
-        let named: Vec<((NodeId, u32), Type)> = raised
+        let named: Vec<((NodeId, ExceptionInstance), Type)> = raised
             .iter()
-            .map(|(k, _)| *k)
+            .map(|(k, _)| k.clone())
             .zip(named.iter().map(|t| names.rename(t)))
             .collect();
         named
@@ -662,17 +662,15 @@ impl Reach {
 /// The polarities each variable occurs at in `ct`.
 /// Each exception a function in `ty` may raise whose type still holds an inference variable, by
 /// the `raise` and the instance raising it, once each, in the order the walk meets them.
-fn raised_types(solver: &mut Solver, ty: &Type) -> Vec<((NodeId, u32), Type)> {
-    fn go(solver: &mut Solver, ty: &Type, out: &mut Vec<((NodeId, u32), Type)>) {
+fn raised_types(solver: &mut Solver, ty: &Type) -> Vec<((NodeId, ExceptionInstance), Type)> {
+    fn go(solver: &mut Solver, ty: &Type, out: &mut Vec<((NodeId, ExceptionInstance), Type)>) {
         if let Type::Fun { capabilities, .. } = ty {
             for effect in capabilities.set_in(solver).causes {
                 if let crate::ccl::capabilities::Effect::Raise(raised) = effect
                     && crate::ccl::subst::type_contains_infer(&raised.ty)
-                    && !out
-                        .iter()
-                        .any(|(k, _)| *k == (raised.site, raised.instance))
+                    && !out.iter().any(|(k, _)| *k == raised.key())
                 {
-                    out.push(((raised.site, raised.instance), raised.ty.clone()));
+                    out.push((raised.key(), raised.ty.clone()));
                 }
             }
         }
@@ -687,12 +685,12 @@ fn raised_types(solver: &mut Solver, ty: &Type) -> Vec<((NodeId, u32), Type)> {
 /// `raise` and the instance raising it, replaced by the type `named` gives it. Materializing the
 /// type mints a fresh variable for one still open, so the exception is found by where it is
 /// raised, not by its type.
-fn name_raises(solver: &mut Solver, ty: &mut Type, named: &[((NodeId, u32), Type)]) {
+fn name_raises(solver: &mut Solver, ty: &mut Type, named: &[((NodeId, ExceptionInstance), Type)]) {
     use crate::ccl::capabilities::{Capabilities, Effect, Raised};
     let named_at = |r: &Raised| {
         named
             .iter()
-            .find(|(k, _)| *k == (r.site, r.instance))
+            .find(|(k, _)| *k == r.key())
             .map(|(_, t)| t.clone())
     };
     if let Type::Fun { capabilities, .. } = ty {

@@ -11,7 +11,6 @@ use crate::ccl::infer::solver::var::{Solved, SolverVar};
 use crate::ccl::ty::RenderCtx;
 use smol_str::SmolStr;
 use std::{
-    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
@@ -479,40 +478,66 @@ pub enum Effect {
 #[derive(Debug, Clone)]
 pub struct Raised {
     pub site: NodeId,
-    pub instance: u32,
+    pub instance: ExceptionInstance,
     pub ty: crate::ccl::Type,
 }
+
+/// Which copy of a `raise`'s exception an exception is: each copy it was made by, innermost
+/// first. Empty for the exception the definition holding the `raise` records.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExceptionInstance(Rc<[InstanceStep]>);
+
+/// One copy an [`ExceptionInstance`] was made by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum InstanceStep {
+    /// A copy made for the use at this node: its instantiation's and its specialization
+    /// clone's alike.
+    Use(NodeId),
+    /// A copy no use makes, distinct from every other.
+    Unattributed(u32),
+}
+
+impl ExceptionInstance {
+    fn then(&self, step: InstanceStep) -> Self {
+        ExceptionInstance(self.0.iter().copied().chain([step]).collect())
+    }
+}
+
+static UNATTRIBUTED_INSTANCE_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl Raised {
     /// The exception raised at `site`, of type `ty`, as the definition holding it records it.
     pub fn at(site: NodeId, ty: crate::ccl::Type) -> Self {
         Self {
             site,
-            instance: 0,
+            instance: ExceptionInstance::default(),
             ty,
         }
     }
 
     /// This exception as one use of its definition raises it: at the freshened type `ty`, and
     /// a capability of its own.
-    pub fn instantiated(&self, ty: crate::ccl::Type) -> Self {
-        thread_local! {
-            static NEXT: Cell<u32> = const { Cell::new(1) };
-        }
-        let instance = NEXT.with(|n| {
-            let i = n.get();
-            n.set(i + 1);
-            i
-        });
+    ///
+    /// The instance is this one copied for the use at `at`: every copy made for one use, its
+    /// instantiation's and its specialization's alike, is one exception, and two uses are two.
+    /// A copy no use makes is an exception of its own.
+    pub fn instantiated(&self, ty: crate::ccl::Type, at: Option<NodeId>) -> Self {
+        let step = match at {
+            Some(at) => InstanceStep::Use(at),
+            None => InstanceStep::Unattributed(
+                UNATTRIBUTED_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ),
+        };
         Self {
             site: self.site,
-            instance,
+            instance: self.instance.then(step),
             ty,
         }
     }
 
-    fn key(&self) -> (NodeId, u32) {
-        (self.site, self.instance)
+    /// What identifies this exception: where it is raised, and which copy it is.
+    pub fn key(&self) -> (NodeId, ExceptionInstance) {
+        (self.site, self.instance.clone())
     }
 
     /// The type this exception is raised at, once emission has resolved it. `None` while it
@@ -3065,55 +3090,6 @@ impl CapabilityVar {
     }
 }
 
-/// Each use of a polymorphic definition, by its node: the copies its instantiation made of the
-/// definition's capability variables, which a specialization the use mints takes for its own nodes
-/// (`src/ccl/design/type-inference.md`, "Capabilities on every expression").
-///
-/// A copy holds what the use's arguments bring where the definition's effect parameters stand,
-/// which a fresh copy of the definition's variable does not.
-#[derive(Debug, Default)]
-pub struct UseCapabilities {
-    uses: HashMap<NodeId, HashMap<CapabilityVarId, Rc<CapabilityVar>>>,
-}
-
-impl UseCapabilities {
-    /// The use at `node` instantiated its definition with `copies`.
-    pub fn record_use(
-        &mut self,
-        node: NodeId,
-        copies: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    ) {
-        if !copies.is_empty() {
-            self.uses.insert(node, copies.clone());
-        }
-    }
-
-    /// The copies the use at `node` made, which the specialization it mints takes in place of
-    /// fresh ones.
-    pub fn copies(&self, node: NodeId) -> HashMap<CapabilityVarId, Rc<CapabilityVar>> {
-        self.uses.get(&node).cloned().unwrap_or_default()
-    }
-
-    /// A specialization was minted whose nodes are copies of its definition's, each by its
-    /// original in `origins`, and whose capability variables are `freshened`'s copies of theirs:
-    /// each use in it records the specialization's copies of its original's copies, which hold
-    /// what the specialization's own use brings, so a specialization it mints in turn takes
-    /// those.
-    pub fn specialize(
-        &mut self,
-        origins: &HashMap<NodeId, NodeId>,
-        freshened: &HashMap<CapabilityVarId, Rc<CapabilityVar>>,
-    ) {
-        let at = |var: &Rc<CapabilityVar>| Rc::clone(freshened.get(&var.uid).unwrap_or(var));
-        for (clone, original) in origins {
-            if let Some(inner) = self.uses.get(original) {
-                let inner = inner.iter().map(|(id, var)| (*id, at(var))).collect();
-                self.uses.insert(*clone, inner);
-            }
-        }
-    }
-}
-
 /// The set a group of capabilities states, without the depths that only inference reads.
 #[expect(
     clippy::mutable_key_type,
@@ -4089,7 +4065,7 @@ mod tests {
     #[test]
     fn stamping_a_kind_unsettles_a_resolution_read_before() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         // Both stand in the scope of `x`, the place the recorded write names.
         let scope = Telescope::empty().extended(Name::from("x"));
         let source = CapabilityVar::fresh(solver, 0, &scope);

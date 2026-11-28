@@ -233,6 +233,11 @@ pub(super) trait Typing {
     /// [`InferCtx::normalize_annotation`](super::context::InferCtx::normalize_annotation).
     fn normalize(&mut self, ann: &Type) -> Type;
 
+    /// Normalize a function kind lowering wrote, as [`Self::normalize`] normalizes a function
+    /// annotation's: what a cast's target states.
+    fn normalize_fun_kind(&mut self, fun_kind: &crate::ccl::ty::FunKind)
+    -> crate::ccl::ty::FunKind;
+
     /// Emit constraints for any refinement predicate carried on a binder/param
     /// annotation, so a **fresh bare** predicate (`{D | __elem …}` from lowering —
     /// e.g. `groupby`'s `{K | __elem ∈ (c ≫ key)}`) gets its sub-terms typed in

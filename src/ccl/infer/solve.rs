@@ -161,9 +161,6 @@ pub(super) struct CoalesceCtx {
     /// error records them, so an error a use causes inside a clone is reported at the
     /// use that clone serves ([`coalesce_generalized_let`]).
     specializing: Vec<ActiveSpecialization>,
-    /// Each use's copies of its definition's capability variables, which the clone it mints takes
-    /// and is keyed by (`capabilities::UseCapabilities`).
-    use_capabilities: crate::ccl::capabilities::UseCapabilities,
     /// The monomorphic `let`s whose right-hand sides the walk is inside: with
     /// [`specializing`](Self::specializing)'s, the definitions a trait function's call
     /// cannot be answered by, since a definition does not reach itself
@@ -1401,7 +1398,6 @@ pub(super) fn coalesce_pass(
     bound_at_annotation: std::collections::HashSet<Name>,
     definition_telescopes: HashMap<Name, crate::ccl::infer_var::Telescope>,
     instances: Rc<InstanceTable>,
-    use_capabilities: crate::ccl::capabilities::UseCapabilities,
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         pass: Pass::Write,
@@ -1425,7 +1421,6 @@ pub(super) fn coalesce_pass(
         coalesced_by_origin: HashMap::new(),
         discarding: false,
         specializing: Vec::new(),
-        use_capabilities,
         placed: Vec::new(),
         opaque_params_at: Vec::new(),
         assumptions: Vec::new(),
@@ -1610,15 +1605,39 @@ pub(super) struct Settler<'s> {
     solver: &'s mut Solver,
     memo: &'s PredMemo,
     read: &'s mut ReadSets,
+    /// How many requirements being closed enclose the value being rewritten.
+    closing: usize,
 }
 
 impl<'s> Settler<'s> {
     pub(super) fn new(solver: &'s mut Solver, memo: &'s PredMemo, read: &'s mut ReadSets) -> Self {
-        Settler { solver, memo, read }
+        Settler {
+            solver,
+            memo,
+            read,
+            closing: 0,
+        }
+    }
+
+    /// Rewrite the parts of `r`, a requirement being closed, resolving the types they hold.
+    fn close_parts(&mut self, r: &mut crate::ccl::capabilities::Requirement) {
+        self.closing += 1;
+        r.rewrite_ordering_parts(self);
+        self.closing -= 1;
     }
 }
 
 impl crate::ccl::infer::solver::held::HeldRewriter for Settler<'_> {
+    /// Inside a requirement being closed, a variable resolves as a node's type does: the
+    /// closed requirement reads what is left of the run once the run has ended. Elsewhere it is
+    /// kept: coalesce decides a node's types, and an error's are reported as found.
+    fn type_variable(&mut self, ty: &Type) -> Option<Type> {
+        if self.closing == 0 {
+            return None;
+        }
+        resolve_var_type(self.solver, ty).ok()
+    }
+
     fn capabilities(
         &mut self,
         capabilities: &crate::ccl::capabilities::Capabilities,
@@ -1659,7 +1678,7 @@ impl crate::ccl::infer::solver::held::HeldRewriter for Settler<'_> {
                 satisfied,
             );
             closing.nested = Some(nested.clone());
-            nested.rewrite_ordering_parts(self);
+            self.close_parts(&mut nested);
             if let Some(closing) = self.read.closing.get_mut(&order.id) {
                 closing.nested = Some(nested.clone());
             }
@@ -1679,7 +1698,7 @@ impl crate::ccl::infer::solver::held::HeldRewriter for Settler<'_> {
             order.capabilities.clone(),
             satisfied,
         );
-        done.rewrite_ordering_parts(self);
+        self.close_parts(&mut done);
         self.read.closing.remove(&order.id);
         self.read.closed.insert(order.id, done.clone());
         Some(done)
@@ -4159,19 +4178,8 @@ pub(super) fn specialize_use(
         own_params: Some(Rc::clone(&frame.own_params)),
         param_telescope: Some(param_telescope),
         entered_binders,
-        // The clone's capability variables are the use's copies (`capabilities::UseCapabilities`).
-        copies: ctx
-            .use_capabilities
-            .copies(use_expr.node_id())
-            .into_iter()
-            .map(|(id, copy)| {
-                (
-                    crate::ccl::infer::solver::held::HeldKey::Capability(id),
-                    crate::ccl::infer::solver::held::Held::Capability(copy),
-                )
-            })
-            .collect(),
         use_at: Some(use_expr.node_id()),
+        use_assumptions: ctx.assumptions.clone(),
         ..FreshenCache::new()
     };
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -4198,9 +4206,6 @@ pub(super) fn specialize_use(
     #[cfg(debug_assertions)]
     let before = crate::ccl::infer::solver::scheme::Minted::now();
     freshen_expr_type_slots(solver, &mut clone, cutoff, target, &mut fresh);
-    // Each use in the clone instantiated through the clone's copies.
-    ctx.use_capabilities
-        .specialize(&origins, &capability_copies(&fresh));
     // The clone is this use's own: nothing above the cutoff is shared with the definition.
     #[cfg(debug_assertions)]
     crate::ccl::infer::solver::scheme::assert_copied_apart_from(
@@ -4251,15 +4256,9 @@ pub(super) fn specialize_use(
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
     let one_way = frame.bound_at_annotation;
-    let mut cache = ConstrainCache::new().without_capabilities();
+    let mut cache = ConstrainCache::new();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
-    for (_, obligation) in fresh.copies::<Rc<crate::ccl::infer::solver::traits::TraitObligation>>()
-    {
-        if obligation.assumptions().is_empty() {
-            obligation.assume_more(&ctx.assumptions);
-        }
-    }
     let pinned = constrain_subtype_in(
         solver,
         &clone.ty,
@@ -4365,7 +4364,6 @@ pub(super) fn specialize_use(
                     .ok()
                     .map(|settled| settled.peel_refinements().clone())
             });
-            obligation.assume_more(&ctx.assumptions);
             obligation.redeliver(solver, &mut cache)
         })?;
         crate::ccl::infer::solver::traits::settle_held_answers(solver, None, &mut cache)
@@ -4722,20 +4720,6 @@ impl OpenNumbering {
         }
         ty.walk_children_mut(|child| self.replace(solver, child, ctx, answer));
     }
-}
-
-/// The copies of capability variables `fresh` made, by the original's id.
-fn capability_copies(
-    fresh: &FreshenCache,
-) -> HashMap<crate::ccl::capabilities::CapabilityVarId, Rc<crate::ccl::capabilities::CapabilityVar>>
-{
-    fresh
-        .copies::<Rc<crate::ccl::capabilities::CapabilityVar>>()
-        .filter_map(|(key, copy)| match key {
-            crate::ccl::infer::solver::held::HeldKey::Capability(id) => Some((id, copy)),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Undo [`suspend_for_clone`].
@@ -6906,7 +6890,6 @@ mod predicate_resolution_tests {
                 Default::default(),
                 Default::default(),
                 InstanceTable::std(),
-                Default::default(),
             )
             .is_empty()
         );
@@ -6935,7 +6918,6 @@ mod predicate_resolution_tests {
             Default::default(),
             Default::default(),
             InstanceTable::std(),
-            Default::default(),
         );
     }
 }

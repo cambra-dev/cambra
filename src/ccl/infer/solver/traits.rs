@@ -3520,8 +3520,13 @@ impl TraitObligation {
             .as_ref()
             .expect("only a method call's obligation instantiates a method");
         let (level, telescope) = call.at.borrow().clone();
-        let instance =
-            scheme.instantiate_with_params(solver, level, &telescope, self.operator_node_id);
+        let instance = scheme.instantiate_with_params(
+            solver,
+            level,
+            &telescope,
+            self.operator_node_id,
+            &self.context.borrow(),
+        );
         for (instantiation, bound, _) in &instance.bounds {
             constrain_subtype(solver, instantiation, bound, cache)?;
         }
@@ -5397,7 +5402,7 @@ mod tests {
         let node_id = provenance::NodeId::fresh();
         let x = Name::raw("x");
         let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver);
+        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
         let v = InferVar::fresh_over(solver, 0, &telescope, kind);
         let operand = Type::Infer(Rc::clone(&v));
         let ob = TraitObligation::new(

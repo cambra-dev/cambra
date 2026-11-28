@@ -167,18 +167,13 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                         ctx.level,
                         &ctx.telescope,
                         node_id,
+                        &ctx.assumptions,
                     );
-                    // The specialization this use mints takes its copies of the definition's
-                    // capability variables (`capabilities::UseCapabilities`).
-                    ctx.use_capabilities
-                        .record_use(node_id, &instance.capability_copies);
                     // A block's bound copied with the definition is failed by what this use
                     // passes, so it is reported here.
                     for copy in instance.capability_copies.values() {
                         copy.note_use(ctx.solver(), node_id);
                     }
-                    ctx.record_order_assumptions(&instance.capability_copies);
-                    ctx.assume_at_use(&instance.obligations);
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -1374,7 +1369,10 @@ pub(super) fn emit_cast<C: Typing>(
     // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
     // still carries its kind, which a match on the raw target would drop
     // to the `Compute` default.
-    let fun_kind = target.fun_kind().cloned().unwrap_or(FunKind::Compute);
+    let fun_kind = match target.fun_kind() {
+        Some(fun_kind) => ctx.normalize_fun_kind(fun_kind),
+        None => FunKind::Compute,
+    };
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
