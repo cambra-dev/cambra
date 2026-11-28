@@ -640,7 +640,7 @@ fn freshen_requirement(
     let Some(order) = r.ordering() else {
         return r.clone();
     };
-    if order.satisfied.get() {
+    if order.decision(solver) == Some(true) {
         return r.clone();
     }
     if let Some(copy) = cache.ordering.get(&order.id) {
@@ -656,8 +656,7 @@ fn freshen_requirement(
         _ => order.capabilities.clone(),
     };
     let assumptions = order
-        .assumptions
-        .borrow()
+        .assumptions(solver)
         .iter()
         .map(|r| Rc::new(r.map_types(|t| freshen_above(solver, lim, t, target, cache))))
         .collect();
@@ -665,6 +664,7 @@ fn freshen_requirement(
         .use_at
         .map_or((order.node, order.source), |at| (at, at));
     let copy = crate::ccl::capabilities::Requirement::orderable_if_required_by(
+        solver,
         positions,
         capabilities,
         node,
@@ -720,7 +720,9 @@ fn freshen_capability_var(
                     },
                 );
             }
-            Capability::Requires(r) if r.ordering().is_some_and(|o| o.satisfied.get()) => {}
+            Capability::Requires(r)
+                if r.ordering()
+                    .is_some_and(|o| o.decision(solver) == Some(true)) => {}
             Capability::Requires(r) if r.ordering().is_some() => {
                 let requirement = freshen_requirement(solver, lim, r, target, cache);
                 f.record(
