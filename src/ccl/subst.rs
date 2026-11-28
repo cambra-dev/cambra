@@ -1594,6 +1594,14 @@ impl Subst {
                 }
             }
         }
+        #[cfg(debug_assertions)]
+        if let Some((k, through, direct)) = mapped_two_ways(a, b) {
+            panic!(
+                "a composition maps {k:?} two ways: through the first half to {through:?}, and by \
+                 the second half's own entry to {direct:?} (see type-inference.md, \"A composition \
+                 maps each binder one way\")"
+            );
+        }
         let mut keys: BTreeSet<Binder> = a.binders.keys().cloned().collect();
         keys.extend(b.binders.keys().cloned());
         let mut m = BTreeMap::new();
@@ -5618,6 +5626,56 @@ mod capture_assert_probe {
         body();
         COUNT.with(Cell::get)
     }
+}
+
+/// A binder `then(a, b)` maps two ways, with the mapping `a` gives it carried through `b` and the
+/// mapping `b`'s own entry gives it. `b` acts on the frame `a` maps into, and a binder `a` maps away
+/// is not in that frame. An identity rename on either side leaves the binder in the frame, and so
+/// can a contribution's join, whose binder `b`'s entry reaches only through what `a`'s other
+/// entries map to it (`src/ccl/design/type-inference.md`, "A composition maps each binder one
+/// way"). Two
+/// mappings to one variable agree, and two discharges agree where their terms are equal but for
+/// their type slots, which inference fills ([`crate::ccl::ty::eq_term_modulo_ty_slots`]).
+#[cfg(debug_assertions)]
+fn mapped_two_ways(a: &Subst, b: &Subst) -> Option<(Binder, Mapping, Mapping)> {
+    a.binders.iter().find_map(|(k, ma)| {
+        let direct = b.binders.get(k)?;
+        if matches!(direct, Mapping::Rename(to) if to == k) {
+            return None;
+        }
+        let through = match ma {
+            Mapping::Rename(to) if to == k => return None,
+            // A contribution joined over a binder its target is still in the scope of: a place
+            // received through a parameter crosses the signature's earlier parameters. The join
+            // reads no value of the binder, so `b`'s entry for it acts only on what `a`'s other
+            // entries map to it, and `then` carries each of those through `b` under its own key.
+            // An elimination or a witness discharge reading the binder is still checked.
+            Mapping::Join(None, JoinSite::Contribution)
+                if a.elims.is_empty()
+                    && !a.witness_mappings().any(|(_, w)| {
+                        matches!(w, WitnessMapping::Discharge(t) if type_free_vars(t).contains(k))
+                    }) =>
+            {
+                return None;
+            }
+            Mapping::Rename(to) => b
+                .binders
+                .get(to)
+                .cloned()
+                .unwrap_or_else(|| Mapping::Rename(to.clone())),
+            Mapping::Discharge(_) | Mapping::Join(..) => ma.clone(),
+        };
+        let agree = match (&through, direct) {
+            _ if through.var_target().is_some() || direct.var_target().is_some() => {
+                through.var_target() == direct.var_target()
+            }
+            (Mapping::Discharge(x), Mapping::Discharge(y)) => {
+                crate::ccl::ty::eq_term_modulo_ty_slots(x, y)
+            }
+            _ => through == *direct,
+        };
+        (!agree).then(|| (k.clone(), through, direct.clone()))
+    })
 }
 
 #[cfg(test)]
