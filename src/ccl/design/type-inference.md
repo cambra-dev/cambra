@@ -809,6 +809,12 @@ into the graph; they carry no assumptions about which ancestors a query is alrea
 Unknown reads propagate as unknown, and a propagation that does not settle within 64 rounds
 also returns unknown. Either case limits reuse to the same whole substitution.
 
+The enclosing binders change a result only where closing rewrites a reference to one
+(`RefinementScope::close`). Where the substitution cannot change any read below the variable, the
+key holds an enclosing binder that no read below names as an unnamed crossing, which keeps the
+other binders' distances. The walks below two functions whose binders nothing below reads are
+then one walk: a chain of collections, each boxed under its own binder, compacts once.
+
 The stamp pass shares one walk state across every compaction it runs (`FixedGraph`, entered
 through `reading_fixed_graph` in `infer/solver/compact.rs`), so a variable compacts once for the
 pass rather than once per node that reaches it. The pass is one read of a graph no write changes
