@@ -276,12 +276,14 @@ fn pred_json(e: &TypedExpr, scope: &mut Vec<Name>) -> Option<String> {
         TypedExprNode::Lit(Lit::Bool(b)) => Some(format!(r#"{{"k":"litBool","b":{b}}}"#)),
         TypedExprNode::Lit(Lit::String(s)) => Some(format!(r#"{{"k":"litStr","s":"{s}"}}"#)),
         TypedExprNode::Lit(Lit::Unit) => Some(r#"{"k":"litUnit"}"#.to_string()),
-        TypedExprNode::BinOp { left, op, right } => Some(format!(
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } => Some(format!(
             r#"{{"k":"binop","op":"{op:?}","a":{},"b":{}}}"#,
             pred_json(left, scope)?,
             pred_json(right, scope)?
         )),
-        TypedExprNode::UnaryOp(op, inner) => Some(format!(
+        TypedExprNode::UnaryOp(op, inner, _) => Some(format!(
             r#"{{"k":"unop","op":"{op:?}","a":{}}}"#,
             pred_json(inner, scope)?
         )),

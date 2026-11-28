@@ -471,15 +471,18 @@ definition being checked alone, and `specialize_use` freshens such a clone with
 `FreshenLevel::Raise`, every level raised by the same amount, so the clone stands at the innermost
 of them. The relative levels inside the clone are kept, and it is coalesced at the raised cutoff.
 
-An obligation copy holding an assumption about one of the specialized binding's own parameters
-is reset to its trait's instances and the assumptions it still needs
+An obligation copy holding an assumption about the specialized binding's own parameters alone is
+reset to its trait's instances and the assumptions it still needs
 (`TraitObligation::reset_for_specialization`), and is redelivered its operands' lower bounds once
-the clone is pinned (`redeliver`). An assumption naming only the binding's own parameters is
-dropped. One that also names a nested definition's parameter is the only row answering that
-parameter, so it is kept: its own parameters freshen to the clone's variables, which the pin ties
-to the use's types, and before redelivery each is replaced by the base it resolves to
-(`settle_assumptions`), since an assumption is matched by equality. Freshening writes bounds directly and so does not deliver; the
-redelivery, which reads the bounds transitively, replaces it. That a reset obligation resolves
+the clone is pinned (`redeliver`). That assumption is dropped. One that also names a nested
+definition's parameter is the only row answering that parameter, so it is kept: its own
+parameters freshen to the clone's variables, which the pin ties to the use's types, and before
+redelivery each is replaced by the base it resolves to (`settle_assumptions`), since an
+assumption is matched by equality. A copy whose rows are all kept is not reset: they answer it as
+they answer the definition's own obligation, and redelivering one would deposit the nested
+definition's associated types into the clone's variables, which sit below that definition's
+level. Freshening writes bounds directly and so does not deliver; the redelivery, which reads the
+bounds transitively, replaces it. That a reset obligation resolves
 follows from the use having satisfied every requirement at the same types; one that did not would
 be an error the definition alone does not raise, which is reported at the use.
 

@@ -159,15 +159,15 @@ fn decompose_join_bool(
     other_preds: &mut Vec<Expr>,
 ) {
     match &e.node {
-        TypedExprNode::BinOp { left, op, right }
-            if op.unrefined() == BinOpKind::BoolLogic(LogicKind::And) =>
-        {
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } if op.unrefined() == BinOpKind::BoolLogic(LogicKind::And) => {
             decompose_join_bool(left, env, rec_ty, eq_conds, other_preds);
             decompose_join_bool(right, env, rec_ty, eq_conds, other_preds);
         }
-        TypedExprNode::BinOp { left, op, right }
-            if op.unrefined() == BinOpKind::Compare(CompareKind::Equals) =>
-        {
+        TypedExprNode::BinOp {
+            left, op, right, ..
+        } if op.unrefined() == BinOpKind::Compare(CompareKind::Equals) => {
             let ka = compile_join_side(left, env, rec_ty);
             let kb = compile_join_side(right, env, rec_ty);
             eq_conds.push((ka, kb));

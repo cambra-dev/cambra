@@ -1215,6 +1215,7 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
             left,
             op: BinOpKind::BoolLogic(kind @ (LogicKind::And | LogicKind::Or)),
             right,
+            ..
         } if holds_a_chain(&right) => {
             let literal = |b: bool| {
                 let mut lit = Expr::lit(Lit::Bool(b));
@@ -1296,6 +1297,7 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
             left,
             op: op @ BinOpKind::BoolLogic(LogicKind::And | LogicKind::Or),
             right,
+            obligation,
         } => {
             let left = hoist_onto_spine(*left, spine, true);
             Expr {
@@ -1303,6 +1305,7 @@ fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>, nested: bool) -> Expr {
                     left: Box::new(left),
                     op,
                     right,
+                    obligation,
                 },
                 ..e
             }
@@ -5132,6 +5135,7 @@ mod tests {
             left: Box::new(read),
             op: BinOpKind::Arithmetic(ArithmeticKind::Sub),
             right: Box::new(tvar(&r, int.clone())),
+            obligation: Default::default(),
         });
         sub.ty = int.clone();
         let mut write = Expr::mut_write(pool.clone(), Occurrence::mint(), sub).doing_of_its_own(

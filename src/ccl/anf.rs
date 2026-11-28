@@ -222,35 +222,13 @@ pub fn run(expr: Expr) -> Expr {
 /// `read_respelling`, this is for diagnostics only. It is applied before `read_respelling`,
 /// because a temp's definition can name a read's binder.
 pub fn temp_respelling(expr: &Expr, ids: crate::ccl::Ids) -> Subst {
-    temp_respelling_reading(&mut Solver::none(), expr, ids, Reading::Closed)
+    temp_respelling_in(&mut Solver::none(), expr, ids)
 }
 
 /// [`temp_respelling`] inside a typing run, of a tree that holds the run's variables, each read
 /// through `solver`.
 pub(crate) fn temp_respelling_in(solver: &mut Solver, expr: &Expr, ids: crate::ccl::Ids) -> Subst {
-    temp_respelling_reading(solver, expr, ids, Reading::InRun)
-}
-
-/// Where a respelling reads a tree's types: in its run, or once the run has closed it.
-#[derive(Clone, Copy)]
-enum Reading {
-    InRun,
-    Closed,
-}
-
-fn temp_respelling_reading(
-    solver: &mut Solver,
-    expr: &Expr,
-    ids: crate::ccl::Ids,
-    reading: Reading,
-) -> Subst {
-    fn go(
-        solver: &mut Solver,
-        expr: &Expr,
-        env: &mut HashMap<Name, Expr>,
-        ids: crate::ccl::Ids,
-        reading: Reading,
-    ) {
+    fn go(solver: &mut Solver, expr: &Expr, env: &mut HashMap<Name, Expr>, ids: crate::ccl::Ids) {
         if let TypedExprNode::Let {
             binding,
             bound_expr,
@@ -263,15 +241,9 @@ fn temp_respelling_reading(
                 Subst::discharge_env_in_place_in(solver, (**bound_expr).copied(ids), env, ids);
             // A loop source's `elements` call over a structural collection is the collection,
             // as coalescing reads it.
-            let collection = match reading {
-                Reading::InRun => {
-                    crate::ccl::infer::solve::elements_of_a_collection(solver, &mut definition)
-                }
-                Reading::Closed => {
-                    crate::ccl::infer::solve::elements_of_a_closed_collection(&mut definition)
-                }
-            };
-            if let Some(collection) = collection {
+            if let Some(collection) =
+                crate::ccl::infer::solve::elements_of_a_collection(&mut definition)
+            {
                 definition = collection;
             }
             // An inference error leaves the tree partly typed. A definition has its binder's
@@ -281,10 +253,10 @@ fn temp_respelling_reading(
             }
             env.insert(binding.name.clone(), definition);
         }
-        expr.walk_children(|child| go(solver, child, env, ids, reading));
+        expr.walk_children(|child| go(solver, child, env, ids));
     }
     let mut env = HashMap::new();
-    go(solver, expr, &mut env, ids, reading);
+    go(solver, expr, &mut env, ids);
     Subst::discharging(&env, ids)
 }
 
@@ -710,7 +682,12 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left,
+            op,
+            right,
+            obligation,
+        } => {
             let (mut binds, left) = atomize(*left, muts);
             let (right_binds, right) = atomize(*right, muts);
             binds.extend(right_binds);
@@ -720,15 +697,16 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
                     left: Box::new(left),
                     op,
                     right: Box::new(right),
+                    obligation,
                 }),
             )
         }
 
-        TypedExprNode::UnaryOp(op, operand) => {
+        TypedExprNode::UnaryOp(op, operand, obligation) => {
             let (binds, operand) = atomize(*operand, muts);
             let_chain(
                 binds,
-                rebuild(TypedExprNode::UnaryOp(op, Box::new(operand))),
+                rebuild(TypedExprNode::UnaryOp(op, Box::new(operand), obligation)),
             )
         }
 

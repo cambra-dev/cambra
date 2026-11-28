@@ -6609,7 +6609,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::unary(UnaryOpKind::Not, Expr::lit(Lit::Bool(true)));
         infer(&mut expr, &mut ctx).unwrap();
-        if let TypedExprNode::UnaryOp(_, inner) = &mut expr.node {
+        if let TypedExprNode::UnaryOp(_, inner, _) = &mut expr.node {
             inner.ty = Type::Base(BaseType::Int);
         }
         let result = typecheck(&expr);
@@ -6728,6 +6728,7 @@ mod tests {
                 op: BinOpKind::Arithmetic(ArithmeticKind::Add),
                 left: Box::new(Expr::apply(Expr::var("p"), Expr::proj_index(0))),
                 right: Box::new(Expr::lit(Lit::Int(0))),
+                obligation: Default::default(),
             }),
             Expr::apply(Expr::var("p"), Expr::proj_index(1)),
         ]));

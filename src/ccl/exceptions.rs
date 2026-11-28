@@ -1199,6 +1199,7 @@ impl Cx {
                 left,
                 op: BinOpKind::BoolLogic(logic @ (LogicKind::And | LogicKind::Or)),
                 right,
+                ..
             } if holds_raise(&right) => {
                 let constant = Expr::lit(Lit::Bool(logic == LogicKind::Or)).with_ty(ty.clone());
                 let (then, otherwise) = match logic {

@@ -2,6 +2,7 @@
 // InferCtx (Step 7c)
 // ---------------------------------------------------------------------------
 
+use crate::ccl::expr::CallObligation;
 use crate::ccl::infer::solver::Solver;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -346,10 +347,6 @@ pub(super) struct InferCtx {
     /// The [`DefGroup`](crate::ccl::TypedExprNode::DefGroup)s whose emission encloses the
     /// current position, innermost last.
     pub(super) groups: Vec<OpenGroup>,
-    /// Each trait function's call emitted, by its node: the obligation its emission placed,
-    /// and the function it calls, for the application that passes it its arguments
-    /// ([`Typing::bind_instance_function_called`]).
-    pub(super) trait_calls: HashMap<NodeId, (Rc<TraitObligation>, smol_str::SmolStr, Vec<Type>)>,
     /// How many errors emission has recovered from ([`Typing::recoveries`]).
     recoveries: usize,
     /// Failure nodes, including suppressed cascades, whose statements a restart omits.
@@ -943,7 +940,6 @@ impl InferCtx {
             poisoned_reads: 0,
             instances: Rc::default(),
             groups: Vec::new(),
-            trait_calls: HashMap::new(),
             recoveries: 0,
             failed_nodes: Vec::new(),
             statement_owners: HashMap::new(),
@@ -2454,20 +2450,6 @@ impl InferCtx {
         self.current_node_id = prev;
     }
 
-    /// [`Typing::require_trait`], with a variable back for each of the associated types
-    /// `assoc` names, in that order.
-    pub(super) fn require_trait_associating(
-        &mut self,
-        trait_: Trait,
-        operator_node_id: NodeId,
-        operand_types: &[&Type],
-        assoc: &[Assoc],
-        at: &dyn Fn() -> String,
-    ) -> Result<Vec<Type>, LocatedInferError> {
-        self.require_trait_obligation(trait_, operator_node_id, operand_types, assoc, None, at)
-            .map(|(settled, _)| settled)
-    }
-
     /// Pass the method calls of a statement, still waiting, to the statement enclosing it.
     fn pass_method_calls(&mut self, calls: Vec<DeferredMethod>) {
         self.method_calls
@@ -2550,9 +2532,9 @@ impl InferCtx {
         })
     }
 
-    /// [`require_trait_associating`](Self::require_trait_associating), with the refinement
-    /// the operator states of one associated type, if it states one, and returning the
-    /// obligation it placed.
+    /// Record an obligation of `trait_` over `operand_types`, with a variable back for each of
+    /// the associated types `assoc` names, in that order, and the refinement the operator
+    /// states of one associated type, if it states one; returns the obligation it placed too.
     pub(super) fn require_trait_obligation(
         &mut self,
         trait_: Trait,
@@ -3847,15 +3829,15 @@ impl Typing for InferCtx {
         if parameter.parameter_mode == crate::ccl::place::ParameterMode::Borrow
             && let Type::Infer(variable) = ty
         {
-            let value = self
-                .require_trait(
-                    Trait::place_value(),
-                    parameter.occurrence.id(),
-                    &[ty],
-                    Some(Assoc::output()),
-                    &|| "the value read from a borrowed place".to_string(),
-                )?
-                .expect("PlaceValue associates its read type");
+            // A place read is no call, so its obligation is carried out by no node.
+            let (value, _) = self.require_trait(
+                Trait::place_value(),
+                parameter.occurrence.id(),
+                &[ty],
+                Some(Assoc::output()),
+                &|| "the value read from a borrowed place".to_string(),
+            )?;
+            let value = value.expect("PlaceValue associates its read type");
             self.place_reads.insert(variable.uid, value);
         }
         Ok(())
@@ -3931,11 +3913,21 @@ impl Typing for InferCtx {
         errors
     }
 
-    fn bind_instance_function_called(&mut self, function: NodeId) -> Result<(), LocatedInferError> {
-        let Some((obligation, name, operands)) = self.trait_calls.get(&function).cloned() else {
+    fn bind_instance_function_called(&mut self, function: &Expr) -> Result<(), LocatedInferError> {
+        let TypedExprNode::TraitFn {
+            function,
+            operands,
+            obligation,
+            ..
+        } = &function.node
+        else {
             return Ok(());
         };
-        super::emit::bind_selected_instance_function(&obligation, &name, &operands, self)
+        let obligation = obligation
+            .get()
+            .cloned()
+            .expect("emission places a trait function's obligation before its call applies it");
+        super::emit::bind_selected_instance_function(&obligation, function, operands, self)
     }
 
     fn pred_memo(&self) -> TermMemo {
@@ -4026,11 +4018,20 @@ impl Typing for InferCtx {
         operand_types: &[&Type],
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
-    ) -> Result<Option<Type>, LocatedInferError> {
+    ) -> Result<(Option<Type>, CallObligation), LocatedInferError> {
         let wanted: Vec<Assoc> = assoc.into_iter().collect();
-        let settled =
-            self.require_trait_associating(trait_, operator_node_id, operand_types, &wanted, at)?;
-        Ok(settled.into_iter().next())
+        let (settled, obligation) = self.require_trait_obligation(
+            trait_,
+            operator_node_id,
+            operand_types,
+            &wanted,
+            None,
+            at,
+        )?;
+        Ok((
+            settled.into_iter().next(),
+            CallObligation::placed(obligation),
+        ))
     }
 
     fn require_trait_refined(
@@ -4042,8 +4043,8 @@ impl Typing for InferCtx {
         assoc: Assoc,
         refinement: crate::ccl::RefinementTemplate,
         at: &dyn Fn() -> String,
-    ) -> Result<Type, LocatedInferError> {
-        let (settled, _) = self.require_trait_obligation(
+    ) -> Result<(Type, CallObligation), LocatedInferError> {
+        let (settled, obligation) = self.require_trait_obligation(
             trait_,
             operator_node_id,
             operand_types,
@@ -4051,10 +4052,11 @@ impl Typing for InferCtx {
             Some((assoc.clone(), refinement, operand_exprs)),
             at,
         )?;
-        Ok(settled
+        let ty = settled
             .into_iter()
             .next()
-            .expect("an operator asking for an association gets its position back"))
+            .expect("an operator asking for an association gets its position back");
+        Ok((ty, CallObligation::placed(obligation)))
     }
 
     fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {

@@ -159,7 +159,10 @@ struct PartitionKey<'a> {
 /// `cast`, or `Compose` — matching the term a site is spelled in is
 /// [`match_pointful_site`]'s job.
 fn partition_key_of(predicate: &Expr) -> Option<PartitionKey<'_>> {
-    let TypedExprNode::BinOp { left, op, right } = &predicate.node else {
+    let TypedExprNode::BinOp {
+        left, op, right, ..
+    } = &predicate.node
+    else {
         return None;
     };
     if op.unrefined() != BinOpKind::Compare(CompareKind::Equals) {

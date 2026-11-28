@@ -385,6 +385,75 @@ impl TypedBinding {
     }
 }
 
+/// The trait obligation emission placed for a call a trait answers: a trait function's, an
+/// operator's, or a method's whose receiver's type was unknown where it stands. What answers the
+/// call is that obligation's
+/// [`answer`](crate::ccl::infer::solver::traits::TraitObligation::answer), which coalescing carries
+/// out (`src/ccl/design/type-inference.md`, "A call reads its obligation's answer").
+///
+/// A copy of the node holds the same obligation, and a use's copy of a generalized
+/// definition holds that use's copy of it, as its types hold the use's copies of their
+/// variables. It is the solver's record of the call rather than part of the term, so it is
+/// excluded from value equality, as a node's id is.
+#[derive(Clone, Default)]
+pub struct CallObligation(
+    pub Option<std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>>,
+);
+
+impl CallObligation {
+    /// The obligation `obligation` placed for a call.
+    pub fn placed(
+        obligation: std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>,
+    ) -> Self {
+        CallObligation(Some(obligation))
+    }
+
+    /// The obligation, if emission placed one.
+    pub fn get(&self) -> Option<&std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>> {
+        self.0.as_ref()
+    }
+}
+
+impl TypedExprNode {
+    /// The slot holding the obligation of the call this node makes, for a node a trait
+    /// answers: a trait function, an operator, a method.
+    pub fn call_obligation(&self) -> Option<&CallObligation> {
+        match self {
+            TypedExprNode::TraitFn { obligation, .. }
+            | TypedExprNode::BinOp { obligation, .. }
+            | TypedExprNode::UnaryOp(_, _, obligation)
+            | TypedExprNode::Method { obligation, .. } => Some(obligation),
+            _ => None,
+        }
+    }
+
+    /// Mutable analog of [`call_obligation`](Self::call_obligation).
+    pub fn call_obligation_mut(&mut self) -> Option<&mut CallObligation> {
+        match self {
+            TypedExprNode::TraitFn { obligation, .. }
+            | TypedExprNode::BinOp { obligation, .. }
+            | TypedExprNode::UnaryOp(_, _, obligation)
+            | TypedExprNode::Method { obligation, .. } => Some(obligation),
+            _ => None,
+        }
+    }
+}
+
+impl PartialEq for CallObligation {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for CallObligation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(obligation) => write!(f, "{obligation:?}"),
+            None => f.write_str("_"),
+        }
+    }
+}
+
 /// The expression kind enum for CCL expressions.
 ///
 /// This is the central type of the CCL AST node hierarchy. Every program is a [`TypedExpr`]
@@ -512,10 +581,14 @@ pub enum TypedExprNode {
         op: BinOpKind,
         /// The right-hand operand.
         right: Box<TypedExpr>,
+        /// The obligation of the operator's trait that emission placed, for an operator
+        /// that requires one. Empty before emission and after inference.
+        obligation: CallObligation,
     },
 
-    /// A unary operation.
-    UnaryOp(UnaryOpKind, Box<TypedExpr>),
+    /// A unary operation, with the obligation of the operator's trait as
+    /// [`BinOp`](Self::BinOp) holds it.
+    UnaryOp(UnaryOpKind, Box<TypedExpr>, CallObligation),
 
     /// A lambda abstraction over a list of parameters.
     ///
@@ -688,9 +761,9 @@ pub enum TypedExprNode {
         args: usize,
         candidates: Vec<MethodCandidate>,
         /// The obligation of a call emission deferred, its receiver's type unknown where
-        /// the call stands, which selects the candidate once that type arrives. `None`
-        /// before emission.
-        deferred: Option<std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>>,
+        /// the call stands, which selects the candidate once that type arrives. Empty
+        /// before emission, and for a call emission resolved where it stands.
+        obligation: CallObligation,
     },
 
     /// A function of an instance not chosen yet: what `summon(Area(_))::area` and `a::area`,
@@ -698,8 +771,9 @@ pub enum TypedExprNode {
     /// functions").
     ///
     /// Typed by the trait's signature at an obligation over `operands`, which stay in the
-    /// node as type slots. Coalescing replaces the node with the function of the instance
-    /// its resolved operand types match, so none survives inference.
+    /// node as type slots. Coalescing replaces the node with what that obligation's answer
+    /// says: the function of the instance answering it, or, for a collection's `elements`, the
+    /// collection. None survives inference.
     TraitFn {
         trait_: crate::ccl::infer::solver::traits::Trait,
         function: SmolStr,
@@ -710,6 +784,8 @@ pub enum TypedExprNode {
         /// The associated types the trait type states, by name, which emission normalizes as
         /// it does `operands`.
         assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+        /// The obligation emission placed for the call. Empty before emission.
+        obligation: CallObligation,
     },
 
     /// Tagged variant constructor: `` `Tag(payload) ``.
@@ -1449,12 +1525,18 @@ impl Duplicate for TypedExprNode {
                 generators: generators.copied(ids),
                 element: element.copied(ids),
             },
-            N::BinOp { left, op, right } => N::BinOp {
+            N::BinOp {
+                left,
+                op,
+                right,
+                obligation,
+            } => N::BinOp {
                 left: left.copied(ids),
                 op: *op,
                 right: right.copied(ids),
+                obligation: obligation.clone(),
             },
-            N::UnaryOp(op, e) => N::UnaryOp(*op, e.copied(ids)),
+            N::UnaryOp(op, e, obligation) => N::UnaryOp(*op, e.copied(ids), obligation.clone()),
             N::Lambda { params, body } => N::Lambda {
                 params: params.iter().map(|p| p.copied(ids)).collect(),
                 body: body.copied(ids),
@@ -1517,23 +1599,25 @@ impl Duplicate for TypedExprNode {
                 name,
                 args,
                 candidates,
-                deferred,
+                obligation,
             } => N::Method {
                 name: name.clone(),
                 args: *args,
                 candidates: candidates.copied(ids),
-                deferred: deferred.clone(),
+                obligation: obligation.clone(),
             },
             N::TraitFn {
                 trait_,
                 function,
                 operands,
                 assoc,
+                obligation,
             } => N::TraitFn {
                 trait_: trait_.clone(),
                 function: function.clone(),
                 operands: operands.clone(),
                 assoc: assoc.clone(),
+                obligation: obligation.clone(),
             },
             N::VariantCtor {
                 tag,
@@ -2439,7 +2523,11 @@ impl TypedExpr {
 
     /// Construct a unary operation expression.
     pub fn unary(op: UnaryOpKind, operand: Self) -> Self {
-        Self::new(TypedExprNode::UnaryOp(op, Box::new(operand)))
+        Self::new(TypedExprNode::UnaryOp(
+            op,
+            Box::new(operand),
+            CallObligation::default(),
+        ))
     }
 
     pub fn borrow(place: Self) -> Self {
@@ -2507,6 +2595,7 @@ impl TypedExpr {
             left: Box::new(left),
             op,
             right: Box::new(right),
+            obligation: CallObligation::default(),
         })
     }
 
@@ -2717,7 +2806,7 @@ impl TypedExpr {
                 f(left.as_ref());
                 f(right.as_ref());
             }
-            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Borrow(inner) => f(inner.as_ref()),
+            TypedExprNode::UnaryOp(_, inner, _) | TypedExprNode::Borrow(inner) => f(inner.as_ref()),
             TypedExprNode::Lambda { body, .. } => f(body.as_ref()),
             TypedExprNode::Aggregate { input, .. } => f(input.as_ref()),
             TypedExprNode::Let {
@@ -2939,7 +3028,7 @@ impl TypedExpr {
                 f(left.as_mut());
                 f(right.as_mut());
             }
-            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Borrow(inner) => f(inner.as_mut()),
+            TypedExprNode::UnaryOp(_, inner, _) | TypedExprNode::Borrow(inner) => f(inner.as_mut()),
             TypedExprNode::Lambda { body, .. } => f(body.as_mut()),
             TypedExprNode::Aggregate { input, .. } => f(input.as_mut()),
             TypedExprNode::Let {
@@ -3964,6 +4053,7 @@ mod tests {
                 crate::ccl::infer::solver::traits::Assoc::output(),
                 marker("assoc"),
             )],
+            obligation: CallObligation::default(),
         });
         trait_fn.ty = marker("node_ty");
         assert_eq!(reached(&trait_fn), vec!["assoc", "node_ty", "operand"]);
