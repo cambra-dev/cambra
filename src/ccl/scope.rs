@@ -90,6 +90,9 @@
 //! binding structure, matching `walk_children`.
 
 use super::{Generator, Label, Name, Type, TypedBinding, TypedExpr, TypedExprNode};
+use crate::ccl::ccl_utils::PredMemo;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 /// The binders a node puts in scope over one of its children.
 ///
@@ -651,6 +654,463 @@ where
     );
 }
 
+/// [`freshen_bound_names`] for each definition a module's statement chain holds, leaving the
+/// chain's own binders as they are. A run copies its module's chain, and the names a definition
+/// introduces are the module's, the same in every copy. The chain's binders are renamed per run by
+/// its uniquify scope, which the names spelled through the run's qualifier are resolved against.
+pub(crate) fn freshen_definitions(chain: &mut TypedExpr, ids: crate::ccl::Ids) {
+    let mut at = chain;
+    loop {
+        let continues = matches!(
+            at.node,
+            TypedExprNode::Let { .. }
+                | TypedExprNode::LetRec { .. }
+                | TypedExprNode::DefGroup { .. }
+                | TypedExprNode::MutDecl { .. }
+                | TypedExprNode::ExprStmt { .. }
+                | TypedExprNode::Run { .. }
+                | TypedExprNode::LetType { .. }
+        );
+        if !continues {
+            freshen_bound_names(at, ids);
+            return;
+        }
+        match &mut at.node {
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } => {
+                freshen_bound_names(bound_expr, ids);
+                at = body;
+            }
+            TypedExprNode::LetRec { bindings, body }
+            | TypedExprNode::DefGroup { bindings, body } => {
+                for (_, definition) in bindings.iter_mut() {
+                    freshen_bound_names(definition, ids);
+                }
+                at = body;
+            }
+            TypedExprNode::MutDecl { init, body, .. } => {
+                freshen_bound_names(init, ids);
+                at = body;
+            }
+            TypedExprNode::ExprStmt { expr, body } => {
+                freshen_bound_names(expr, ids);
+                at = body;
+            }
+            TypedExprNode::Run { body, .. } | TypedExprNode::LetType { body, .. } => at = body,
+            _ => unreachable!("a chain statement continues"),
+        }
+    }
+}
+
+/// Panic unless each name `e` binds is bound at one site (`src/ccl/design/type-inference.md`,
+/// "Every binder is bound in one place"). A held term shared by allocation is one binding site
+/// wherever it rides.
+#[cfg(debug_assertions)]
+pub(crate) fn assert_binders_unique(e: &TypedExpr) {
+    fn walk(
+        e: &TypedExpr,
+        bound: &mut HashMap<Name, crate::ccl::provenance::NodeId>,
+        held: &mut std::collections::HashSet<*const TypedExpr>,
+    ) {
+        let mut own = Vec::new();
+        each_bound_name(e, |n| {
+            if !own.contains(n) {
+                own.push(n.clone());
+            }
+        });
+        for n in own {
+            if let Some(other) = bound.insert(n.clone(), e.node_id()) {
+                panic!(
+                    "`{n}` is bound at node {other:?} and again at node {:?}: every binder is \
+                     bound in one place",
+                    e.node_id()
+                );
+            }
+        }
+        e.walk_type_slots(|t| {
+            t.walk_held_terms(&mut |q| {
+                if held.insert(Rc::as_ptr(q)) {
+                    walk(q, bound, held);
+                }
+            });
+        });
+        e.walk_children(|c| walk(c, bound, held));
+    }
+    walk(
+        e,
+        &mut HashMap::new(),
+        &mut std::collections::HashSet::new(),
+    );
+}
+
+/// Give every binder `e` introduces a fresh name, and retarget each reference bound by one.
+///
+/// A term placed at a second position is a second binding of every name it binds, so a copy
+/// renames them (`src/ccl/design/type-inference.md`, "Every binder is bound in one place"). Each
+/// name `e` binds takes one fresh name, at every site binding it.
+///
+/// A value reference is resolved by scope: it takes the new name of the binder it resolves to,
+/// and a reference to a binder outside `e` is left alone, even where a binder inside `e` spells
+/// the same name. Types and capability sets are renamed in the scope of the node holding them,
+/// where a function type's binder and a dependent tuple's component names bind as they do in a
+/// term. They also name binders outside those binders' scopes: an effect on a feed handle reaches
+/// the nodes above its `let`, and a type stamped from a body names what the body binds. Such a
+/// mention takes the binder's new name, unless `e` reads that name as a value from outside, in
+/// which case it means the outer binder and is left alone.
+///
+/// A held term in one of `e`'s types is one binding site wherever its `Rc` rides, so it keeps
+/// its allocation unless it reads a renamed binder. A held term that reads one is rebuilt, with
+/// `ids` choosing whether the rebuild keeps its ids, and the rebuilt copy renames the binders it
+/// introduces in turn.
+pub(crate) fn freshen_bound_names(e: &mut TypedExpr, ids: crate::ccl::Ids) {
+    let mut fresh = Renames::new();
+    collect_bound_names(e, &mut fresh);
+    if fresh.is_empty() {
+        return;
+    }
+    let read_from_outside = crate::ccl::free_names::names(e, crate::ccl::free_names::VALUE_READS);
+    let escaped: Renames = fresh
+        .iter()
+        .filter(|(from, _)| !read_from_outside.contains(*from))
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    rename(e, Some(&fresh), Renames::new(), &escaped, ids);
+}
+
+/// Rename each binder `renames` maps, at every site `e` binds it, and retarget each reference
+/// bound by one, as [`freshen_bound_names`] does for every binder. Every other binder keeps its
+/// name.
+pub(crate) fn rename_binders(e: &mut TypedExpr, renames: &Renames, ids: crate::ccl::Ids) {
+    let mut fresh = Renames::new();
+    collect_bound_names_by(e, &mut fresh, &|n| {
+        renames.get(n).cloned().unwrap_or_else(|| n.clone())
+    });
+    let read_from_outside = crate::ccl::free_names::names(e, crate::ccl::free_names::VALUE_READS);
+    let escaped: Renames = renames
+        .iter()
+        .filter(|(from, _)| !read_from_outside.contains(*from))
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    rename(e, Some(&fresh), Renames::new(), &escaped, ids);
+}
+
+/// The binders `e`'s own nodes introduce, each mapped to what `to` gives it. Held terms are
+/// not entered.
+fn collect_bound_names_by(e: &TypedExpr, renames: &mut Renames, to: &dyn Fn(&Name) -> Name) {
+    each_bound_name(e, |n| {
+        renames.entry(n.clone()).or_insert_with(|| to(n));
+    });
+    e.walk_children(|c| collect_bound_names_by(c, renames, to));
+}
+
+/// The binders `e`'s own nodes introduce, each mapped to a fresh name. Held terms are not
+/// entered: each is a binding site of its own.
+fn collect_bound_names(e: &TypedExpr, renames: &mut Renames) {
+    collect_bound_names_by(e, renames, &Name::fresh_like);
+}
+
+/// Rename `e`: each binder to the name `fresh` gives it, or kept where `fresh` is `None`; each
+/// reference in `scoped` to its new name; each mention in a type or capability set outside its
+/// binder's scope by `escaped`. Whether anything changed.
+fn rename(
+    e: &mut TypedExpr,
+    fresh: Option<&Renames>,
+    scoped: Renames,
+    escaped: &Renames,
+    ids: crate::ccl::Ids,
+) -> bool {
+    let memo = PredMemo::copying(ids);
+    let mut renamer = Renamer {
+        fresh,
+        scoped,
+        escaped,
+        memo: &memo,
+        ids,
+        held_names: HashMap::new(),
+    };
+    renamer.term(e)
+}
+
+/// Each name `e`'s own node binds: its binders, and a `For`'s position, which binds in the body
+/// with no binder of its own.
+fn each_bound_name(e: &TypedExpr, mut f: impl FnMut(&Name)) {
+    e.walk_binders(|b| f(&b.name));
+    if let TypedExprNode::For { position, .. } = &e.node {
+        f(position);
+    }
+}
+
+/// Binder renames: each name to its new name.
+pub(crate) type Renames = HashMap<Name, Name>;
+
+/// One rename, with the renames of the binders in scope kept in one map that each scope extends
+/// on entry and restores on exit.
+struct Renamer<'m> {
+    fresh: Option<&'m Renames>,
+    scoped: Renames,
+    escaped: &'m Renames,
+    memo: &'m PredMemo,
+    ids: crate::ccl::Ids,
+    /// The names each held term reads, by allocation, so a term riding many slots is read once.
+    held_names: HashMap<*const TypedExpr, Rc<std::collections::BTreeSet<Name>>>,
+}
+
+/// Where a type slot's names resolve: the binders a type binds within itself, then the node's
+/// own binders, then the binders in scope, then the escaped mentions.
+struct SlotScope<'a> {
+    within: Vec<(Name, Name)>,
+    local: &'a Renames,
+    scoped: &'a Renames,
+    escaped: &'a Renames,
+}
+
+impl SlotScope<'_> {
+    fn get(&self, n: &Name) -> Option<&Name> {
+        self.within
+            .iter()
+            .rev()
+            .find(|(from, _)| from == n)
+            .map(|(_, to)| to)
+            .or_else(|| self.local.get(n))
+            .or_else(|| self.scoped.get(n))
+            .or_else(|| self.escaped.get(n))
+    }
+
+    fn retarget(&self, n: &mut Name) -> bool {
+        match self.get(n) {
+            Some(to) if to != n => {
+                *n = to.clone();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn renames_any<'n>(&self, mut names: impl Iterator<Item = &'n Name>) -> bool {
+        names.any(|n| self.get(n).is_some_and(|to| to != n))
+    }
+}
+
+impl Renamer<'_> {
+    /// Rename `e` under the binders in scope; whether anything changed.
+    fn term(&mut self, e: &mut TypedExpr) -> bool {
+        let mut local = Renames::new();
+        each_bound_name(e, |n| {
+            let to = match self.fresh {
+                Some(fresh) => fresh[n].clone(),
+                None => n.clone(),
+            };
+            local.entry(n.clone()).or_insert(to);
+        });
+        let mut changed = false;
+        // The scope entries the current run of children has replaced, to restore after it.
+        let mut restore: Vec<(Name, Option<Name>)> = Vec::new();
+        for_each_scoped_item_mut(e, &mut |item| match item {
+            ScopedItemMut::VarRef(n) | ScopedItemMut::KeyRef(n) => {
+                changed |= retarget(&self.scoped, n);
+            }
+            ScopedItemMut::Scope(names) => {
+                for (n, old) in restore.drain(..).rev() {
+                    match old {
+                        Some(old) => self.scoped.insert(n, old),
+                        None => self.scoped.remove(&n),
+                    };
+                }
+                for n in names {
+                    let old = self.scoped.insert(n.clone(), local[n].clone());
+                    restore.push((n.clone(), old));
+                }
+            }
+            ScopedItemMut::Child(c) => changed |= self.term(c),
+        });
+        for (n, old) in restore.into_iter().rev() {
+            match old {
+                Some(old) => self.scoped.insert(n, old),
+                None => self.scoped.remove(&n),
+            };
+        }
+        e.walk_binders_mut(|b| {
+            if let Some(to) = local.get(&b.name)
+                && *to != b.name
+            {
+                b.name = to.clone();
+                changed = true;
+            }
+        });
+        if let TypedExprNode::For { position, .. } = &mut e.node
+            && let Some(to) = local.get(&**position)
+            && **position != *to
+        {
+            **position = to.clone();
+            changed = true;
+        }
+        // The node's slots read its binders as well as the scope around it: a function type names
+        // its binder after the parameter, a feed handle's type names its own channel. A slot
+        // reading an outer binder that the node's own binder shadows under another name has no
+        // spelling here, and is refused.
+        for (from, to) in &local {
+            let outer = self.scoped.get(from).or_else(|| self.escaped.get(from));
+            if outer.is_some_and(|outer| outer != to) {
+                let mut reads = false;
+                e.walk_type_slots(|ty| {
+                    reads |= crate::ccl::free_names::names_in_type(ty).contains(from);
+                });
+                assert!(
+                    !reads,
+                    "a node binds `{from:?}` and a type of it may read the outer binder of that name"
+                );
+            }
+        }
+        let escaped = self.escaped;
+        let scoped = std::mem::take(&mut self.scoped);
+        let mut slots = SlotScope {
+            within: Vec::new(),
+            local: &local,
+            scoped: &scoped,
+            escaped,
+        };
+        e.walk_type_slots_mut(|ty| changed |= self.ty(ty, &mut slots));
+        changed |= rename_capability_names(&mut e.own_capabilities, &slots);
+        changed |= rename_capability_names(&mut e.capabilities, &slots);
+        self.scoped = scoped;
+        changed
+    }
+
+    /// Rename `ty` in `slots`. A function type's binder and a dependent tuple's component names
+    /// take the name the scope gives them and bind it over what follows, as a term's binder does.
+    fn ty(&mut self, ty: &mut Type, slots: &mut SlotScope<'_>) -> bool {
+        let mut changed = false;
+        match ty {
+            Type::Refinement(_, refinements) => refinements.rewrite_each(|_, refinement| {
+                if self.held_reads_renamed(&refinement.predicate, slots) {
+                    changed |= self
+                        .memo
+                        .rebuild(refinement, &(), |term| self.retarget_held(term, slots));
+                }
+            }),
+            _ => {
+                for held in ty.held_terms_mut() {
+                    if self.held_reads_renamed(held.held(), slots) {
+                        changed |= self
+                            .memo
+                            .rebuild(held, &(), |term| self.retarget_held(term, slots));
+                    }
+                }
+            }
+        }
+        match ty {
+            Type::ChanDom(name, _) => changed |= slots.retarget(name),
+            Type::Fun {
+                binder,
+                fun_kind,
+                domain,
+                codomain,
+                capabilities,
+            } => {
+                // A witness's kind is written outside the function's binder.
+                for w in fun_kind.witnesses_mut() {
+                    for t in w.types_mut() {
+                        changed |= self.ty(t, slots);
+                    }
+                }
+                changed |= self.ty(domain, slots);
+                let depth = slots.within.len();
+                let mut renamed = false;
+                let retargeted = binder.map_names(|n| {
+                    let to = slots.get(n).cloned().unwrap_or_else(|| n.clone());
+                    slots.within.push((n.clone(), to.clone()));
+                    renamed |= to != *n;
+                    to
+                });
+                if renamed {
+                    *binder = retargeted;
+                    changed = true;
+                }
+                changed |= rename_capability_names(capabilities, slots);
+                changed |= self.ty(codomain, slots);
+                slots.within.truncate(depth);
+                return changed;
+            }
+            Type::DepTuple(components) => {
+                let depth = slots.within.len();
+                for (n, component) in components.iter_mut() {
+                    changed |= self.ty(component, slots);
+                    if let Some(n) = n {
+                        let to = slots.get(n).cloned().unwrap_or_else(|| n.clone());
+                        slots.within.push((n.clone(), to.clone()));
+                        if to != *n {
+                            *n = to;
+                            changed = true;
+                        }
+                    }
+                }
+                slots.within.truncate(depth);
+                return changed;
+            }
+            _ => {}
+        }
+        ty.walk_children_mut(|t| changed |= self.ty(t, slots));
+        changed
+    }
+
+    /// Whether the held term `q` reads a name `slots` renames.
+    fn held_reads_renamed(&mut self, q: &Rc<TypedExpr>, slots: &SlotScope<'_>) -> bool {
+        let names = self
+            .held_names
+            .entry(Rc::as_ptr(q))
+            .or_insert_with(|| {
+                Rc::new(crate::ccl::free_names::names(
+                    q,
+                    crate::ccl::free_names::EVERY_READ,
+                ))
+            })
+            .clone();
+        slots.renames_any(names.iter())
+    }
+
+    /// Retarget a held term's references by `slots`, and freshen what it binds: the rebuilt
+    /// term is a copy of the held one.
+    fn retarget_held(&mut self, term: &mut TypedExpr, slots: &SlotScope<'_>) -> bool {
+        let reads = crate::ccl::free_names::names(term, crate::ccl::free_names::EVERY_READ);
+        let scoped: Renames = reads
+            .iter()
+            .filter_map(|n| slots.get(n).map(|to| (n.clone(), to.clone())))
+            .collect();
+        let changed = rename(term, None, scoped, &Renames::new(), self.ids);
+        if changed {
+            freshen_bound_names(term, self.ids);
+        }
+        changed
+    }
+}
+
+/// Retarget `n` by `renames`; whether it changed.
+fn retarget(renames: &Renames, n: &mut Name) -> bool {
+    match renames.get(n) {
+        Some(to) if to != n => {
+            *n = to.clone();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn rename_capability_names(
+    capabilities: &mut crate::ccl::capabilities::Capabilities,
+    slots: &SlotScope<'_>,
+) -> bool {
+    let Some(set) = capabilities.known_set() else {
+        return false;
+    };
+    if !slots.renames_any(set.names().into_iter()) {
+        return false;
+    }
+    *capabilities =
+        capabilities.mapped(&|n: &Name| Some(slots.get(n).cloned().unwrap_or_else(|| n.clone())));
+    true
+}
+
 /// The name occurrences `e` makes itself, mutably — the `&mut` half of
 /// [`ScopedItem::VarRef`] / [`ScopedItem::KeyRef`].
 ///
@@ -867,7 +1327,7 @@ mod tests {
             TypedExpr::disjoint_join(vec![var("dj0"), var("dj1")]),
             node(N::Realized {
                 legs: vec![var("r0"), var("r1")],
-                staged: std::rc::Rc::new(var("r")),
+                staged: Rc::new(var("r")),
             }),
             TypedExpr::expr_stmt(var("stmt"), var("rest")),
             node(N::Begin {

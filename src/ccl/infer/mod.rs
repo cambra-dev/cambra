@@ -1420,6 +1420,8 @@ fn run_once(
     public: &HashSet<Name>,
     marks: &HashMap<NodeId, crate::ccl::lower::Mark>,
 ) -> Result<Inferred, RunFailure> {
+    #[cfg(debug_assertions)]
+    crate::ccl::scope::assert_binders_unique(expr);
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         // The run's solver: the sources' variables are minted in it, and the context that

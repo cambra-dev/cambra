@@ -60,26 +60,26 @@
 //! reference inference will reject as unbound, or a reserved name resolved
 //! by other means.
 //!
-//! **Mint before copy.** A copy made of a *raw* tree mints distinct uids per
-//! copy here, making α-equivalent copies structurally unequal. A copy that
-//! refinement dedup has to collapse against its origin is therefore made
-//! after this pass: [`crate::ccl::comprehension`] copies each generator source
-//! into its loop-join predicate, and runs after `uniquify`. Lowering's own
-//! copies are made before it: a chained comparison places its middle operand
-//! twice, and a group-by places its collection and key function in its key
-//! domain and its partition. A refinement nested in such a term is one shared
-//! `Rc` across the copies, which `memo` rebuilds once, against whichever copy's
-//! binders it meets first, so a raw copy would leave the others' nested
-//! refinements naming a binder they do not have. Lowering therefore places
-//! these terms through `MintedTerm` (`lower/exprs.rs`), which runs this pass on
-//! the term before taking any copy. This pass treats minted names as settled: minted
+//! **Mint before copy.** Lowering places some terms at several positions: a
+//! chained comparison places its middle operand twice, and a group-by places its
+//! collection and key function in its key domain and its partition. A
+//! refinement nested in such a term is one shared `Rc` across the copies, which
+//! `memo` rebuilds once, against whichever copy's binders it meets first, so a
+//! copy of a raw term would leave the others' nested refinements naming a
+//! binder they do not have. Lowering therefore places these terms through
+//! `MintedTerm` (`lower/exprs.rs`), which runs this pass on the term before
+//! taking any copy, and each copy then renames the binders it introduces,
+//! rebuilding the nested refinements that read them
+//! (`src/ccl/design/type-inference.md`, "Every binder is bound in one place").
+//! [`crate::ccl::comprehension`] runs after this pass and renames its filter
+//! copies the same way. This pass treats minted names as settled: minted
 //! binding sites are not re-minted and push nothing on the environment (their
 //! bound variables are already resolved; their free variables are still raw
 //! and resolve against the environment at the position of each copy), which
-//! makes the pass idempotent. A uid may legitimately occur at several binding
-//! sites — a predicate shared by `Rc` is rebuilt once, and a later copy
-//! preserves uids — so the checked invariant is "every binding site is
-//! minted", not global binder uniqueness.
+//! makes the pass idempotent. A uid occurs at several binding sites only where
+//! one predicate shared by `Rc` rides several type slots, so the checked
+//! invariant here is "every binding site is minted"; inference types each such
+//! occurrence under names of its own.
 
 use std::collections::HashMap;
 

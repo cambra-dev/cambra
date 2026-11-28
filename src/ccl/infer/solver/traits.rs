@@ -1293,6 +1293,11 @@ pub struct InstanceTable {
     /// holds is declared, which a diagnostic compares with an instance's module
     /// ([`DeclaredAt::module`]).
     run_modules: HashMap<crate::ccl::RunPath, Vec<SmolStr>>,
+    /// The binding of a declared instance's function that each copy of it renames, by the
+    /// copy's binder. Every run or import of a module binds its own copy of the module's
+    /// instances' functions (`src/ccl/design/type-inference.md`, "Every binder is bound in one
+    /// place").
+    copies: HashMap<Name, Name>,
 }
 
 /// The type of a function over `inputs`, as a `def` over them lowers: a function of the one
@@ -1402,12 +1407,37 @@ impl InstanceTable {
         })
     }
 
+    /// Every binder of a declared instance's function: each declared binding and each copy of
+    /// one.
+    pub fn function_binders(&self) -> impl Iterator<Item = &Name> {
+        self.declared_bindings().chain(self.copies.keys())
+    }
+
+    /// Record that `copy` binds a module copy's function of the declared binding `declared`.
+    pub fn note_copy(&mut self, copy: Name, declared: Name) {
+        debug_assert!(
+            self.declared_bindings().any(|b| *b == declared),
+            "a copy renames the binding of a declared instance's function, and `{declared}` is none"
+        );
+        let previous = self.copies.insert(copy, declared);
+        debug_assert!(previous.is_none(), "each copy's binder is minted once");
+    }
+
+    /// The declared binding `binder` binds a function of: itself for a declared binding, the
+    /// binding it copies for a copy, and `None` for any other binder.
+    pub fn declared_binding<'a>(&'a self, binder: &'a Name) -> Option<&'a Name> {
+        self.copies
+            .get(binder)
+            .or_else(|| self.declared_bindings().find(|b| *b == binder))
+    }
+
     /// The trait, the declared instance and the name of the trait function whose `def` is
-    /// lowered to `binding`.
+    /// lowered to `binding`, or to the binding `binding` copies.
     pub fn declared_function(
         &self,
         binding: &Name,
     ) -> Option<(&Trait, &Rc<TraitInstance>, &SmolStr)> {
+        let binding = self.copies.get(binding).unwrap_or(binding);
         self.instances.iter().find_map(|(t, i)| {
             i.functions
                 .iter()

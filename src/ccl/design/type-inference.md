@@ -1604,7 +1604,9 @@ spelling every such copy reaches. Each rule below is an equivalence: the two spe
 give the same value at every argument the term is applied at.
 
 - a transparent `let` is discharged, and an applied lambda is β-reduced. `simplify`'s
-  `let __output = 𝑒 in __output`, rewritten to `𝑒` during planning, reads back by this rule;
+  `let __output = 𝑒 in __output`, rewritten to `𝑒` during planning, reads back by this rule. A
+  `let` whose binder a feed's target still names after the discharge declares a handle rather
+  than defining a value, and stays;
 - an applied `cast` reads its value, since a cast re-views a collection's domain and leaves what
   it holds at a key unchanged;
 - an applied eliminated combinator reads back to the term it stands for: `id`, `const`, a `zip`
@@ -2632,6 +2634,38 @@ Predicate interiors can subsequently be coalesced; they are not excluded from th
 Capture avoidance depends on the binder discipline and the substitution's scope handling.
 Assertions check violations instead of silently alpha-renaming arbitrary input trees. This is an
 implementation contract, not a proof that malformed substitutions cannot be represented.
+
+#### Every binder is bound in one place
+
+A substitution is keyed by name and composes by name, so a name bound at two sites would be one key
+for two binders. Every binding site inference sees binds a name that no other site binds.
+
+- A term placed at more than one position is copied with fresh names for the binders it introduces
+  (`scope::freshen_bound_names`). Lowering's `MintedTerm::copy`, a comprehension's filter nest,
+  inlining's copy of a function at each use, and a substitution's discharge at each occurrence it
+  replaces copy this way.
+- A run copies its module's statement chain. The copy renames the binders each definition
+  introduces (`scope::freshen_definitions`), and the run's uniquify scope renames the chain's own
+  binders.
+- Each run or import of a module binds its own copy of each function of the module's instances.
+  Linking renames the function's binder in the copy and records the copy against the instance's
+  declared binding (`InstanceTable::note_copy`). A call the instance answers takes the innermost
+  copy in scope.
+- A copy shares its origin's inference variables, and a variable's telescope names the origin's
+  binders. A discharge copy placed during inference is therefore well scoped only while no
+  variable it holds has a bound that names a binder the copy renamed. In debug builds,
+  `assert_well_scoped` checks this at every `settle`.
+- A predicate shared by allocation across several type slots is one term, bound once. Emission
+  types it once per occurrence (`emit_bare_predicate`), and each typing is its own problem, so each
+  freshens the binders of the copy it types.
+- Closing or opening a function's binder (`PiWalk`) converts a predicate that reads the binder
+  into a new term. A converted term that holds no inference variable renames the binders it
+  introduces. A converted term that holds one keeps their names, because the variables it shares
+  with the original have bounds that name the original's binders.
+- In debug builds, `scope::assert_binders_unique` checks at inference entry that each name is bound
+  at one site.
+- Refinement equality compares a predicate's interior binders by position
+  (`eq_term_modulo_ty_slots`), so a renamed copy of a predicate equals its origin.
 
 A refinement's discharge postcondition uses the substitution inside its predicate, with element
 indices shifted by one. A discharged name can remain when a replacement term introduces it from

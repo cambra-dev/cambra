@@ -1422,6 +1422,20 @@ impl<'a> ProgramLowering<'a> {
             if !first {
                 copy_predicates(&mut chain, &mut HashMap::new());
             }
+            // Every binder is bound in one place (`src/ccl/design/type-inference.md`), and each
+            // run is a copy of its module's definitions.
+            crate::ccl::scope::freshen_definitions(&mut chain, crate::ccl::Ids::Fresh);
+            // The copy binds its own copy of each function of the module's instances.
+            let mut copies = HashMap::new();
+            each_instance_binder(&chain, &ctx.instances, &mut |declared| {
+                copies
+                    .entry(declared.clone())
+                    .or_insert_with(|| Name::fresh_like(declared));
+            });
+            for (declared, copy) in &copies {
+                ctx.instances.note_copy(copy.clone(), declared.clone());
+            }
+            crate::ccl::scope::rename_binders(&mut chain, &copies, crate::ccl::Ids::Fresh);
             chain
         };
         let path = place
@@ -2096,6 +2110,20 @@ pub(super) fn use_names(
         }
     }
     names
+}
+
+/// Call `f` on each binder in `e` of a declared instance's function.
+fn each_instance_binder(
+    e: &crate::ccl::TypedExpr,
+    instances: &crate::ccl::infer::solver::traits::InstanceTable,
+    f: &mut dyn FnMut(&Name),
+) {
+    e.walk_binders(|b| {
+        if instances.declared_binding(&b.name) == Some(&b.name) {
+            f(&b.name);
+        }
+    });
+    e.walk_children(|c| each_instance_binder(c, instances, f));
 }
 
 #[cfg(test)]

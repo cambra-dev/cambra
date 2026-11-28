@@ -1404,7 +1404,7 @@ pub(super) fn coalesce_pass(
         plan: Plan::default(),
         replay: HashMap::new(),
         walked_predicates: HashMap::new(),
-        instance_functions: instances.declared_bindings().cloned().collect(),
+        instance_functions: instances.function_binders().cloned().collect(),
         instances,
         defining: Vec::new(),
         scope: Vec::new(),
@@ -3540,11 +3540,17 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
         panic!("a declared instance of `{trait_}` binds every function its trait declares")
     };
     let binding = binding.clone();
-    let in_scope = ctx.scope.iter().any(|entry| match entry {
-        ScopeEntry::Generalized(frame) => frame.name == binding,
-        ScopeEntry::Shadow(name) => *name == binding,
+    // Every run or import of the instance's module binds a copy of the function, and the call
+    // takes the innermost copy in scope.
+    let copies = |name: &Name| ctx.instances.declared_binding(name) == Some(&binding);
+    let in_scope = ctx.scope.iter().rev().find_map(|entry| {
+        let name = match entry {
+            ScopeEntry::Generalized(frame) => &frame.name,
+            ScopeEntry::Shadow(name) => name,
+        };
+        copies(name).then(|| name.clone())
     });
-    if !in_scope {
+    let Some(copy) = in_scope else {
         let declared = instance
             .declared
             .as_ref()
@@ -3552,7 +3558,7 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
         let function = format!("{trait_}::{function}");
         let instance = declared.head.clone();
         let inside =
-            ctx.defining.contains(&binding) || ctx.specializing.iter().any(|s| s.name == binding);
+            ctx.defining.iter().any(copies) || ctx.specializing.iter().any(|s| copies(&s.name));
         // A definition of another module, specialized here, reaches the instances of the
         // modules its own reaches, not those of a module that imports it
         // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]", **\[Open\]**).
@@ -3581,8 +3587,8 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
         };
         ctx.push_error(error);
         return false;
-    }
-    expr.node = TypedExprNode::Var(binding);
+    };
+    expr.node = TypedExprNode::Var(copy);
     true
 }
 
@@ -6659,7 +6665,7 @@ mod tests {
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
             TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
         ]));
-        let mut e = TypedExpr::let_bind(
+        let e = TypedExpr::let_bind(
             "f",
             crate::ccl::Occurrence::mint(),
             outer_f,
@@ -6670,6 +6676,8 @@ mod tests {
                 TypedExpr::let_bind("f", crate::ccl::Occurrence::mint(), inner_f, uses),
             ),
         );
+        // Lowering uniquifies before inference, which binds every name once.
+        let mut e = crate::ccl::uniquify::run(e);
         let ty = run_inference(&mut e).expect("shadowed generalized bindings type-check");
         assert_eq!(
             ty,

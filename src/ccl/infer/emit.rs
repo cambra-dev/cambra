@@ -795,6 +795,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             let mut typed = Ok(());
             for arg in &mut app.args {
                 memo.rebuild_always(arg, |term| {
+                    crate::ccl::scope::freshen_bound_names(term, crate::ccl::Ids::Fresh);
                     if typed.is_ok() {
                         typed = ctx.subexpr(term).map(|_| ());
                     }
@@ -933,6 +934,10 @@ fn emit_bare_predicate<C: Typing>(
     // installed rather than skipping the install.
     let mut typed = Ok(());
     memo.rebuild_always(r, |pred| {
+        // Each occurrence is its own typing problem, so it binds names of its own: every
+        // binder is bound in one place
+        // (`src/ccl/design/type-inference.md`, "Every binder is bound in one place").
+        crate::ccl::scope::freshen_bound_names(pred, crate::ccl::Ids::Fresh);
         typed = ctx
             .scoped(&Name::elem(), domain, |ctx| ctx.subexpr(pred))
             .and_then(|pred_ty| {
@@ -4300,8 +4305,21 @@ pub(super) fn bind_selected_instance_function(
                     .is_some_and(|t| ctx.opened_param(p.id).is_some_and(|opened| opened == *t))
             })
         });
-    if at_own_types {
-        emit_group_member_for(binding, ctx)?;
+    if !at_own_types {
+        return Ok(());
+    }
+    // The open group binding the instance's functions binds one copy of them: the module's
+    // own, or a run's or an import's.
+    let copy = ctx.groups.iter().rev().find_map(|group| {
+        group
+            .members
+            .iter()
+            .map(|m| &m.binding.name)
+            .find(|name| ctx.instances.declared_binding(name) == Some(binding))
+            .cloned()
+    });
+    if let Some(copy) = copy {
+        emit_group_member_for(&copy, ctx)?;
     }
     Ok(())
 }

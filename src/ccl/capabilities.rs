@@ -949,6 +949,11 @@ impl Capabilities {
                 .iter()
                 .filter_map(|r| {
                     let terms = mapped(&r.requirement().terms)?;
+                    // A requirement whose terms the map keeps is the same requirement, and keeps
+                    // what inference attached to it.
+                    if terms == r.requirement().terms {
+                        return Some(r.clone());
+                    }
                     Some(Requirement::of(r.requirement().trait_.clone(), terms))
                 })
                 .collect(),
