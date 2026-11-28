@@ -518,7 +518,8 @@ impl Name {
 
     /// A fresh binder copying `name`'s spelling and metadata: what a pass that
     /// re-mints a binder it copies or renames gives the copy, so the copy keeps
-    /// its display and its [`field_key`](Self::field_key).
+    /// its display and its [`field_key`](Self::field_key). A synthetic binder's copy is
+    /// synthetic of the same kind.
     pub fn fresh_like(name: &Name) -> Self {
         match name {
             Name::Unique { base, meta, .. } => Name::Unique {
@@ -526,6 +527,7 @@ impl Name {
                 uid: Uid::fresh(),
                 meta: meta.clone(),
             },
+            Name::Synthetic { kind, .. } => Self::synthetic(kind.clone()),
             other => Self::fresh(other.base()),
         }
     }

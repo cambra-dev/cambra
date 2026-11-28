@@ -997,7 +997,7 @@ impl Subst {
         // `v`'s kind. An elimination is the exception: it reads the sum out, and what is left
         // is a plain collection whatever `v` turns out to be, so it has a data kind of its own.
         let kind = if self.elims.iter().any(|e| matches!(e, Elim::Top(_))) {
-            let k = crate::ccl::ty::FunKindVar::fresh(solver, v.level(solver));
+            let k = crate::ccl::ty::FunKindVar::fresh(solver, v.level(solver), &telescope);
             k.stamp_data(solver);
             k
         } else {
@@ -1085,6 +1085,22 @@ impl Subst {
             .collect();
         v.telescope
             .rescoped(|n| self.binders.contains_key(n), reads)
+    }
+
+    /// Whether the context of `v[self]` holds `b` ([`Self::instance_telescope`]), read without
+    /// building it: `b` is in `v`'s telescope and this substitution maps it away, or one of its
+    /// images reads `b`.
+    pub(crate) fn instance_context_holds(
+        &self,
+        v: &crate::ccl::infer_var::InferVar,
+        b: &Binder,
+    ) -> bool {
+        (!self.binders.contains_key(b) && v.telescope.contains(b))
+            || self
+                .binders
+                .values()
+                .flat_map(Mapping::image)
+                .any(|n| is_read_name(&n) && &n == b)
     }
 
     /// Whether this substitution renames or discharges any of `names`.
@@ -1182,6 +1198,108 @@ impl Subst {
             f(&mut copy);
             *t = Rc::new(copy);
         }
+    }
+
+    /// Every name this substitution mentions: each key, each rename's target, and each name a
+    /// term it carries reads or binds. A captured term is a copy of a subterm, so a binder it
+    /// introduces is a binder of the tree it was copied from.
+    pub(crate) fn mentioned_names(&self) -> BTreeSet<Name> {
+        let mut out: BTreeSet<Name> = self.binders.keys().cloned().collect();
+        let reads = |t: &TypedExpr, out: &mut BTreeSet<Name>| {
+            out.extend(crate::ccl::free_names::names(
+                t,
+                crate::ccl::free_names::EVERY_READ,
+            ));
+            out.extend(crate::ccl::scope::bound_names(t));
+        };
+        for m in self.binders.values() {
+            match m {
+                Mapping::Rename(to) => {
+                    out.insert(to.clone());
+                }
+                Mapping::Discharge(t) | Mapping::Join(Some(t), _) => reads(t, &mut out),
+                Mapping::Join(None, _) => {}
+            }
+        }
+        for e in &self.elims {
+            if let Some(t) = e.term() {
+                reads(t, &mut out);
+            }
+        }
+        out
+    }
+
+    /// This substitution with its keys renamed by `renames` and what it maps them to left as it
+    /// is: the substitution read from a frame `renames` renames into one it leaves alone.
+    pub(crate) fn rename_keys(&self, renames: &crate::ccl::scope::Renames) -> Subst {
+        Subst {
+            binders: self
+                .binders
+                .iter()
+                .map(|(k, m)| {
+                    (
+                        renames.get(k).cloned().unwrap_or_else(|| k.clone()),
+                        m.clone(),
+                    )
+                })
+                .collect(),
+            ..self.clone()
+        }
+    }
+
+    /// This substitution with what it maps each key to renamed by `renames`, its keys left as
+    /// they are: the substitution read from a frame `renames` leaves alone into one it renames.
+    pub(crate) fn rename_images(&self, renames: &crate::ccl::scope::Renames, ids: Ids) -> Subst {
+        let keys: Vec<Binder> = self.binders.keys().cloned().collect();
+        let renamed = self.rename_names(renames, ids);
+        let inverse: crate::ccl::scope::Renames = renames
+            .iter()
+            .map(|(from, to)| (to.clone(), from.clone()))
+            .collect();
+        let restored = renamed.rename_keys(&inverse);
+        debug_assert!(
+            restored
+                .binders
+                .keys()
+                .eq(keys.iter().collect::<BTreeSet<_>>()),
+            "renaming the images keeps the keys"
+        );
+        restored
+    }
+
+    /// This substitution with every binder `renames` maps renamed: a key, a rename's target, and
+    /// each mention in a discharge's term or type. Each binder is bound in one place, so the
+    /// rename is the same at every mention ([`crate::ccl::scope::rename_names_in_type`]). An
+    /// instance of a definition reads its bounds under the binders the instance gives the
+    /// definition's own.
+    pub(crate) fn rename_names(&self, renames: &crate::ccl::scope::Renames, ids: Ids) -> Subst {
+        let name = |n: &Binder| renames.get(n).cloned().unwrap_or_else(|| n.clone());
+        let mut out = Subst {
+            binders: self
+                .binders
+                .iter()
+                .map(|(k, m)| {
+                    let m = match m {
+                        Mapping::Rename(to) => Mapping::Rename(name(to)),
+                        Mapping::Discharge(_) | Mapping::Join(..) => m.clone(),
+                    };
+                    (name(k), m)
+                })
+                .collect(),
+            ..self.clone()
+        };
+        out.for_each_discharge_term_mut(&mut |t| {
+            crate::ccl::scope::rename_names_in_term(t, renames, ids);
+        });
+        out.map_witness_half(
+            |w| *w,
+            Rc::clone,
+            |t| {
+                let mut t = t.clone();
+                crate::ccl::scope::rename_names_in_type(&mut t, renames, ids);
+                t
+            },
+        )
     }
 
     /// Each kind an elimination names, as [`Self::map_witness_half`] passes it to `kind`.
@@ -1855,7 +1973,7 @@ impl Subst {
     /// captured under a Pi binder, and only a binder entry puts a term there. An entry acting
     /// on nothing in `ty` puts nothing there, so it captures nothing there, as
     /// [`Self::under_binder`] states for a term.
-    fn acting_on_type(&self, solver: &mut Solver, ty: &Type) -> Subst {
+    pub(crate) fn acting_on_type(&self, solver: &mut Solver, ty: &Type) -> Subst {
         let free = type_free_vars(ty);
         let mut out = self.clone();
         out.binders.retain(|k, m| {
@@ -1872,6 +1990,25 @@ impl Subst {
         self.binders.keys().any(|k| binder_acts_on(k, v))
             || self.witnesses.keys().any(|w| v.may_name_witness(solver, w))
             || self.elims.iter().any(|e| elim_acts_on(solver, e, v))
+    }
+
+    /// Whether this substitution discharges `k`: maps it to a term rather than renaming it.
+    pub(crate) fn discharges(&self, k: &Binder) -> bool {
+        matches!(self.binders.get(k), Some(Mapping::Discharge(_)))
+    }
+
+    /// This substitution without its binder entries for the binders `drop` holds. The witness
+    /// half and the eliminations are kept.
+    pub(crate) fn without_binders(&self, drop: impl Fn(&Binder) -> bool) -> Subst {
+        Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter(|(b, _)| !drop(b))
+                .map(|(b, m)| (b.clone(), m.clone()))
+                .collect(),
+            ..self.clone()
+        }
     }
 
     /// The entries of this substitution that can change what `v` resolves to.
@@ -1903,6 +2040,33 @@ impl Subst {
     /// ([`check_dropped_entries`]).
     ///
     /// Returns `self` borrowed when nothing is dropped.
+    /// This substitution's binder entries for the binders `telescope` holds: the only ones a
+    /// variable standing there can read, so a walk reading that variable carries only them. The
+    /// witness half and the eliminations are kept.
+    pub(crate) fn binders_in(
+        &self,
+        telescope: &crate::ccl::infer_var::Telescope,
+    ) -> Cow<'_, Subst> {
+        self.binders_where(|b| telescope.contains(b))
+    }
+
+    /// This substitution's binder entries for the binders `holds` answers for, as
+    /// [`Self::binders_in`] keeps a telescope's.
+    pub(crate) fn binders_where(&self, holds: impl Fn(&Binder) -> bool) -> Cow<'_, Subst> {
+        if self.binders.keys().all(&holds) {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter(|(b, _)| holds(b))
+                .map(|(b, m)| (b.clone(), m.clone()))
+                .collect(),
+            ..self.clone()
+        })
+    }
+
     pub(crate) fn acting_on(
         &self,
         solver: &mut Solver,
@@ -5468,7 +5632,11 @@ mod tests {
         let solver = &mut Solver::new();
         let x = Name::raw("x");
         let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
+        let kind = crate::ccl::ty::FunKindVar::fresh(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty(),
+        );
         let v = crate::ccl::infer_var::InferVar::fresh_over(solver, 0, &telescope, kind);
         let sigma = Subst::rename(x, Name::raw("y"));
         let ty = Type::Infer(Rc::clone(&v));
@@ -6216,10 +6384,10 @@ mod tests {
         crate::ccl::ty::WitnessId,
     ) {
         use crate::ccl::ty::{FunKind, FunKindVar};
-        let k = FunKindVar::fresh(solver, 0);
-        let related = FunKindVar::fresh(solver, 0);
+        let k = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
+        let related = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         k.record(solver, FunKind::Var(Rc::clone(&related)), true);
-        let unrelated = FunKindVar::fresh(solver, 0);
+        let unrelated = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let (own, theirs, outside) = (
             k.binder_id_at(solver, 0),
             related.binder_id_at(solver, 0),

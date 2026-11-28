@@ -1682,14 +1682,13 @@ fn a_filter_over_the_groups_of_a_group_by() {
     );
 }
 
-/// Not compiled yet: a group-by in a conditional's guard. The guard becomes each leg's filter,
-/// which planning lifts from its uncompiled predicate and plans as the tree. Running the plan
-/// panics. Each answers `1`.
+/// A group-by in a conditional's guard: the guard becomes each leg's filter, which planning
+/// lifts from its uncompiled predicate and plans as the tree, so the group-by is recognized there
+/// too.
 #[rstest]
 #[case::summing_the_groups(r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) else 0")]
 #[case::counting_the_groups(r"1 if 0 < sum([1 for g in groupby([1, 1, 2], \e -> e)]) else 0")]
-#[should_panic(expected = "Cannot apply Fn(0..3 → Int) to the values of Fn(Int → Int) at level 1")]
-fn a_group_by_in_a_guard_is_not_compiled_yet(#[case] program: &str) {
+fn a_group_by_in_a_guard(#[case] program: &str) {
     check_scalar(program, Value::Int(1));
 }
 
@@ -1771,18 +1770,6 @@ fn a_comprehension_reading_only_the_element_under_a_further_level() {
 /// operand of a chained comparison, which lowering places in both comparisons, and a group-by
 /// nested in a key, which the key domain's predicate and the partition each hold.
 #[rstest]
-#[case::nested_in_a_key(
-    r"sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])",
-    Value::Int(4)
-)]
-fn a_group_by_held_twice_is_iterated(#[case] program: &str, #[case] expected: Value) {
-    check_scalar(program, expected);
-}
-
-/// Not compiled yet: [`a_group_by_held_twice_is_iterated`] as the middle operand of a chained
-/// comparison, which lowering places in both comparisons. Running the plan panics. It answers
-/// `true`, and `1` in a guard.
-#[rstest]
 #[case::in_a_chained_comparison(
     r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100",
     Value::Bool(true)
@@ -1791,11 +1778,11 @@ fn a_group_by_held_twice_is_iterated(#[case] program: &str, #[case] expected: Va
     r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0",
     Value::Int(1)
 )]
-#[should_panic(expected = "Cannot apply Fn(0..3 → Int) to the values of Fn(Int → Int) at level 1")]
-fn a_group_by_held_twice_in_a_chained_comparison_is_not_compiled_yet(
-    #[case] program: &str,
-    #[case] expected: Value,
-) {
+#[case::nested_in_a_key(
+    r"sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])",
+    Value::Int(4)
+)]
+fn a_group_by_held_twice_is_iterated(#[case] program: &str, #[case] expected: Value) {
     check_scalar(program, expected);
 }
 

@@ -1227,7 +1227,8 @@ fn emit_under_params<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let Some((param, rest)) = params.split_first_mut() else {
-        return emit_value_read(body, ctx);
+        let opaque = crate::ccl::infer_var::body_opaque_binders(body);
+        return ctx.under_opaque_binders(&opaque, |ctx| emit_value_read(body, ctx));
     };
     let ty = match first {
         Some(ty) => ty,

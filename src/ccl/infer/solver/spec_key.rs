@@ -479,6 +479,10 @@ struct KeyCtx {
     /// refinement two ways. A refinement lands index-spelled, so two α-variant
     /// instantiations key together and the memo shares their specialization.
     scope: RefinementScope,
+    /// Each variable's own reads, for deciding which of its bounds are its own
+    /// ([`bound_is_own`](crate::ccl::infer::solver::compact::bound_is_own)), as compaction
+    /// decides it.
+    own_content: crate::ccl::infer::solver::compact::ContentWalk,
 }
 
 /// The specialization key of `ty`: its two directed reads (see the module docs).
@@ -497,6 +501,7 @@ pub fn spec_key(solver: &mut Solver, ty: &Type) -> SpecKey {
         consulted: ConsultedNames::new(),
         chain_from: 0,
         scope: RefinementScope::default(),
+        own_content: Default::default(),
         #[cfg(test)]
         visits: 0,
     };
@@ -548,6 +553,8 @@ fn key_var_binder(
         return false;
     }
     seen.push(k.uid);
+    // The walk reads `k`'s edges in `k`'s scope, so it carries only the entries acting there.
+    let subst_acc = &*subst_acc.binders_in(&k.telescope);
     let mut offset = 0;
     for src in k.built_over(solver) {
         let n = src.arity(solver).unwrap_or(0);
@@ -925,6 +932,10 @@ fn key_go(
         // the dual read already sees every bound either could reach, on whichever
         // root read follows that side.
         Type::Infer(state) => {
+            // The walk reads this variable in its scope, so it carries only the entries acting
+            // there, as compaction's `expand_variable` does.
+            let in_scope = subst_acc.binders_in(&state.telescope);
+            let subst_acc: &Subst = &in_scope;
             let visit_key = (state.uid, pol);
             let memo_key = (state.uid, pol, ctx.scope.enclosing().to_vec());
             let under = if subst_acc.is_id() {
@@ -980,13 +991,20 @@ fn key_go(
                 ctx.walk.enter(visit_key);
                 let mut acc = KeyView::default();
                 for b in bounds.iter() {
+                    // A bound on an instance of this variable is the instance's, and the key
+                    // reads it where compaction does: at the variable standing for the instance.
+                    if !crate::ccl::infer::solver::compact::bound_is_own(
+                        solver,
+                        state,
+                        b,
+                        &mut ctx.own_content,
+                    ) {
+                        continue;
+                    }
                     // Compose the edge's morphism before descending, as `compact_go`
                     // does: a bound reached transitively arrives with every edge's
                     // substitution composed.
-                    let inner_acc = {
-                        let rendered = b.render_subst(solver);
-                        Subst::then(solver, &rendered, subst_acc)
-                    };
+                    let inner_acc = b.reading_subst(solver, under.as_ref().unwrap_or(subst_acc));
                     // A bound that is not a variable is a structural boundary, behind which
                     // reaching a variable being expanded is a recursive type.
                     let chain_from = ctx.chain_from;
@@ -1291,7 +1309,11 @@ mod tests {
     #[test]
     fn a_witness_operation_does_not_repeat_a_scalar_bound_graph() {
         let solver = &mut Solver::new();
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
+        let kind = crate::ccl::ty::FunKindVar::fresh(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty(),
+        );
         let collection = Rc::new(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
         let (root, nodes) =
@@ -1411,7 +1433,11 @@ mod tests {
         // which keys as the `Compute` default rather than as its own point.
         let unresolved = |solver: &mut Solver| Type::Fun {
             binder: crate::ccl::FunBinder::None,
-            fun_kind: crate::ccl::ty::FunKind::fresh_var(solver, 0),
+            fun_kind: crate::ccl::ty::FunKind::fresh_var(
+                solver,
+                0,
+                &crate::ccl::infer_var::Telescope::empty(),
+            ),
             domain: Box::new(int()),
             codomain: Box::new(int()),
             capabilities: crate::ccl::capabilities::Capabilities::none(),
@@ -1499,6 +1525,7 @@ mod tests {
             consulted: ConsultedNames::new(),
             chain_from: 0,
             scope: RefinementScope::default(),
+            own_content: Default::default(),
             visits: 0,
         }
     }
@@ -1528,7 +1555,12 @@ mod tests {
         );
         let mut cache = ConstrainCache::new();
         constrain_subtype(solver, &lower, &b, &mut cache).expect("the lower flows in");
-        let v = fresh_var(solver, 0);
+        // `?v` stands under `x` too, which what flows into it names.
+        let v = Type::Infer(crate::ccl::InferVar::fresh_in(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty().extended(crate::ccl::Name::raw("x")),
+        ));
         constrain_subtype(solver, &b, &v, &mut cache).expect("the barrier flows into ?v");
         let mut above = |xs: &[i64]| {
             let top = fresh_var(solver, 0);

@@ -194,7 +194,7 @@ impl KindVarPool {
             let i = rng.below(self.0.len() as u64) as usize;
             return Rc::clone(&self.0[i]);
         }
-        let v = FunKindVar::fresh(solver, 0);
+        let v = FunKindVar::fresh(solver, 0, &cambra::ccl::Telescope::empty());
         self.0.push(Rc::clone(&v));
         v
     }

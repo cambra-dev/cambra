@@ -795,6 +795,48 @@ pub(crate) fn rename_binders(e: &mut TypedExpr, renames: &Renames, ids: crate::c
     rename(e, Some(&fresh), Renames::new(), &escaped, ids);
 }
 
+/// Retarget every mention in `ty` of a name `renames` maps: a free reference, a function type's
+/// binder, a dependent tuple's component. Each binder is bound in one place, so every mention of
+/// such a name means that binder, and the rename needs no scope. A held term that reads a
+/// renamed name is rebuilt as [`rename_binders`] rebuilds one; `ids` chooses whether it keeps its
+/// ids. Whether anything changed.
+pub(crate) fn rename_names_in_type(ty: &mut Type, renames: &Renames, ids: crate::ccl::Ids) -> bool {
+    let memo = PredMemo::copying(ids);
+    let mut renamer = Renamer {
+        fresh: None,
+        scoped: Renames::new(),
+        escaped: renames,
+        memo: &memo,
+        ids,
+        held_names: HashMap::new(),
+    };
+    let (local, scoped) = (Renames::new(), Renames::new());
+    let mut slots = SlotScope {
+        within: Vec::new(),
+        local: &local,
+        scoped: &scoped,
+        escaped: renames,
+    };
+    renamer.ty(ty, &mut slots)
+}
+
+/// [`rename_names_in_type`] for a term: every mention of a name `renames` maps, a binder the term
+/// introduces included, in the term and in its types.
+pub(crate) fn rename_names_in_term(e: &mut TypedExpr, renames: &Renames, ids: crate::ccl::Ids) {
+    let mut fresh = Renames::new();
+    collect_bound_names_by(e, &mut fresh, &|n| {
+        renames.get(n).cloned().unwrap_or_else(|| n.clone())
+    });
+    rename(e, Some(&fresh), renames.clone(), renames, ids);
+}
+
+/// Every binder `e` introduces, its held terms' aside.
+pub(crate) fn bound_names(e: &TypedExpr) -> Vec<Name> {
+    let mut renames = Renames::new();
+    collect_bound_names_by(e, &mut renames, &|n| n.clone());
+    renames.into_keys().collect()
+}
+
 /// The binders `e`'s own nodes introduce, each mapped to what `to` gives it. Held terms are
 /// not entered.
 fn collect_bound_names_by(e: &TypedExpr, renames: &mut Renames, to: &dyn Fn(&Name) -> Name) {

@@ -59,7 +59,7 @@ pub(super) enum MethodCallsEnd {
 ///
 /// Implemented by [`InferCtx`](super::context::InferCtx) (Emit)
 /// and [`CheckCtx`](super::check::CheckCtx) (Check).
-pub(super) trait Typing {
+pub(super) trait Typing: crate::ccl::infer_var::TelescopeWalk + Sized {
     /// The node whose typing rule is currently running — the blame for any error
     /// raised under it. Emit maintains it in
     /// [`emit_node`](super::emit::emit_node), Check in `check_node`; both set it
@@ -333,6 +333,13 @@ pub(super) trait Typing {
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized;
+
+    /// Run `f` over a function body, or a run's top level, with the opaque binders it binds
+    /// entered ([`crate::ccl::infer_var::body_opaque_binders`]). A type crossing one of them keeps
+    /// its name, as it crosses the opaque binder's own `let`.
+    fn under_opaque_binders<R>(&mut self, names: &[Name], f: impl FnOnce(&mut Self) -> R) -> R {
+        self.under_binders(names, f)
+    }
 
     /// Run `f` with `facts` holding in the scope, in addition to those already there: what a
     /// refinement query under them assumes ([`ScopeEnv::facts`]). A `match` arm's facts about

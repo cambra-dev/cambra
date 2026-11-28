@@ -2580,10 +2580,13 @@ fn constrain_go_impl(
         // (contravariant), so the values equate; and the domain must equate so a
         // `Mut` param's fresh per-call domain resolves to the argument mutable variable's
         // domain (borrowing — the two-way edge is what carries the
-        // resolution back to the caller). Value/domain edges run under *identity*
-        // like a `Feed` payload: a `Mut`'s value and domain are plain types, not
-        // content in a Pi binder's scope, so discharges accumulated on the way to
-        // the place type do not transport in.
+        // resolution back to the caller). Value/domain edges carry only the renames of the
+        // edge's substitutions, like a `Feed` payload: a `Mut`'s value and domain are plain
+        // types, not content in a Pi binder's scope, so discharges accumulated on the way to
+        // the place type do not transport in. A rename does: it relates two copies of one
+        // definition, each with binders of its own, and the variables in the two value types
+        // stand in their copies' scopes (`src/ccl/design/type-inference.md`, "Every binder is
+        // bound in one place").
         // Two histories of the **same kind** equate invariantly in both value
         // and domain (a mutable param reads *and* writes; a feed place both feeds
         // and is read). A cross-kind pair (a mutable variable demanded as a feed, or vice
@@ -2605,10 +2608,9 @@ fn constrain_go_impl(
                 history_kind: k1,
             },
         ) if k0 == k1 => {
-            constrain_go(solver, w0, w1, &Subst::id(), &Subst::id(), cache, scope)?;
-            cache.swapped(|cache| {
-                constrain_go(solver, w1, w0, &Subst::id(), &Subst::id(), cache, scope)
-            })
+            let (sl, sr) = (sl.split_renames().0, sr.split_renames().0);
+            constrain_go(solver, w0, w1, &sl, &sr, cache, scope)?;
+            cache.swapped(|cache| constrain_go(solver, w1, w0, &sr, &sl, cache, scope))
         }
         // A barrier variable's upper edge, recorded in native form (`H‹sl› <: rhs‹sr›`) as
         // the `(Type::Infer(_), _)` arm below records one, and not closed against the lowers:
@@ -2661,6 +2663,8 @@ fn constrain_go_impl(
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
         (Type::Infer(lv), _) if !lv.is_barrier() && type_level(solver, rhs) <= lv.level(solver) => {
+            // The content side keeps what can act on `rhs` (`Subst::acting_on_type`).
+            let sr = &sr.acting_on_type(solver, rhs);
             crate::ccl::capabilities::lower_capability_levels(solver, rhs, lv.level(solver));
             let lows = {
                 let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
@@ -2743,6 +2747,11 @@ fn constrain_go_impl(
                 else {
                     continue;
                 };
+                // Each half of the bridge acts in its edge's frame: the holder read through that
+                // edge's holder side (`Subst::instance_telescope`). An entry for a binder outside
+                // the frame names nothing there.
+                let tau_l = tau_l.binders_where(|b| low.self_subst.instance_context_holds(lv, b));
+                let tau_u = tau_u.binders_where(|b| sl.instance_context_holds(lv, b));
                 cache.with_origins((low.origin, None), |cache| {
                     let left = Subst::then(solver, &low.ty_subst, &tau_l);
                     let right = Subst::then(solver, sr, &tau_u);
@@ -2761,6 +2770,8 @@ fn constrain_go_impl(
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if !rv.is_barrier() && type_level(solver, lhs) <= rv.level(solver) => {
+            // The content side keeps what can act on `lhs` (`Subst::acting_on_type`).
+            let sl = &sl.acting_on_type(solver, lhs);
             crate::ccl::capabilities::lower_capability_levels(solver, lhs, rv.level(solver));
             let ups = {
                 let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
@@ -2871,6 +2882,9 @@ fn constrain_go_impl(
                 else {
                     continue;
                 };
+                // Each half of the bridge acts in its edge's frame, as in the arm above.
+                let tau_l = tau_l.binders_where(|b| sr.instance_context_holds(rv, b));
+                let tau_u = tau_u.binders_where(|b| up.self_subst.instance_context_holds(rv, b));
                 cache.with_origins((None, up.origin), |cache| {
                     let left = Subst::then(solver, sl, &tau_l);
                     let right = Subst::then(solver, &up.ty_subst, &tau_u);
@@ -4176,7 +4190,7 @@ mod tests {
     #[test]
     fn monomorphic_functions_keep_their_kind_at_the_bindings_level() {
         let solver = &mut Solver::new();
-        let kind = FunKindVar::fresh(solver, 2);
+        let kind = FunKindVar::fresh(solver, 2, &crate::ccl::infer_var::Telescope::empty());
         let function = Type::Fun {
             binder: FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&kind)),
@@ -4195,7 +4209,7 @@ mod tests {
         let solver = &mut Solver::new();
         for has_variable in [false, true] {
             for invariant in [false, true] {
-                let kind = FunKindVar::fresh(solver, 2);
+                let kind = FunKindVar::fresh(solver, 2, &crate::ccl::infer_var::Telescope::empty());
                 let function = Type::Fun {
                     binder: FunBinder::None,
                     fun_kind: FunKind::Var(Rc::clone(&kind)),
@@ -6261,13 +6275,25 @@ mod tests {
         let cond = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
         let consumer = {
             let fresh = fresh_var(solver, 0);
-            Type::consumer_fun(solver, 0, fresh, prim(BaseType::Int))
+            Type::consumer_fun(
+                solver,
+                0,
+                &crate::ccl::infer_var::Telescope::empty(),
+                fresh,
+                prim(BaseType::Int),
+            )
         };
         assert!(constrain_subtype(solver, &cond, &consumer, &mut ConstrainCache::new()).is_ok());
         // A consumer demanding a *concrete narrower* domain fails: the concrete type
         // meets the witness at every candidate, and `0..3` is not `0..2` — the
         // conditional collection never silently narrows to a single domain.
-        let narrow = Type::consumer_fun(solver, 0, Type::UIntRange(2), prim(BaseType::Int));
+        let narrow = Type::consumer_fun(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty(),
+            Type::UIntRange(2),
+            prim(BaseType::Int),
+        );
         assert!(constrain_subtype(solver, &cond, &narrow, &mut ConstrainCache::new()).is_err());
     }
 
@@ -6292,7 +6318,13 @@ mod tests {
             // comprehension). Its domain accumulates the witness.
             let consumer = {
                 let fresh = fresh_var(solver, 0);
-                Type::consumer_fun(solver, 0, fresh, int.clone())
+                Type::consumer_fun(
+                    solver,
+                    0,
+                    &crate::ccl::infer_var::Telescope::empty(),
+                    fresh,
+                    int.clone(),
+                )
             };
             assert!(
                 constrain_subtype(solver, &collection, &consumer, &mut ConstrainCache::new())
@@ -6382,7 +6414,10 @@ mod tests {
         let solver = &mut Solver::new();
         // The edge relates the two kinds, so a pin either side carries is a pin
         // both read — whichever side it was recorded on.
-        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
+        let (a, b) = (
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+        );
         let mut cache = ConstrainCache::new();
         // Pin `a` to compute, leaving `b` unpinned.
         constrain_subtype(
@@ -6420,7 +6455,10 @@ mod tests {
     #[test]
     fn a_pin_arriving_after_a_var_var_kind_edge_still_crosses_it() {
         let solver = &mut Solver::new();
-        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
+        let (a, b) = (
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+        );
         // The edge first, both sides unpinned — nothing to carry.
         constrain_subtype(
             solver,
@@ -6456,9 +6494,9 @@ mod tests {
     fn a_pin_crosses_a_chain_of_var_var_kind_edges() {
         let solver = &mut Solver::new();
         let (a, b, c) = (
-            FunKindVar::fresh(solver, 0),
-            FunKindVar::fresh(solver, 0),
-            FunKindVar::fresh(solver, 0),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
         );
         for (x, y) in [(&a, &b), (&b, &c)] {
             constrain_subtype(
@@ -6491,7 +6529,7 @@ mod tests {
     #[test]
     fn a_plain_collection_and_a_sum_do_not_merge() {
         let solver = &mut Solver::new();
-        let v = FunKindVar::fresh(solver, 0);
+        let v = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let mut cache = ConstrainCache::new();
         constrain_subtype(
             solver,
@@ -6528,7 +6566,10 @@ mod tests {
         // The pin crosses the edge, so the *second* concrete kind meets a component that
         // already holds the first — and a concrete kind settles the variable it meets, so
         // the contradiction is reported at that edge rather than carried to coalesce.
-        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
+        let (a, b) = (
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+        );
         constrain_subtype(
             solver,
             &fun_at(FunKind::Var(Rc::clone(&a))),
@@ -6567,7 +6608,10 @@ mod tests {
         // whichever kind of edge that is. A variable between the two ends hides nothing:
         // `resolved` folds the whole component.
         let fun_over = fun_at;
-        let (a, b) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
+        let (a, b) = (
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+        );
         let mut cache = ConstrainCache::new();
         constrain_subtype(
             solver,
@@ -6606,7 +6650,7 @@ mod tests {
         // A kind var meeting `Data` is *pinned* to it, never an eager rejection,
         // and resolves at coalesce. A compute function meeting the same var would
         // pin it the other way, and holding both points is `KindPin::Conflict`.
-        let v = FunKindVar::fresh(solver, 0);
+        let v = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let var_fun = Type::Fun {
             binder: FunBinder::None,
             fun_kind: FunKind::Var(Rc::clone(&v)),

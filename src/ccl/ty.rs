@@ -467,8 +467,12 @@ impl FunKind {
 
     /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds), owned by `solver`, for
     /// a function standing at `level`.
-    pub fn fresh_var(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> FunKind {
-        FunKind::Var(FunKindVar::fresh(solver, level))
+    pub fn fresh_var(
+        solver: &mut Solver,
+        level: crate::ccl::infer_var::Level,
+        telescope: &crate::ccl::infer_var::Telescope,
+    ) -> FunKind {
+        FunKind::Var(FunKindVar::fresh(solver, level, telescope))
     }
 
     /// A fresh kind variable **pinned to `Data`** — a consumer's function, polymorphic in
@@ -481,8 +485,12 @@ impl FunKind {
 
     /// [`fresh_data`](Self::fresh_data) for a function an annotation's normalization mints at
     /// `level`.
-    pub fn fresh_data_at(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> FunKind {
-        let v = FunKindVar::fresh(solver, level);
+    pub fn fresh_data_at(
+        solver: &mut Solver,
+        level: crate::ccl::infer_var::Level,
+        telescope: &crate::ccl::infer_var::Telescope,
+    ) -> FunKind {
+        let v = FunKindVar::fresh(solver, level, telescope);
         v.stamp_data(solver);
         FunKind::Var(v)
     }
@@ -829,16 +837,20 @@ impl FunKindVar {
 
 impl FunKindVar {
     /// Mint a fresh funkind variable owned by `solver`, with nothing recorded, for an owner
-    /// standing at `level`. The owner is the variable it is the funkind of, or the annotation's
-    /// function it was minted for: a freshening copies a funkind variable only above its cutoff,
-    /// as it copies a type variable, so an instantiation leaves an outer definition's funkind
-    /// variable its own (`src/ccl/design/type-inference.md`, "Funkind variables are copied by
-    /// level").
-    pub fn fresh(solver: &mut Solver, level: crate::ccl::infer_var::Level) -> Rc<FunKindVar> {
+    /// standing at `level` in `telescope`. The owner is the variable it is the funkind of, or the
+    /// annotation's function it was minted for: a freshening copies a funkind variable only above
+    /// its cutoff, as it copies a type variable, so an instantiation leaves an outer definition's
+    /// funkind variable its own (`src/ccl/design/type-inference.md`, "Funkind variables are
+    /// copied by level").
+    pub fn fresh(
+        solver: &mut Solver,
+        level: crate::ccl::infer_var::Level,
+        telescope: &crate::ccl::infer_var::Telescope,
+    ) -> Rc<FunKindVar> {
         FunKindVar::mint(
             solver,
             level,
-            crate::ccl::infer_var::Telescope::empty(),
+            telescope.clone(),
             FunKindVarFixed {
                 hole: false,
                 minted: KindPin::Unpinned,
@@ -1130,6 +1142,30 @@ impl FunKindVar {
     /// [`Self::upper`] with each edge's substitution.
     pub fn upper_edges(&self, solver: &Solver) -> Vec<(FunKind, crate::ccl::subst::Subst)> {
         self.bounds(solver).upper.clone()
+    }
+
+    /// Rewrite each kind recorded on an edge of this variable, below and above, through `f`:
+    /// a copy's candidates read under the copy's names for its definition's binders.
+    pub(crate) fn map_edge_kinds(
+        &self,
+        solver: &mut Solver,
+        mut f: impl FnMut(&mut Solver, &FunKind) -> FunKind,
+    ) {
+        let (lower, upper) = {
+            let b = self.bounds(solver);
+            (b.lower.clone(), b.upper.clone())
+        };
+        let lower: Vec<_> = lower
+            .iter()
+            .map(|(k, s)| (f(solver, k), s.clone()))
+            .collect();
+        let upper: Vec<_> = upper
+            .iter()
+            .map(|(k, s)| (f(solver, k), s.clone()))
+            .collect();
+        let b = &mut solver.funkind_state_mut(self).bounds;
+        b.lower = lower;
+        b.upper = upper;
     }
 
     /// Record that this kind is a copy of `original` — see
@@ -2157,6 +2193,20 @@ impl TraitRequirement {
                 .map(|(n, t)| (n.clone(), f(t)))
                 .collect(),
             at: self.at,
+        }
+    }
+
+    /// This requirement with each term argument and each binder through `name`: the names it
+    /// reads and the ones it binds.
+    pub fn map_names(&self, mut name: impl FnMut(&crate::ccl::Name) -> crate::ccl::Name) -> Self {
+        TraitRequirement {
+            terms: self.terms.iter().map(&mut name).collect(),
+            binders: self
+                .binders
+                .iter()
+                .map(|(n, t)| (name(n), t.clone()))
+                .collect(),
+            ..self.clone()
         }
     }
 
@@ -4368,10 +4418,11 @@ impl Type {
     pub fn consumer_fun(
         solver: &mut Solver,
         level: crate::ccl::infer_var::Level,
+        telescope: &crate::ccl::infer_var::Telescope,
         domain: Self,
         codomain: Self,
     ) -> Self {
-        let fun_kind = FunKind::fresh_data_at(solver, level);
+        let fun_kind = FunKind::fresh_data_at(solver, level, telescope);
         // The parts sit under the binders the kind may come to have.
         InferVar::place_parts_under(solver, &domain, &fun_kind);
         InferVar::place_parts_under(solver, &codomain, &fun_kind);
@@ -7619,21 +7670,21 @@ mod tests {
     #[test]
     fn cached_witness_positions_read_new_names_edges_and_copies() {
         let solver = &mut Solver::new();
-        let a = FunKindVar::fresh(solver, 0);
-        let b = FunKindVar::fresh(solver, 0);
+        let a = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
+        let b = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         a.record(solver, FunKind::Var(Rc::clone(&b)), true);
         let absent = *Witness::mint(TypeKind::UIntRanges).id();
         assert_eq!(a.binder_position(solver, &absent), None);
         let first = b.binder_id_at(solver, 0);
         assert_eq!(a.binder_position(solver, &first), Some(0));
 
-        let c = FunKindVar::fresh(solver, 0);
+        let c = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let second = c.binder_id_at(solver, 1);
         assert_eq!(a.binder_position(solver, &second), None);
         b.record(solver, FunKind::Var(Rc::clone(&c)), false);
         assert_eq!(a.binder_position(solver, &second), Some(1));
 
-        let original = FunKindVar::fresh(solver, 0);
+        let original = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let third = original.binder_id_at(solver, 2);
         assert_eq!(a.binder_position(solver, &third), None);
         c.copied_from(solver, &original);
@@ -7652,21 +7703,21 @@ mod tests {
     #[test]
     fn a_cached_kind_component_reads_new_binders_and_edges() {
         let solver = &mut Solver::new();
-        let a = FunKindVar::fresh(solver, 0);
-        let b = FunKindVar::fresh(solver, 0);
+        let a = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
+        let b = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         a.record(solver, FunKind::Var(Rc::clone(&b)), true);
         assert!(a.component_binder_ids(solver).is_empty());
 
         let first = b.binder_id_at(solver, 0);
         assert_eq!(a.component_binder_ids(solver), vec![first]);
 
-        let c = FunKindVar::fresh(solver, 0);
+        let c = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let second = c.binder_id_at(solver, 0);
         b.record(solver, FunKind::Var(Rc::clone(&c)), true);
         assert!(a.same_component(solver, &c));
         assert_eq!(a.component_binder_ids(solver), vec![first, second]);
 
-        let original = FunKindVar::fresh(solver, 0);
+        let original = FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty());
         let third = original.binder_id_at(solver, 0);
         c.copied_from(solver, &original);
         assert_eq!(a.component_binder_ids(solver), vec![first, second, third]);
@@ -8237,7 +8288,10 @@ mod tests {
     fn a_resolved_kind_follows_a_later_write_to_a_kind_it_reaches() {
         let solver = &mut Solver::new();
         let reaching = |solver: &mut Solver| {
-            let (k1, k2) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
+            let (k1, k2) = (
+                FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+                FunKindVar::fresh(solver, 0, &crate::ccl::infer_var::Telescope::empty()),
+            );
             k1.record(solver, FunKind::Var(Rc::clone(&k2)), true);
             assert_eq!(k1.resolved_in(solver), KindPin::Unpinned);
             (k1, k2)

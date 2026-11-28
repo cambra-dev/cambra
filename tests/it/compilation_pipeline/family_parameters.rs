@@ -1427,51 +1427,60 @@ fn an_inherited_quantified_requirement_passes_through_two_generic_definitions() 
     );
 }
 
-/// A def relying on its parameter type's family bound, inherited or restated, calls another
-/// twice, and each call specializes the callee at the groups' inner collections.
-///
-/// TODO(peeled-family-specialization): false rejection; the program computes 12. This is the bug
-/// `a_family_bound_passes_through_three_generic_definitions_through_an_annotated_statement` pins.
-/// A-normalization peels the temporaries of `total`'s body onto the spine ahead of its `=> Int`
-/// result annotation.
-#[rstest]
-#[case::inherited("")]
-#[case::restated(" requires forall (k: K) V(k) <: _ |=> Int")]
-fn an_inherited_family_bound_passes_through_two_generic_definitions(#[case] clause: &str) {
-    check_compile_error(
-        &formatdoc! {"
-            {BOUNDED_GROUPS}
-            def total(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
-                sum([sum([x for x in grp]) for grp in gs.extract()])
-            def twice(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
-                total(gs) + total(gs)
-            twice(Groups::new([box([1, 2]), box([3])]))
-        "},
-        "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
+/// A def taking `Groups` and relying on its family bound calls another twice, and each call
+/// specializes the callee at the groups' inner collections. `clause` is each def's `requires`
+/// clause, and `body` is the lines of `total`'s body.
+fn two_generic_definitions(clause: &str, body: &[&str]) -> String {
+    let body: String = body.iter().map(|line| format!("    {line}\n")).collect();
+    formatdoc! {"
+        {BOUNDED_GROUPS}
+        def total(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
+        {body}def twice(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
+            total(gs) + total(gs)
+        twice(Groups::new([box([1, 2]), box([3])]))
+    "}
+}
+
+/// `total`'s body as one expression.
+const TOTAL_EXPRESSION: &[&str] = &["sum([sum([x for x in grp]) for grp in gs.extract()])"];
+
+/// `total`'s result bound by an annotated statement.
+const TOTAL_STATEMENT: &[&str] = &[
+    "s: Int = sum([sum([x for x in grp]) for grp in gs.extract()])",
+    "s + 0",
+];
+
+/// The family bound the defs rely on is inherited from `Groups`.
+#[test]
+fn an_inherited_family_bound_passes_through_two_generic_definitions() {
+    check_scalar(
+        &two_generic_definitions("", TOTAL_EXPRESSION),
+        Value::Int(12),
     );
 }
 
-/// `an_inherited_family_bound_passes_through_two_generic_definitions` with `total`'s result
+/// [`an_inherited_family_bound_passes_through_two_generic_definitions`] with `total`'s result
 /// bound by an annotated statement.
+#[test]
+fn an_inherited_family_bound_passes_through_two_generic_definitions_through_an_annotated_statement()
+{
+    check_scalar(
+        &two_generic_definitions("", TOTAL_STATEMENT),
+        Value::Int(12),
+    );
+}
+
+/// The defs restate the family bound in their `requires` clauses.
 ///
-/// TODO(peeled-family-specialization): false rejection; the program computes 12. This is the bug
-/// `a_family_bound_passes_through_three_generic_definitions_through_an_annotated_statement` pins.
+/// TODO(peeled-family-specialization): false rejection; the program computes 12.
+/// A-normalization peels the temporaries of `total`'s body onto the spine ahead of its `=> Int`
+/// result annotation.
 #[rstest]
-#[case::inherited("")]
-#[case::restated(" requires forall (k: K) V(k) <: _ |=> Int")]
-fn an_inherited_family_bound_passes_through_two_generic_definitions_through_an_annotated_statement(
-    #[case] clause: &str,
-) {
+#[case::an_expression(TOTAL_EXPRESSION)]
+#[case::an_annotated_statement(TOTAL_STATEMENT)]
+fn a_restated_family_bound_passes_through_two_generic_definitions(#[case] body: &[&str]) {
     check_compile_error(
-        &formatdoc! {"
-            {BOUNDED_GROUPS}
-            def total(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
-                s: Int = sum([sum([x for x in grp]) for grp in gs.extract()])
-                s + 0
-            def twice(K, V: K => Type, gs: Groups(K, V)) => Int{clause}:
-                total(gs) + total(gs)
-            twice(Groups::new([box([1, 2]), box([3])]))
-        "},
+        &two_generic_definitions(" requires forall (k: K) V(k) <: _ |=> Int", body),
         "Type mismatch for this use: expected ‹outer keys›, found ‹outer keys›",
     );
 }

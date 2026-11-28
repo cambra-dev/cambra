@@ -199,7 +199,10 @@ fn a_shared_kind_var_resolves_the_same_way_in_every_order() {
         let scope = Telescope::empty();
         let v0 = Type::Infer(InferVar::fresh_in(solver, 0, &scope));
         let v1 = Type::Infer(InferVar::fresh_in(solver, 0, &scope));
-        let (k1, k2) = (FunKindVar::fresh(solver, 0), FunKindVar::fresh(solver, 0));
+        let (k1, k2) = (
+            FunKindVar::fresh(solver, 0, &Telescope::empty()),
+            FunKindVar::fresh(solver, 0, &Telescope::empty()),
+        );
         let mut rejected = false;
         for &i in order {
             let r = match i {

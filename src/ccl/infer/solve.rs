@@ -45,10 +45,18 @@ use crate::ccl::Duplicate;
 /// failure to resolve a node's type is pushed by [`CoalesceCtx::push_read_error`], which
 /// drops the nodes that only carry a defect already reported.
 fn push_coalesce_err(errors: &mut Vec<LocatedInferError>, new_err: InferError, blame: NodeId) {
+    // An instance binds its own copy of each opaque binder its definition binds, so the copies
+    // of one binder escaping are one defect at one site: the same blamed node, the binders
+    // spelled alike.
+    fn spelled(names: &[Name]) -> Vec<&str> {
+        names.iter().map(Name::base).collect()
+    }
     if let InferError::OpaqueEscape { names, .. } = &new_err
-        && errors.iter().any(
-            |e| matches!(&e.error, InferError::OpaqueEscape { names: seen, .. } if seen == names),
-        )
+        && errors.iter().any(|e| {
+            e.node_id == blame
+                && matches!(&e.error, InferError::OpaqueEscape { names: seen, .. }
+                    if spelled(seen) == spelled(names))
+        })
     {
         return;
     }
@@ -1803,12 +1811,14 @@ pub(super) fn check_scope_valid(
     scope: &BTreeSet<Name>,
     errors: &mut Vec<LocatedInferError>,
 ) {
-    // Opaque and failed definitions have no value to discharge (ScopeExit::Keep), so
-    // their names can occur in types above their lets. A failed definition is present
-    // only in an error-bearing tree; admitting its name does not admit a successful
-    // transparent definition whose name escaped substitution.
+    // A failed definition has no value to discharge (ScopeExit::Keep), so its name can occur
+    // in types above its `let`. It is present only in an error-bearing tree; admitting its name
+    // does not admit a successful transparent definition whose name escaped substitution. An
+    // opaque binder is bound by its function body, or by the tree's top level, as inference
+    // binds it ([`crate::ccl::infer_var::body_opaque_binders`]).
     let mut scope = scope.clone();
     collect_kept_let_binders(expr, &mut scope);
+    scope.extend(crate::ccl::infer_var::body_opaque_binders(expr));
     check_scope_valid_go(expr, &scope, errors)
 }
 
@@ -1823,7 +1833,7 @@ fn collect_kept_let_binders(expr: &Expr, out: &mut BTreeSet<Name>) -> bool {
     {
         let failed = collect_kept_let_binders(bound_expr, out);
         let body_failed = collect_kept_let_binders(body, out);
-        if binding.transparency == BindingTransparency::Opaque || failed {
+        if failed {
             out.insert(binding.name.clone());
         }
         return failed || body_failed;
@@ -1834,6 +1844,17 @@ fn collect_kept_let_binders(expr: &Expr, out: &mut BTreeSet<Name>) -> bool {
 }
 
 fn check_scope_valid_go(expr: &Expr, scope: &BTreeSet<Name>, errors: &mut Vec<LocatedInferError>) {
+    // A function body binds its opaque binders for the whole of itself.
+    let with_body_binders;
+    let scope = match &expr.node {
+        TypedExprNode::Lambda { body, .. } => {
+            let mut s = scope.clone();
+            s.extend(crate::ccl::infer_var::body_opaque_binders(body));
+            with_body_binders = s;
+            &with_body_binders
+        }
+        _ => scope,
+    };
     // The construction boundary holds from the outside too: a coalesced type is
     // stored, so every dependent function in it spells its own binder as an index.
     // The opening tripwires (`subst::open_codomain`, this file's `Fun`/`Fun` arm)
@@ -4173,6 +4194,9 @@ pub(super) fn specialize_use(
     let param_telescope = frame.telescope.entered(entered_binders.iter().cloned());
     let mut fresh = FreshenCache {
         own_params: Some(Rc::clone(&frame.own_params)),
+        // The clone binds its own copy of each binder its definition binds, as an instantiation
+        // does: the ones the scope it stands in does not hold.
+        definition_site: Some(param_telescope.clone()),
         param_telescope: Some(param_telescope),
         entered_binders,
         use_at: Some(use_expr.node_id()),
@@ -4202,7 +4226,41 @@ pub(super) fn specialize_use(
     };
     #[cfg(debug_assertions)]
     let before = crate::ccl::infer::solver::scheme::Minted::now();
+    fresh.name_definition_binders(crate::ccl::scope::bound_names(&clone));
     freshen_expr_type_slots(solver, &mut clone, cutoff, target, &mut fresh);
+    if !fresh.binders.is_empty() {
+        crate::ccl::infer::solver::scheme::rename_instance_binders(solver, &fresh);
+        let renames: crate::ccl::scope::Renames = fresh
+            .binders
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        crate::ccl::scope::rename_binders(&mut clone, &renames, crate::ccl::Ids::Fresh);
+        // A type slot holding a variable the clone shares with the definition reads it under the
+        // renames, as an instantiation's types do.
+        fn read_shared(solver: &mut Solver, e: &mut Expr, renames: &crate::ccl::scope::Renames) {
+            e.walk_type_slots_mut(|t| {
+                *t = crate::ccl::infer::solver::scheme::instance_type(solver, t, renames);
+            });
+            e.walk_children_mut(|c| read_shared(solver, c, renames));
+        }
+        read_shared(solver, &mut clone, &renames);
+        // What coalescing records of a binding by its name, the clone's binding under its own
+        // name: where a generalized definition stands, whether it is bound at its annotation, and
+        // whether it is an instance's function.
+        for (from, to) in &renames {
+            if let Some(telescope) = ctx.definition_telescopes.get(from).cloned() {
+                let copied = fresh.copied_telescope(&telescope);
+                ctx.definition_telescopes.insert(to.clone(), copied);
+            }
+            if ctx.bound_at_annotation.contains(from) {
+                ctx.bound_at_annotation.insert(to.clone());
+            }
+            if ctx.instance_functions.contains(from) {
+                ctx.instance_functions.insert(to.clone());
+            }
+        }
+    }
     // The clone is this use's own: nothing above the cutoff is shared with the definition.
     #[cfg(debug_assertions)]
     crate::ccl::infer::solver::scheme::assert_copied_apart_from(

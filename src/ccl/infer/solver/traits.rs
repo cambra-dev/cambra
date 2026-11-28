@@ -2237,9 +2237,42 @@ impl TraitObligation {
     /// Rewrite every type its assumptions state through `f`: a specialization clone
     /// re-mints the type parameters of the definitions nested in it, and its copy of
     /// an obligation must name the clone's parameters, not the original's.
+    /// Rewrite the substitution each watched operand is read under through `f`: a copy's frames
+    /// spell the copy's binders ([`frames`](Self::frames)).
+    pub(crate) fn map_frames(
+        &self,
+        mut f: impl FnMut(&crate::ccl::subst::Subst) -> crate::ccl::subst::Subst,
+    ) {
+        for frame in self.frames.borrow_mut().values_mut() {
+            *frame = f(frame);
+        }
+    }
+
+    /// Rewrite the family application each held answer is at through `f`: a copy's held answers
+    /// stand at its own spelling of the terms.
+    pub(crate) fn map_held_apps(
+        &self,
+        mut f: impl FnMut(&crate::ccl::ty::FamilyApp) -> crate::ccl::ty::FamilyApp,
+    ) {
+        for held in self.held.borrow_mut().values_mut() {
+            match held {
+                Held::AtOneKey { app } | Held::Settled { app } => *app = f(app),
+                Held::Nothing | Held::AtTheBound => {}
+            }
+        }
+    }
+
     pub(crate) fn map_assumptions(&self, mut f: impl FnMut(&Type) -> Type) {
+        self.map_assumption_rows(|r| r.map_types(&mut f));
+    }
+
+    /// Rewrite each assumption and each row of the context through `f`.
+    pub(crate) fn map_assumption_rows(
+        &self,
+        mut f: impl FnMut(&TraitRequirement) -> TraitRequirement,
+    ) {
         let mut map = |rows: &[Rc<TraitRequirement>]| -> Vec<Rc<TraitRequirement>> {
-            rows.iter().map(|r| Rc::new(r.map_types(&mut f))).collect()
+            rows.iter().map(|r| Rc::new(f(r))).collect()
         };
         let assumptions = map(&self.assumptions.borrow());
         let context = map(&self.context.borrow());
@@ -5432,7 +5465,11 @@ mod tests {
         let node_id = provenance::NodeId::fresh();
         let x = Name::raw("x");
         let telescope = crate::ccl::infer_var::Telescope::empty().extended(x.clone());
-        let kind = crate::ccl::ty::FunKindVar::fresh(solver, 0);
+        let kind = crate::ccl::ty::FunKindVar::fresh(
+            solver,
+            0,
+            &crate::ccl::infer_var::Telescope::empty(),
+        );
         let v = InferVar::fresh_over(solver, 0, &telescope, kind);
         let operand = Type::Infer(Rc::clone(&v));
         let ob = TraitObligation::new(

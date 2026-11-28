@@ -45,9 +45,7 @@ pub struct SolverVar<V: Solved> {
     /// The scope level the variable was minted at. A monomorphic binding can lower it
     /// ([`SolverVar::lower_level`]); the lowered level is the solver's.
     pub(crate) initial_level: Level,
-    /// The binders in scope where the variable stands: what a fact recorded on it may name. Only
-    /// a type variable's is read: no fact recorded on a funkind variable or a capability variable
-    /// is read against a scope.
+    /// The binders in scope where the variable stands: what a fact recorded on it may name.
     pub telescope: Telescope,
     /// What this sort of variable carries besides ([`Solved::Fixed`]).
     pub(crate) fixed: V::Fixed,
