@@ -2712,20 +2712,14 @@ When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles 
 2. Views that differ only in entries the holder cannot name act alike on it, so
    `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. The entries compared are
    the ones `Subst::acting_on` keeps.
-3. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
-   renames at this site. This is an existing restricted transport assumption, not general
-   invertibility of discharge.
-4. If either view is invertible, compose its inverse forward with the other view.
-5. Otherwise, split rename and discharge parts. Equal discharge parts, compared modulo term type
+3. If either view is invertible, compose its inverse forward with the other view. A discharge is
+   not invertible, including one whose term is a bare variable
+   ([An edge through a discharge is a fact about an instance](#an-edge-through-a-discharge-is-a-fact-about-an-instance)).
+4. Otherwise, split rename and discharge parts. Equal discharge parts, compared modulo term type
    slots, permit a bridge through an invertible rename part.
-6. Whole views equal modulo type slots also need no bridge.
-7. Distinct non-invertible views are two instances of `𝑉`: `L <: 𝑉[𝑎]` and `𝑉[𝑏] <: 𝑈` relate
+5. Whole views equal modulo type slots also need no bridge.
+6. Distinct non-invertible views are two instances of `𝑉`: `L <: 𝑉[𝑎]` and `𝑉[𝑏] <: 𝑈` relate
    nothing, and the closure draws no edge (`bridge_holder_gap` answers `None`).
-
-The licensed view is required by existing extrusion and per-occurrence dependent uses.
-Removing it without another representation reactivates those failures. Its source contract is
-limited to the current monomorphic treatment of the indexed family; first-class polymorphic
-dependent uses require a separate design.
 
 `ConstrainCache` records the side-substitution pairs seen for each `(lhs, rhs)` type pair.
 Two applications such as `g(0)` and `g(1)` must not collapse solely because the underlying variable
@@ -2741,14 +2735,9 @@ substitution leaves it. Both sides of a dependent application discharge the para
 naming it is in the post-discharge context once its own substitution has acted.
 Dropping the whole mixed substitution would also drop useful renames.
 
-A bound under a discharge states a fact about an instance `𝑉[σ]`. Compaction reads it as `𝑉`'s
-own content exactly where `σ` leaves `𝑉`'s content unchanged: its binders are outside `𝑉`'s scope,
-or `𝑉`'s own content does not name them. `content_mentions` decides the second by walking `𝑉`'s
-bounds that are its own, mapping the queried names back through each bound's rendering
-substitution; it applies nothing, so it mints no suspension. An elimination
-([An elimination reads a sum through a term](#an-elimination-reads-a-sum-through-a-term)) acts on
-`𝑉` unless `𝑉`'s funkind settled plain. A fact about `𝑉[σ]` stays out of `𝑉`'s answer and reaches
-the variable that stands for the instance.
+A bound under a discharge is a fact about an instance of its holder, which compaction reads as
+[An edge through a discharge is a fact about an instance](#an-edge-through-a-discharge-is-a-fact-about-an-instance)
+states.
 
 Bound eligibility depends on the holder's own content and the bound's holder substitution.
 The graph is fixed during a compaction walk, so `CompactState::own_bounds` caches this decision
@@ -2759,6 +2748,38 @@ eligible bound under their own accumulated substitution. A later walk checks eli
 composite at refinement leaves. `RefinementScope` then closes references against the functions
 enclosing that position. Identity transport preserves an unchanged predicate.
 
+#### An edge through a discharge is a fact about an instance
+
+An edge `𝐿‹ℓ› <: 𝑉‹σ›` whose holder side `σ` discharges a binder of `𝑉`'s telescope
+(`Subst::discharges_binder_of`) states `𝐿[ℓ] <: 𝑉[σ]`, a fact about the instance `𝑉[σ]`. The same
+holds for an upper edge. Each reader of a variable's bounds treats such an edge as follows:
+
+- **Closure** uses it like any other edge. Substitution preserves subtyping, so `𝐿 <: 𝑉` and
+  `𝑉[σ] <: 𝑈` give `𝐿[σ] <: 𝑈`. The edge is recorded on `𝑉`, so a bound that reaches `𝑉` later
+  closes against it.
+- **The record-time scope check** reads the bound's names in the edge's frame
+  (`Bound::content_names`) against the instance's context (`Subst::instance_telescope`): `𝑉`'s
+  telescope with `σ`'s binders removed and the names their images read added, as a suspension's
+  telescope is
+  ([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
+- **Compaction** reads it as `𝑉`'s own content only where `𝑉[σ]` is `𝑉`, and where its content
+  names nothing outside `𝑉`'s context. `𝑉[σ]` is `𝑉` where `σ`'s binders are outside `𝑉`'s scope,
+  or where `𝑉`'s own content does not name them. `content_mentions` decides the second by walking
+  `𝑉`'s own bounds and mapping the queried names back through each bound's rendering
+  substitution. It applies nothing, so it mints no suspension. An elimination
+  ([An elimination reads a sum through a term](#an-elimination-reads-a-sum-through-a-term)) acts
+  on `𝑉` unless `𝑉`'s funkind settled plain. The content's names are its own names and what each
+  variable it holds reads (`ContentWalk::reads_of`), both in the edge's frame. A fact about `𝑉[σ]`
+  that compaction does not read stays out of `𝑉`'s answer and reaches the variable that stands
+  for the instance.
+- **The domain join** over `𝑉`'s lower bounds (`distinct_data_domains`) skips it: its domain is the
+  instance's, another type.
+
+No reader treats a discharge as a rename. Inverting `[𝑥 ↦ 𝑦]` restates a fact at the value `𝑦`
+takes as a fact at every value of `𝑥`. It also gives the renamed occurrence the type it had as
+`𝑦` (`Mapping::as_expr`), where a call's argument carries a witness binder the parameter's type
+does not.
+
 #### Discharge is application
 
 A discharge-bearing bound represents applying a dependent type to a term argument. Its substitution
@@ -2766,9 +2787,8 @@ domain accounts for names permitted in the stored type before that application i
 `Subst::invert` does not invert a discharge; it accepts only injective rename mappings.
 
 Pi indices do not eliminate every name-based transport operation. Live bounds still name
-telescope entries, and the closure bridge still uses `Subst::aligned` and the restricted
-`licensed_correspondence_view` where appropriate. The cases and failure mode are specified under
-[Native bound edges and closure](#native-bound-edges-and-closure).
+telescope entries, and the closure bridge still uses `Subst::aligned`. The cases and failure mode
+are specified under [Native bound edges and closure](#native-bound-edges-and-closure).
 
 #### A substitution reaching a variable suspends on it
 
