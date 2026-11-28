@@ -3778,37 +3778,6 @@ pub fn own_state_as_module(
     ty.walk_children_mut(|child| own_state_as_module(solver, child, own));
 }
 
-/// The highest level of a capability variable standing at an input of `ty`: in a function type
-/// at a negative position, as a parameter's type is. A definition whose parameter's clause is
-/// left open by its body is polymorphic in it, as it is in an open type
-/// (`docs/chl-spec.md`, "Writing requirements and effects"), and `type_level` leaves capabilities
-/// out.
-pub fn input_capability_level(solver: &Solver, ty: &crate::ccl::Type) -> Level {
-    fn go(solver: &Solver, ty: &crate::ccl::Type, positive: bool) -> Level {
-        match ty {
-            crate::ccl::Type::Fun {
-                domain,
-                codomain,
-                capabilities,
-                ..
-            } => {
-                let own = match capabilities.repr() {
-                    Repr::Var(v) if !positive => v.level(solver),
-                    _ => 0,
-                };
-                own.max(go(solver, domain, !positive))
-                    .max(go(solver, codomain, positive))
-            }
-            other => {
-                let mut level = 0;
-                other.walk_children(|child| level = level.max(go(solver, child, positive)));
-                level
-            }
-        }
-    }
-    go(solver, ty, true)
-}
-
 impl crate::ccl::infer::solver::held::HoldsSolverState for Capabilities {
     fn walk_held(&self, v: &mut dyn crate::ccl::infer::solver::held::HeldVisitor) {
         use crate::ccl::infer::solver::held::Held;

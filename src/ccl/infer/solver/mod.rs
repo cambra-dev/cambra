@@ -76,33 +76,18 @@ pub use simplify_type::simplify_type;
 pub use spec_key::{SpecKey, spec_key};
 pub use state::Solver;
 
-/// The level of `ty` — the maximum scope level of any inference variable
-/// occurring inside it. Leaves and `Hole` are level 0; `Refinement` defers
-/// to its inner type (refinements are lattice-blind). Used by `extrude` and by
-/// let-generalization (`infer::context::should_generalize`, which generalizes
-/// a binding when its type's level exceeds the binding level).
+/// The level of `ty`: the deepest scope level of any solver variable it holds, an inference
+/// variable or a function type's funkind or capability variable. Leaves and `Hole` are level
+/// 0; `Refinement` defers to its inner type (refinements are lattice-blind). Extrusion compares
+/// it with its target, since each of those variables crosses a level boundary through a proxy,
+/// and let-generalization with the binding level (`infer::context::should_generalize`).
 pub fn type_level(solver: &Solver, ty: &Type) -> Level {
-    level_of(solver, ty, false)
-}
-
-/// The level [`constrain::extrude`] compares with its target: [`type_level`], and the level of
-/// each funkind variable and capability variable a function type in `ty` holds where
-/// [`type_level`] reads its domain and codomain. Each of those crosses a level boundary through
-/// a proxy, as an inference variable does. [`type_level`] leaves them out: a definition's
-/// effects and its functions' kinds decide nothing about whether it is polymorphic.
-pub(crate) fn extrusion_level(solver: &Solver, ty: &Type) -> Level {
-    level_of(solver, ty, true)
-}
-
-/// [`type_level`], counting each function type's funkind and capability variables where
-/// `parts`.
-fn level_of(solver: &Solver, ty: &Type, parts: bool) -> Level {
     match ty {
         Type::Infer(v) => v.level(solver),
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.
-        Type::BoundedHole(t) => level_of(solver, t, parts),
+        Type::BoundedHole(t) => type_level(solver, t),
         // An output annotation's barrier is minted at the level it is normalized at.
         Type::BarrierHole(_) => 0,
         Type::Fun {
@@ -112,63 +97,54 @@ fn level_of(solver: &Solver, ty: &Type, parts: bool) -> Level {
             capabilities,
             ..
         } => {
-            let own = if parts {
-                let kind = match fun_kind {
-                    crate::ccl::ty::FunKind::Var(kind) => kind.level(solver),
-                    _ => 0,
-                };
-                let capabilities = match capabilities.repr() {
-                    crate::ccl::capabilities::Repr::Var(v) => v.level(solver),
-                    _ => 0,
-                };
-                kind.max(capabilities)
-            } else {
-                0
+            let kind = match fun_kind {
+                crate::ccl::ty::FunKind::Var(kind) => kind.level(solver),
+                _ => 0,
+            };
+            let own = match capabilities.repr() {
+                crate::ccl::capabilities::Repr::Var(v) => kind.max(v.level(solver)),
+                _ => kind,
             };
             fun_kind
                 .witnesses()
                 .iter()
                 .flat_map(|w| w.types())
-                .map(|t| level_of(solver, t, parts))
+                .map(|t| type_level(solver, t))
                 .fold(own, Level::max)
-                .max(level_of(solver, d, parts))
-                .max(level_of(solver, c, parts))
+                .max(type_level(solver, d))
+                .max(type_level(solver, c))
         }
-        Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => ts
-            .iter()
-            .map(|t| level_of(solver, t, parts))
-            .max()
-            .unwrap_or(0),
-        Type::Split { input, output } => {
-            level_of(solver, input, parts).max(level_of(solver, output, parts))
+        Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => {
+            ts.iter().map(|t| type_level(solver, t)).max().unwrap_or(0)
         }
+        Type::Split { input, output } => type_level(solver, input).max(type_level(solver, output)),
         Type::DepTuple(cs) => cs
             .iter()
-            .map(|(_, t)| level_of(solver, t, parts))
+            .map(|(_, t)| type_level(solver, t))
             .max()
             .unwrap_or(0),
         Type::Family { binders, body } => binders
             .iter()
-            .map(|(_, t)| level_of(solver, t, parts))
+            .map(|(_, t)| type_level(solver, t))
             .max()
             .unwrap_or(0)
-            .max(level_of(solver, body, parts)),
+            .max(type_level(solver, body)),
         Type::Record(fs) => fs
             .iter()
-            .map(|(_, t)| level_of(solver, t, parts))
+            .map(|(_, t)| type_level(solver, t))
             .max()
             .unwrap_or(0),
         Type::Variant(tags, _) => tags
             .iter()
-            .map(|(_, t)| level_of(solver, t, parts))
+            .map(|(_, t)| type_level(solver, t))
             .max()
             .unwrap_or(0),
-        Type::Refinement(inner, _) => level_of(solver, inner, parts),
+        Type::Refinement(inner, _) => type_level(solver, inner),
         // Combine both children like `Fun` (domain + codomain): a later
         // increment's per-call-site domain generalization depends on the
         // `domain`'s level surfacing here, so a fresh domain var pins the
         // level of the enclosing `Mut`.
-        Type::History { function, .. } => level_of(solver, function, parts),
+        Type::History { function, .. } => type_level(solver, function),
         // A channel domain stores its introduction level, but deliberately
         // reports 0 here: `type_level` drives extrusion and bound-recording
         // level scoping, and a rigid atom must flow through bounds to
@@ -192,7 +168,7 @@ fn level_of(solver: &Solver, ty: &Type, parts: bool) -> Level {
         Type::Param(param) => param.level(),
         Type::Poly(poly) => poly
             .types()
-            .map(|t| level_of(solver, t, parts))
+            .map(|t| type_level(solver, t))
             .max()
             .unwrap_or(0),
         Type::Base(_)

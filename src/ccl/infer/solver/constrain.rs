@@ -31,11 +31,11 @@ use crate::ccl::{
 };
 
 use super::barrier::EdgeReport;
-use super::extrusion_level;
 use super::smt::{ScopeEnv, SmtError};
 use super::traits::{
     Trait, link_barrier_watches, link_watches, notify_barrier_lower, notify_lower, notify_upper,
 };
+use super::type_level;
 use crate::ccl::FieldKey;
 
 // ---------------------------------------------------------------------------
@@ -2627,7 +2627,7 @@ fn constrain_go_impl(
         (Type::Infer(barrier), rhs)
             if barrier.is_barrier()
                 && !is_ordinary_var(rhs)
-                && extrusion_level(solver, rhs) <= barrier.level(solver) =>
+                && type_level(solver, rhs) <= barrier.level(solver) =>
         {
             let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
                 .with_origin(cache.origins.1);
@@ -2643,7 +2643,7 @@ fn constrain_go_impl(
         (lhs, Type::Infer(barrier))
             if barrier.is_barrier()
                 && !is_ordinary_var(lhs)
-                && extrusion_level(solver, lhs) <= barrier.level(solver) =>
+                && type_level(solver, lhs) <= barrier.level(solver) =>
         {
             let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
                 .with_origin(cache.origins.0);
@@ -2669,9 +2669,7 @@ fn constrain_go_impl(
         // existing lower (`low.ty‹low.ty_subst› <: V‹low.self_subst›`) against
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
-        (Type::Infer(lv), _)
-            if !lv.is_barrier() && extrusion_level(solver, rhs) <= lv.level(solver) =>
-        {
+        (Type::Infer(lv), _) if !lv.is_barrier() && type_level(solver, rhs) <= lv.level(solver) => {
             // The content side keeps what can act on `rhs` (`Subst::acting_on_type`).
             let sr = &sr.acting_on_type(solver, rhs);
             let lows = {
@@ -2777,9 +2775,7 @@ fn constrain_go_impl(
         // edge's forward morphism was reconstructed by inverting its stored
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
-        (_, Type::Infer(rv))
-            if !rv.is_barrier() && extrusion_level(solver, lhs) <= rv.level(solver) =>
-        {
+        (_, Type::Infer(rv)) if !rv.is_barrier() && type_level(solver, lhs) <= rv.level(solver) => {
             // The content side keeps what can act on `lhs` (`Subst::acting_on_type`).
             let sl = &sl.acting_on_type(solver, lhs);
             let ups = {
@@ -3263,7 +3259,7 @@ fn record_guarded_upper(
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     // An upper bound sits at or below its holder's level, as the upper-bound arm keeps it.
-    let rhs = if extrusion_level(solver, rhs) > lv.level(solver) {
+    let rhs = if type_level(solver, rhs) > lv.level(solver) {
         if let Some(param) = escaping_param(rhs, lv.level(solver)) {
             return Err(ConstrainError::TypeParamEscapes { param });
         }
@@ -3483,7 +3479,7 @@ pub fn extrude(
     target_level: Level,
     cache: &mut ExtrudeCache,
 ) -> Type {
-    if extrusion_level(solver, ty) <= target_level {
+    if type_level(solver, ty) <= target_level {
         return ty.clone();
     }
     match ty {
@@ -3997,7 +3993,7 @@ fn lower_chan_levels(ty: &mut Type, level: Level) {
 }
 
 fn lower_var_levels(solver: &mut Solver, ty: &Type, level: Level) {
-    if extrusion_level(solver, ty) <= level {
+    if type_level(solver, ty) <= level {
         return;
     }
     if let Type::Infer(v) = ty {
@@ -4081,7 +4077,7 @@ fn extrude_invariant(
     target_level: Level,
     cache: &mut ExtrudeCache,
 ) -> Type {
-    if extrusion_level(solver, ty) <= target_level {
+    if type_level(solver, ty) <= target_level {
         return ty.clone();
     }
     match ty {
@@ -4274,7 +4270,6 @@ mod tests {
 
     use super::*;
     use crate::ccl::infer::solver::test_helpers::{record, refined, variant};
-    use crate::ccl::infer::solver::type_level;
     use crate::ccl::infer::solver::{coalesce_compact, compact_type, fresh_var, fun, prim};
     use crate::ccl::subst::Subst;
     use crate::ccl::{
@@ -4310,9 +4305,10 @@ mod tests {
             capabilities: Capabilities::none(),
         };
         let nested = Type::Tuple(vec![function]);
-        assert_eq!(type_level(solver, &nested), 0);
+        assert_eq!(type_level(solver, &nested), 2);
         lower_levels(solver, &nested, 0);
         assert_eq!(kind.level(solver), 0);
+        assert_eq!(type_level(solver, &nested), 0);
     }
 
     /// Extrusion gives a function's kind above the target a proxy at the target, which binds the
@@ -4339,7 +4335,7 @@ mod tests {
                 } else {
                     extrude(solver, &function, true, 0, &mut ExtrudeCache::new())
                 };
-                assert_eq!(extrusion_level(solver, &extruded), 0);
+                assert_eq!(type_level(solver, &extruded), 0);
                 assert_eq!(kind.level(solver), 2);
                 let Type::Fun {
                     fun_kind: FunKind::Var(proxy),

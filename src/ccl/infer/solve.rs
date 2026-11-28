@@ -6491,8 +6491,14 @@ mod tests {
             ),
         );
         run_inference(&mut e).expect("projection-through-identity program type-checks");
+        // `g` generalizes too, its body's capability variable standing above the binding
+        // level, and its clone's domain is `Int`: the assertion is about `f`'s, the tuple.
+        let tuple_domains: Vec<Type> = collect_mono_param_types(&e)
+            .into_iter()
+            .filter(|t| matches!(t, Type::Tuple(_)))
+            .collect();
         assert_eq!(
-            collect_mono_param_types(&e),
+            tuple_domains,
             vec![Type::Tuple(vec![
                 int_lit_ty(0),
                 int_lit_ty(1),
