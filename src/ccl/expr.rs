@@ -2673,7 +2673,15 @@ impl TypedExpr {
     /// enclosing binding. That is what lets a value-returning recursion (a
     /// find-by-id that yields `Option<&TypedExpr>`) go through this form instead
     /// of needing the allocating one.
-    pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a TypedExpr)) {
+    ///
+    /// A walk recursing through it takes a frame per level of the tree, and a program decides
+    /// how deep that is: the stack grows on demand here, so every such walk grows it.
+    pub fn walk_children<'a>(&'a self, f: impl FnMut(&'a TypedExpr)) {
+        stacker::maybe_grow(512 * 1024, 1024 * 1024, || self.walk_children_here(f))
+    }
+
+    /// [`walk_children`](Self::walk_children) on the current stack.
+    fn walk_children_here<'a>(&'a self, mut f: impl FnMut(&'a TypedExpr)) {
         match &self.node {
             // Each generator's `iter` then its guards, then the element — source
             // order, which is the order the binders come into scope and what lets
@@ -2890,7 +2898,14 @@ impl TypedExpr {
     /// that need to mutate a `Lambda` parameter's `ty`, `Let.binding.ty`, or the refinement
     /// predicate must handle those explicitly before (or after) calling this
     /// method.
-    pub fn walk_children_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
+    ///
+    /// The stack grows on demand, as in `walk_children`.
+    pub fn walk_children_mut<'a>(&'a mut self, f: impl FnMut(&'a mut TypedExpr)) {
+        stacker::maybe_grow(512 * 1024, 1024 * 1024, || self.walk_children_mut_here(f))
+    }
+
+    /// [`walk_children_mut`](Self::walk_children_mut) on the current stack.
+    fn walk_children_mut_here<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
         match &mut self.node {
             TypedExprNode::Comprehension {
                 generators,
