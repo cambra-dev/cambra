@@ -642,7 +642,7 @@ fn key_go(
         | Type::ChanDom(..)
         | Type::Param(_)
         | Type::Txn => KeyView::from_atom(
-            AtomKey::from_type(ty).expect("every atomic type classifies as an AtomKey"),
+            AtomKey::from_type(solver, ty).expect("every atomic type classifies as an AtomKey"),
         ),
         Type::Poly(_) => unreachable!("a polymorphic type reached `spec_key`"),
         // A `Hole` contributes nothing — the same "no information here" the
@@ -692,10 +692,13 @@ fn key_go(
         }
         // An opened family parameter's application is rigid inside the definition it is
         // opened for, as the parameter is, and keys as the atom compaction makes of it.
-        Type::FamilyApp(_) => KeyView::from_atom(
-            AtomKey::from_type(&subst_acc.apply_type_in(solver, ty))
-                .expect("a family application classifies as an AtomKey"),
-        ),
+        Type::FamilyApp(_) => {
+            let applied = subst_acc.apply_type_in(solver, ty);
+            KeyView::from_atom(
+                AtomKey::from_type(solver, &applied)
+                    .expect("a family application classifies as an AtomKey"),
+            )
+        }
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the

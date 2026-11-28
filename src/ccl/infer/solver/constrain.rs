@@ -839,7 +839,12 @@ fn kind_edge_subst(solver: &mut Solver, own: &Subst, far: &Type, far_subst: &Sub
 // Kept out of line: `constrain_go_impl` recurses through every type, and the edge's
 // `Filter` would otherwise widen each of its frames.
 #[inline(never)]
-fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &ConstrainCache) {
+fn constrain_capabilities(
+    solver: &mut Solver,
+    e0: &Capabilities,
+    e1: &Capabilities,
+    cache: &ConstrainCache,
+) {
     if !cache.relates_capabilities {
         return;
     }
@@ -847,6 +852,7 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &Constrai
         // Each label crossing the edge entered at the value's node: an argument passed where
         // a written function type bounds it is where a label beyond the bound is reported.
         (Repr::Var(v0), Repr::Var(v1)) => v1.flows_from(
+            solver,
             v0,
             Filter {
                 at: match cache.origins.0 {
@@ -858,7 +864,7 @@ fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &Constrai
         ),
         (Repr::Known(set), Repr::Var(v1)) => {
             for item in set.items() {
-                v1.record(LocatedCapability { item, at: None });
+                v1.record(solver, LocatedCapability { item, at: None });
             }
         }
         // A known set is a type the compiler built or materialized, which bounds nothing: a
@@ -1901,7 +1907,7 @@ fn constrain_go_impl(
             if n0.parameter_count() != n1.parameter_count() {
                 return Err(mismatch(solver, lhs, rhs, sl, sr));
             }
-            constrain_capabilities(e0, e1, cache);
+            constrain_capabilities(solver, e0, e1, cache);
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
             // and the edge carries that correspondence in its own substitution — the Σ
@@ -2569,7 +2575,7 @@ fn constrain_go_impl(
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(solver, rhs) <= lv.level(solver) => {
-            crate::ccl::capabilities::lower_capability_levels(rhs, lv.level(solver));
+            crate::ccl::capabilities::lower_capability_levels(solver, rhs, lv.level(solver));
             let lows = {
                 let bound = Bound::edge(solver, sl.clone(), rhs.clone(), sr.clone())
                     .with_origin(cache.origins.1);
@@ -2669,7 +2675,7 @@ fn constrain_go_impl(
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(solver, lhs) <= rv.level(solver) => {
-            crate::ccl::capabilities::lower_capability_levels(lhs, rv.level(solver));
+            crate::ccl::capabilities::lower_capability_levels(solver, lhs, rv.level(solver));
             let ups = {
                 let bound = Bound::edge(solver, sr.clone(), lhs.clone(), sl.clone())
                     .with_origin(cache.origins.0);
@@ -3362,7 +3368,7 @@ pub fn extrude(
 ) -> Type {
     if type_level(solver, ty) <= target_level {
         lower_fun_kind_levels(solver, ty, target_level);
-        crate::ccl::capabilities::lower_capability_levels(ty, target_level);
+        crate::ccl::capabilities::lower_capability_levels(solver, ty, target_level);
         return ty.clone();
     }
     match ty {
@@ -3486,7 +3492,7 @@ pub fn extrude(
             // of the deeper scope's scheme then shares it.
             capabilities: {
                 if let Repr::Var(v) = capabilities.repr() {
-                    v.lower_level(target_level);
+                    v.lower_level(solver, target_level);
                 }
                 capabilities.clone()
             },
@@ -5393,7 +5399,6 @@ mod tests {
         // checks against `Int ⇒ Int`. A lower bound `Int ⇒ Bool` that reaches `B` after
         // the extrusion flows out through `B'` as one reaching an extruded `InferVar`
         // flows into its proxy, so the check fails.
-        let arena = crate::ccl::infer::InferArena::new();
         let a = fresh_var(solver, 1);
         let barrier = BarrierVar::fresh(
             solver,
@@ -5431,7 +5436,6 @@ mod tests {
             "`Int ⇒ Bool` reached `{barrier:?}` after its extrusion to `{extruded}` and \
              never met the upper bound `Int ⇒ Int`"
         );
-        drop(arena);
     }
 
     #[test]
@@ -5447,7 +5451,6 @@ mod tests {
         // lowers would carry `Int ⇒ Int` into `B'` through its proxy instead, and `B'`'s
         // resolution `Int ⇒ (Int ∨ Bool)` would not coalesce, which the barrier check
         // skips rather than reports.
-        let arena = crate::ccl::infer::InferArena::new();
         let b = fresh_var(solver, 1);
         let barrier = BarrierVar::fresh(
             solver,
@@ -5489,7 +5492,6 @@ mod tests {
             "`Int ⇒ Int` reached `{barrier:?}` after its extrusion to `{extruded}` and \
              should fail against the lower bound `Int ⇒ Bool`, got {failures:?}"
         );
-        drop(arena);
     }
 
     #[test]
@@ -5649,7 +5651,6 @@ mod tests {
     #[test]
     fn a_meet_over_a_codomain_binder_names_only_a_written_binder() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         for (binder, what) in [
             (
                 Name::fresh("i"),
@@ -5675,7 +5676,6 @@ mod tests {
             };
             assert_eq!(got, what);
         }
-        drop(arena);
     }
 
     /// Build a refinement whose predicate is the **bare** `__elem > <rhs>` —
@@ -5710,7 +5710,6 @@ mod tests {
     #[test]
     fn pi_correspondence_renames_codomain_refinement() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         // The codomain stands under the expected function's binder `x`, which it names
         // once the correspondence lands.
         let result = Type::Infer(InferVar::fresh_in(
@@ -5742,7 +5741,6 @@ mod tests {
         // binder x by the derived correspondence.
         let res = coalesce(solver, &Type::Infer(Rc::clone(result_var)));
         assert_eq!(domain_predicate(&res), "__elem > x");
-        drop(arena);
     }
 
     // at coalesce, yielding the fully-substituted predicate `i > 0`: the
@@ -5750,7 +5748,6 @@ mod tests {
     #[test]
     fn dependent_application_discharges_through_coalesce() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         // Under `x`, as in [`pi_correspondence_renames_codomain_refinement`].
         let result = Type::Infer(InferVar::fresh_in(
             solver,
@@ -5791,7 +5788,6 @@ mod tests {
         // g(0) : {i | i > 0} ⇒ Int — both the correspondence rename and the
         // discharge fired, composed along the coalesce walk.
         assert_eq!(domain_predicate(&app_ty), "__elem > 0");
-        drop(arena);
     }
 
     /// `g : (k: Int) ⇒ ({i | i > k} ⇒ Int)`, shared by the dependent-edge
@@ -5821,7 +5817,6 @@ mod tests {
     #[test]
     fn dependent_discharge_survives_opaque_constraint_order() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         // The codomain stands under `x`, so it is minted where `x` is in scope.
         let result = Type::Infer(InferVar::fresh_in(
             solver,
@@ -5869,7 +5864,6 @@ mod tests {
             "__elem > 0",
             "consumer copy (crossed the upper edge)"
         );
-        drop(arena);
     }
 
     // both flowing into one position: the constraint `Cod <: V` arrives
@@ -5879,7 +5873,6 @@ mod tests {
     #[test]
     fn distinct_discharges_of_one_codomain_both_recorded() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         let g_ty = dependent_g_ty(solver);
         let mut cache = ConstrainCache::new();
         let v = fresh_var(solver, 0);
@@ -5917,7 +5910,6 @@ mod tests {
             2,
             "V must receive BOTH discharged copies, got: {rendered:?}"
         );
-        drop(arena);
     }
 
     // their emit-time inference-var type slots, must bridge as one fiber
@@ -5930,7 +5922,6 @@ mod tests {
     #[test]
     fn bridge_unifies_same_fiber_captures_with_distinct_ty_slots() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         // Non-var capture (`y + 1`) so neither side is rename-shaped; fresh
         // slot per capture, as emission would mint.
         let mut capture = || {
@@ -5951,7 +5942,6 @@ mod tests {
             tau_l.is_id() && tau_u.is_id(),
             "same-written captures must bridge as the same fiber"
         );
-        drop(arena);
     }
 
     // `Subst::eq_modulo_ty_slots` (backed by the codebase's type-blind
@@ -5962,7 +5952,6 @@ mod tests {
     #[test]
     fn eq_modulo_ty_slots_ignores_slots_but_not_structure() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         let mut capture = |name: &str, lit: i64| {
             let mut v = TypedExpr::var(name);
             v.ty = fresh_var(solver, 0);
@@ -5991,7 +5980,6 @@ mod tests {
             Subst::discharge("k", l)
         };
         assert!(lam().eq_modulo_ty_slots(&lam()));
-        drop(arena);
     }
 
     // ----- FunKind edge (`Data` and `Compute` are incomparable) -----------
@@ -6043,7 +6031,6 @@ mod tests {
     #[test]
     fn a_map_key_is_inferred_from_the_domains_that_reach_it() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         let key = fresh_var(solver, 0);
         let Type::Infer(kv) = key.clone() else {
             unreachable!("fresh_var is an inference variable")
@@ -6062,7 +6049,6 @@ mod tests {
             vec!["0..2".to_string(), "0..3".to_string()],
             "both joined domains lie below the key"
         );
-        drop(arena);
     }
 
     /// **A key bound names no domains to pair.** So no set of candidates contains it however
@@ -6122,7 +6108,6 @@ mod tests {
     #[test]
     fn an_unresolved_candidate_takes_the_kinding_edge() {
         let solver = &mut Solver::new();
-        let arena = crate::ccl::infer::InferArena::new();
         let sum = |kind| Type::sum_over(kind, None, prim(BaseType::Int));
         let d = fresh_var(solver, 0);
         let Type::Infer(v) = d.clone() else {
@@ -6140,7 +6125,6 @@ mod tests {
             vec![TypeKind::UIntRanges],
             "the demand rides the candidate until it resolves"
         );
-        drop(arena);
     }
 
     #[test]
