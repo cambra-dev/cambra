@@ -2506,6 +2506,39 @@ i = f(1)
     "},
     6
 )]
+// A sum whose filtered arm's domain reads the definition's own names, the parameter and the
+// filter's source, leaves the definition through the hole at its result. Each call reads the
+// domain at its own argument.
+#[case::a_sum_with_a_filtered_arm_through_a_result_hole(
+    indoc! {"
+        c: Bool = True
+        def f(n) => _ |=> Int:
+            box([x for x in [1, 2, 3] if x > n]) if c else box([1, 2, 3])
+        sum(f(1)) + 10 * sum(f(2))
+    "},
+    35
+)]
+// The same sum, its filter reading only the filter's source.
+#[case::a_sum_with_a_filter_reading_its_source_through_a_result_hole(
+    indoc! {"
+        c: Bool = True
+        def f(n) => _ |=> Int:
+            box([x for x in [1, 2, 3] if x > 1]) if c else box([1, 2, 3])
+        sum(f(1)) + 10 * sum(f(2))
+    "},
+    55
+)]
+// The same sum bound at a hole inside the definition.
+#[case::a_sum_with_a_filtered_arm_bound_at_a_hole(
+    indoc! {"
+        c: Bool = True
+        def f(n):
+            xs: _ |=> Int = box([x for x in [1, 2, 3] if x > n]) if c else box([1, 2, 3])
+            xs
+        sum(f(1)) + 10 * sum(f(2))
+    "},
+    35
+)]
 fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }

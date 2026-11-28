@@ -1773,7 +1773,14 @@ impl<'m> Closer<'m> {
 
     /// A funkind variable's closed copy, one per variable.
     fn kind(&mut self, k: &Rc<crate::ccl::ty::FunKindVar>) -> Rc<crate::ccl::ty::FunKindVar> {
-        Rc::clone(self.kinds.entry(k.uid).or_insert_with(|| k.closed()))
+        if let Some(closed) = self.kinds.get(&k.uid) {
+            return Rc::clone(closed);
+        }
+        // A proxy binds its original's binders, so its copy binds those of the original's copy.
+        let owner = k.binders_of().map(|owner| self.kind(owner));
+        let closed = k.closed(owner);
+        self.kinds.insert(k.uid, Rc::clone(&closed));
+        closed
     }
 }
 

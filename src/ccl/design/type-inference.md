@@ -130,7 +130,9 @@ it does not control that level increment (`in_let_rhs` in `infer/context.rs`, `i
   variables at or below it (`infer/solver/scheme.rs`).[^2]
 - Bound recording cannot place a deeper variable directly on a shallower variable's bounds.
   **Extrusion** makes a proxy at the shallower level and relates it to the original with a
-  polarity-appropriate bound (`infer/solver/constrain.rs`).
+  polarity-appropriate bound (`infer/solver/constrain.rs`). The level it compares counts each
+  function type's funkind and capability variables (`extrusion_level`), and each of those above
+  the shallower level gets a proxy too.
 
 For a schematic `let id = λ x → x`, if `x` has type `α` above the binding cutoff, separate uses
 receive independent copies such as `β ⇒ β` and `γ ⇒ γ`. See
@@ -1929,6 +1931,12 @@ mints the copy at the target's level for the original's, in the copy of the orig
 registers it, and then carries what the run recorded on the original (`Copied`). Registration comes
 before any of the original's state is freshened, so a cycle back to the original finds the copy;
 no sort orders the two itself.
+
+An inference variable's funkind variable is part of its handle, so the copy of the variable is
+minted over a copy of the funkind variable (`mint_copy`). Recording on the funkind variable's copy
+waits until the variable's copy is registered, and then precedes the variable's bounds: the bounds
+name the funkind variable's binders, which its copy renames. It is the copy any funkind variable
+gets, edges and their substitutions included.
 
 ---
 
@@ -4270,8 +4278,13 @@ run's per occurrence (`InferCtx::normalize_fun_kind_in`), for an annotation and 
 target alike, so no run records on lowering's. `copy_var` copies a funkind variable above
 the freshening's cutoff and leaves one at or below it in place, as freshening treats a type
 variable.
-`lower_levels` and extrusion also lower a function type's funkind variable to the destination
-level, including when its domain and codomain contain no variable above that level.
+`lower_levels` lowers a function type's funkind variable to the binding's level, including when
+its domain and codomain contain no variable above that level. Extrusion gives a funkind variable
+above the destination level a proxy there instead (`extrude_kind`). The proxy is related to the
+original as the extrusion's polarity relates a type variable's proxy, and in both directions at an
+invariant position. The proxy binds the original's binders (`FunKindVar::proxy`): the function
+type's parts name them, and so do the telescopes of the variables in those parts. A copy of the
+proxy binds the binders of the copy of the original (`Copied::copy_fixed` for `FunKind`).
 
 A funkind variable also stands in a telescope, given when it is minted: a type variable's own
 funkind variable in the variable's telescope, and a demand's or an annotation's in the walk's scope
@@ -5100,6 +5113,12 @@ lower and upper ([A collection is answered off the table](#a-collection-is-answe
 
 That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` has a case per mechanism, except the barrier-variable copies, which no case reaches with a watch on them.
 
+The check skips a position whose answer an assumption holds at an application of a bounded family
+([Obligations under assumptions](type-parameters.md#obligations-under-assumptions)). Its candidates
+are not the answer: the held answer is what the obligation settles on. A use's copy of such an
+obligation holds the definition's answer, while its operand reads the variable the use stands the
+family at, which resolves to a base.
+
 ### Requirements are generalized
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and resolves its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
@@ -5527,9 +5546,10 @@ function's own variables' included, as every node's does (`Typing::statement`; l
 one `lower::EXPRESSION_STATEMENT`, which `lower::marked_nodes` reads). A parameter's capability is
 bound by its function: it reaches the statement's variable and no type of that function. A
 statement
-whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches a call
-variable with nothing flowing into it, the call of a function a polymorphic definition takes as a
-parameter, which only each use determines (`InferCtx::does_nothing`). Inference returns the
+whose variable causes nothing is inert (`InferError::InertStatement`), unless it reaches an open
+input with nothing flowing into it and nothing recorded on it (`CapabilityVar::open_input`,
+`InferCtx::does_nothing`). Such an input is what calling a function that a polymorphic definition
+takes as a parameter causes, which only each use determines. Inference returns the
 inert statements, and the compile reports them only where inference reports no error: an argument
 lent wrongly, which inference refuses, is the more precise diagnosis. The last
 statement of a block ending a function body is the function's value, which lowering builds as a
@@ -5579,23 +5599,23 @@ stops each `Raise(𝑆)` whose 𝑆 resolves to a subtype of a type a clause cat
 (`capabilities::sent`). Each edge out of a `try` body is registered with the variable collecting the
 body's capabilities, a use's copy included, and once the types settle `capabilities::partly_caught`
 reports a clause taking part of an 𝑆 (`InferError::ExceptTakesPart`). Every type may be raised; a
-type holding a function that is not a collection, which an exception's outcome cannot carry yet,
-is refused at the `raise`, in an `except` and in a clause as not compiled yet
-(`InferError::ExceptionHoldsAFunction`). The edge
-reads the type each time it is crossed, so an exception reaching the body through a function a use
-of the definition is passed is decided as one raised in it is. A type still open lets the exception
-through, and `InferCtx::settle_catches`, once emission is done, marks the types settled and refuses
-a clause that catches nothing (`InferError::ExceptCatchesNothing`). From then on a type still
-holding a variable, which generalizes into a type parameter, is decided as one: it overlaps every
-type, and only itself covers it (`Raised::decided_type`, `covers`). A `try` whose body reaches a
-call of a function no value of the definition flows into, such as an unannotated parameter's, raises
-what each use passes, so none of its clauses is refused at the definition: `Typing::apply` records
-each call whose callee is an inference variable, and the check skips a `try` reaching one whose
-variable receives no value. Each use of a polymorphic definition copies its `Raise` capabilities at
-its own instance of the types (`Raised::instantiated`). The instance is the use's: every copy made
-for one use, its instantiation's and its specialization clone's, is one exception, and two uses are
-two. An exception carries which copy it is, each use it was copied for in order
-(`ExceptionInstance`), so the copies one use makes agree without a table relating them.
+type holding a function that is not a collection, which an exception's outcome cannot carry yet, is
+refused at the `raise`, in an `except` and in a clause as not compiled yet
+(`InferError::ExceptionHoldsAFunction`). The edge reads the type each time it is crossed, so an
+exception reaching the body through a function a use of the definition is passed is decided as one
+raised in it is. A type still open lets the exception through, and `InferCtx::settle_catches`, once
+emission is done, marks the types settled and refuses a clause that catches nothing
+(`InferError::ExceptCatchesNothing`). From then on a type still holding a variable, which
+generalizes into a type parameter, is decided as one: it overlaps every type, and only itself covers
+it (`Raised::decided_type`, `covers`). A `try` whose body reaches a call of a function no value of
+the definition flows into, such as an unannotated parameter's, raises what each use passes, so none
+of its clauses is refused at the definition: `Typing::apply` marks the variable of a call whose
+callee receives no value an open input (`CapabilityVar::open_input`), and the check skips a `try`
+reaching an open input with nothing flowing into it. Each use of a polymorphic definition copies its
+`Raise` capabilities at its own instance of the types (`Raised::instantiated`). The instance is the
+use's: every copy made for one use, its instantiation's and its specialization clone's, is one
+exception, and two uses are two. An exception carries which copy it is, each use it was copied for
+in order (`ExceptionInstance`), so the copies one use makes agree without a table relating them.
 
 ### Polymorphism and materialization
 
@@ -5604,10 +5624,16 @@ out: counting the variable of every function body would generalize every functio
 variable at an input, a parameter's function type, decides that a definition is polymorphic as a
 type variable does (`capabilities::input_capability_level` in `should_generalize`): a body that
 calls the parameter leaves it open. A type becoming a bound of a variable at a shallower level
-lowers its capability variables to that level (`lower_capability_levels`, at bound recording and at
-extrusion). Instantiation copies a capability variable above the scheme's cutoff with its
-capabilities, its upper bounds and the edges into it (`copy_var`), so two uses of one
-polymorphic function collect their capabilities apart. `freshen_level` counts a function type's
+gives each capability variable above that level a proxy there (`extrude_capabilities`). At a
+positive position the original flows into the proxy, at a negative one the proxy flows into the
+original, and at an invariant one both. A negative proxy of an open input is an open input
+(`CapabilityVar::open_input`): what each use supplies to the original, it supplies to the proxy. A
+monomorphic binding lowers its capability variables with its other variables (`lower_levels`). An
+edge is recorded on both of its variables (`CapabilityVar::flows_from`, `CapabilityVar::outgoing`).
+Instantiation copies a capability variable above the scheme's cutoff with its capabilities, its
+upper bounds, the edges into it, and its edges into variables the copy leaves in place
+(`copy_var`), so two uses of one polymorphic function collect their capabilities
+apart, and a proxy below the cutoff collects both. `freshen_level` counts a function type's
 capability variable, so a type whose only quantified part is its capabilities is copied rather than
 shared.
 
