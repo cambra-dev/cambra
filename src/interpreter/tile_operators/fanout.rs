@@ -1119,6 +1119,15 @@ impl MemoProducer {
         )
     }
 
+    /// The guard the input is pulled at for `projection`: the nearest level at or above it that
+    /// the input restates. The memo answers from its cache, which it cuts to `projection`
+    /// ([`Self::answer`]), so a pull that reads more than `projection` answers it exactly.
+    fn input_guard(&self, projection: &Projection) -> TileGuard {
+        projection
+            .restated_by(&self.input.restates())
+            .guard(self.input.tiling())
+    }
+
     /// The cache cut to `projection`: it holds whatever was read, which can be more than the
     /// pull asks for.
     fn answer(&self, projection: &Projection) -> Tile {
@@ -1129,18 +1138,13 @@ impl MemoProducer {
 }
 
 impl MemoProducer {
-    /// Pull the input at `projection_guard`, merge the answer into the cache, and release the
-    /// input at what the answer states. `must_read` is whether the region was dirty: a read of a
-    /// clean region that finds data the cache lacked wakes the memo's consumer.
-    fn read_input(
-        &mut self,
-        projection_guard: TileGuard,
-        projection: &Projection,
-        must_read: bool,
-    ) {
+    /// Pull the input at `projection`, merge the answer into the cache, and release the input at
+    /// what the answer states. `must_read` is whether the region was dirty: a read of a clean
+    /// region that finds data the cache lacked wakes the memo's consumer.
+    fn read_input(&mut self, projection: &Projection, must_read: bool) {
         self.gate_probed = false;
         self.dirty.remove(projection);
-        let mut input = self.input.get(projection_guard);
+        let mut input = self.input.get(self.input_guard(projection));
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
         input.compact();
@@ -1209,7 +1213,7 @@ impl Breaker for MemoProducer {
             return;
         }
 
-        self.read_input(guard, &projection, false);
+        self.read_input(&projection, false);
         // What the input states complete of the consumed region holds nothing the cache did not
         // take, so the memo releases all of it, keys it holds none of included. Its release of
         // what it merged names only the keys held beneath an open row, so a complete key it
@@ -1305,7 +1309,7 @@ impl TileProducer for MemoProducer {
             // per read: an input that changed without notifying answers something new.
             if cfg!(debug_assertions) && !self.gate_probed && self.wakeups.is_empty() {
                 self.gate_probed = true;
-                let mut probe = self.input.get(projection_guard);
+                let mut probe = self.input.get(self.input_guard(&projection));
                 probe.compact();
                 let mut merged = self.cached_tile.clone();
                 merged.merge(probe.clone());
@@ -1329,7 +1333,7 @@ impl TileProducer for MemoProducer {
             }
             return self.answer(&projection);
         }
-        self.read_input(projection_guard, &projection, must_read);
+        self.read_input(&projection, must_read);
         self.answer(&projection)
     }
 

@@ -927,6 +927,11 @@ fn a_tuple_annotation_over_a_dependent_tuple_keyed_comprehension(
     out = test_sink()
     out << [[x for xs in xss for x in xs] for xss in [box([box([1, 2]), box([3])]), box([box([4])])] if sum([1 for xs in xss]) > 1]
 "#}, "[() -> [[(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3]]]")]
+#[case::filtered_over_a_bound_source(indoc! {r#"
+    xss = [box([1, 2, 3]), box([4, 5])]
+    out = test_sink()
+    out << [x for xs in xss for x in xs if x > 2]
+"#}, "[() -> [(_0: 0, _1: 2) -> 3, (_0: 1, _1: 0) -> 4, (_0: 1, _1: 1) -> 5]]")]
 fn an_inner_generator_over_the_outer_element_keys_by_a_dependent_tuple(
     #[case] source: &str,
     #[case] expected: &str,
