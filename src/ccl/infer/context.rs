@@ -26,8 +26,8 @@ use std::rc::Rc;
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{
-    BarrierVar, BindingTransparency, Bound, Expr, InferVar, Level, Lit, Name, Refinement, Type,
-    TypedBinding, TypedExpr, TypedExprNode,
+    BindingTransparency, Bound, Expr, InferVar, Level, Lit, Name, Refinement, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
 };
 use crate::util::ScopeStack;
 
@@ -2650,7 +2650,7 @@ impl InferCtx {
 
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable and every
-    /// `BarrierVar` a fresh barrier variable, both at the current level. Everything
+    /// `BarrierHole` a fresh barrier variable, both at the current level. Everything
     /// else — including existing `Infer` vars, the structural variants the
     /// solver operates on, and `Refinement` wrappers (refinements ride the
     /// lattice as refinements) — is kept, recursing to normalize nested holes.
@@ -2711,22 +2711,14 @@ impl InferCtx {
             // A `Hole` annotation means "infer this" → fresh variable, at
             // the current lexical position (it carries the live telescope).
             Type::Hole => Type::Infer(InferVar::fresh_in(&mut self.solver, self.level, telescope)),
-            // A barrier variable is the same "infer this": each annotation gets its own
-            // copy, which gathers the bounds. Its level is the maximum level of those
-            // bounds (`BarrierVar::level`), so a generalized `let` quantifies it exactly
-            // when a bound reaches above the `let`'s level.
-            Type::BarrierVar(barrier) => {
-                debug_assert!(
-                    barrier.lowers(&self.solver).is_empty()
-                        && barrier.uppers(&self.solver).is_empty(),
-                    "an annotation's barrier variable carries no bounds before normalization"
-                );
-                Type::BarrierVar(BarrierVar::fresh(&mut self.solver,
-                    Rc::clone(barrier.opaque()),
-                    Vec::new(),
-                    Vec::new(),
-                ))
-            }
+            // A barrier is the same "infer this", standing under the opaque binders the body
+            // binds, which its lower bounds name and its resolution drops.
+            Type::BarrierHole(opaque) => Type::Infer(InferVar::barrier(
+                &mut self.solver,
+                self.level,
+                telescope,
+                Rc::clone(opaque),
+            )),
             // A `SharedHole` means "infer this, and it is the same one as that":
             // the *first* occurrence of an id mints the variable and every later
             // one reuses it. That identity is the entire mechanism — it is how a
@@ -4133,7 +4125,7 @@ impl Typing for InferCtx {
             // A parameter standing for a clause opens to a capability variable holding a capability
             // that names it rigidly, as an opened type parameter stands for itself: the body
             // is checked against what any use passes. Instantiation drops the capability, so a
-            // use's copy holds what its arguments bring (`freshen_capability_var`).
+            // use's copy holds what its arguments bring (`copy_var`).
             if let Some(Type::Nominal(decl, _)) = &bound
                 && (*decl == crate::ccl::nominal::effect()
                     || *decl == crate::ccl::nominal::context())
@@ -4153,7 +4145,7 @@ impl Typing for InferCtx {
                 );
                 // `E <: Effect except RunTransaction`: what each use passes for the
                 // parameter holds none of what the bound takes away, and each use's copy of
-                // the variable keeps the bound (`freshen_capability_var`).
+                // the variable keeps the bound (`copy_var`).
                 if !opened.clause_except.is_empty() {
                     let mut set = CapabilitySet::default();
                     let every = Every::of_direction(of_causes)

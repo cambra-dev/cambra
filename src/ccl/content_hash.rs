@@ -311,7 +311,7 @@ fn hash_type<'a>(
         // separates a shared hole from a plain one.
         T::Txn
         | T::Hole
-        | T::BarrierVar(_)
+        | T::BarrierHole(_)
         | T::SharedHole(_)
         | T::Infer(_)
         | T::Undetermined(_) => {}

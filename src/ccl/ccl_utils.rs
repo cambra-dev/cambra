@@ -3136,7 +3136,7 @@ pub(crate) fn strip_refinements_in(solver: &mut Solver, ty: &Type) -> Type {
         | Type::UIntRange(_)
         | Type::Hole
         | Type::SharedHole(_)
-        | Type::BarrierVar(_)
+        | Type::BarrierHole(_)
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::Undetermined(_)

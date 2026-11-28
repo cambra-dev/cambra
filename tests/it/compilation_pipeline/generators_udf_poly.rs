@@ -1342,3 +1342,19 @@ fn a_definition_specialized_for_an_argument_reading_a_binder_stands_under_it() {
         "expected a compile error containing {expected:?}; got: {msg}"
     );
 }
+
+/// A filtered comprehension a function returns, whose element and filter read a parameter beside
+/// the source, called at two lengths. Each call's copy of the definition holds one copy of each
+/// of its variables, however many paths through the definition's graph reach one.
+#[test]
+fn a_returned_comprehension_reading_a_parameter_beside_its_source() {
+    check_scalar(
+        indoc! {"
+            def keep(xs, k):
+                [x + k for x in xs if x + k > 1]
+            y = sum(keep([0, 1, 2], 0)) + sum(keep([0, 1], 3))
+            y
+        "},
+        Value::Int(9),
+    );
+}

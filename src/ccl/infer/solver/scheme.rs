@@ -8,6 +8,7 @@
 
 use crate::ccl::infer::solver::Solver;
 use crate::ccl::infer::solver::held::{Held, HeldKey, HeldKind};
+use crate::ccl::infer::solver::var::{Recorded, SolverVar};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -18,9 +19,7 @@ use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
-use crate::ccl::{
-    BarrierVar, BarrierVarId, Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr,
-};
+use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
 
 // ---------------------------------------------------------------------------
 // Polymorphic schemes
@@ -339,7 +338,7 @@ pub(crate) fn assert_copied_apart_from(
     impl Audit<'_> {
         fn kind(&mut self, kind: &FunKind) {
             if let FunKind::Var(k) = kind {
-                let level = kind_level(self.solver, k);
+                let level = k.level(self.solver);
                 assert!(
                     k.uid >= self.before.funkind || level <= self.lim,
                     "an instantiation shares a funkind variable above the cutoff {} with its scheme: {k:?}",
@@ -571,7 +570,13 @@ impl FreshenCache {
 
     /// Record `copy` as this freshening's copy of `original`.
     pub fn record_copy<K: HeldKind>(&mut self, original: &K, copy: K) {
-        self.copies.insert(original.held_key(), copy.into_held());
+        let previous = self.copies.insert(original.held_key(), copy.into_held());
+        debug_assert!(
+            previous.is_none(),
+            "{:?} was copied twice by one freshening: a copy is registered before anything is \
+             freshened from its original, so a cycle back to the original finds it",
+            original.held_key(),
+        );
     }
 
     /// Each copy of one kind of handle, by its original's key.
@@ -624,8 +629,8 @@ impl FreshenLevel {
 }
 
 /// Freshen a function's kind at instantiation. A variable at or below `lim` belongs to the
-/// enclosing scope and is shared. A variable above `lim`, or without a recorded level, is
-/// copied through [`freshen_kind_var`]. Concrete kinds keep their form, with a sum's candidate
+/// enclosing scope and is shared. A variable above `lim` is copied through
+/// [`copy_var`]. Concrete kinds keep their form, with a sum's candidate
 /// types freshened through the same cache.
 fn freshen_fun_kind(
     solver: &mut Solver,
@@ -642,7 +647,7 @@ fn freshen_fun_kind(
                 .map(|w| w.map_types(|t| freshen_above(solver, lim, t, target, cache)))
                 .collect(),
         ))),
-        FunKind::Var(kv) => FunKind::Var(freshen_kind_var(solver, kv, lim, target, cache)),
+        FunKind::Var(kv) => FunKind::Var(freshen_handle(solver, lim, kv, target, cache)),
     }
 }
 
@@ -678,7 +683,7 @@ fn copy_ordering(
         .map(|t| freshen_above(solver, lim, t, target, cache));
     let positions = freshen_above(solver, lim, &order.positions, target, cache);
     let capabilities = match order.capabilities.repr() {
-        Repr::Var(v) => Capabilities::var(freshen_capability_var(solver, lim, v, target, cache)),
+        Repr::Var(v) => Capabilities::var(freshen_handle(solver, lim, v, target, cache)),
         _ => order.capabilities.clone(),
     };
     let assumptions = order
@@ -720,17 +725,6 @@ fn copy_ordering(
     copy
 }
 
-/// A per-use copy of a capability variable and its incoming capabilities and bounds.
-fn freshen_capability_var(
-    solver: &mut Solver,
-    lim: Level,
-    v: &Rc<CapabilityVar>,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-) -> Rc<CapabilityVar> {
-    freshen_handle(solver, lim, v, target, cache)
-}
-
 /// `capabilities` as this freshening copies what they hold: each variable through
 /// [`freshen_held`], each known set's requirements and raised types as a copied variable's own
 /// are. Written clauses are kept: lowering wrote them, and they hold nothing of a run.
@@ -742,7 +736,7 @@ fn freshen_capabilities(
     cache: &mut FreshenCache,
 ) -> Capabilities {
     capabilities.map_leaves(&mut |leaf| match leaf.repr() {
-        Repr::Var(v) => Capabilities::var(freshen_capability_var(solver, lim, v, target, cache)),
+        Repr::Var(v) => Capabilities::var(freshen_handle(solver, lim, v, target, cache)),
         Repr::Known(set) => {
             Capabilities::known(freshen_capability_set(solver, lim, set, target, cache))
         }
@@ -752,7 +746,7 @@ fn freshen_capabilities(
 }
 
 /// A known capability set's copy: its requirements and raised types freshened, as a copied
-/// variable's own capabilities are ([`copy_capability_var`]).
+/// variable's own capabilities are ([`Copied`]).
 fn freshen_capability_set(
     solver: &mut Solver,
     lim: Level,
@@ -781,7 +775,7 @@ fn freshen_capability_set(
         .vars
         .values()
         .map(|v| {
-            let c = freshen_capability_var(solver, lim, v, target, cache);
+            let c = freshen_handle(solver, lim, v, target, cache);
             (c.uid, c)
         })
         .collect();
@@ -824,123 +818,171 @@ fn capabilities_level(solver: &mut Solver, capabilities: &Capabilities) -> Level
     level
 }
 
-/// A new copy of `v` with its own capabilities, incoming edges and bounds ([`freshen_held`]).
-fn copy_capability_var(
-    solver: &mut Solver,
-    lim: Level,
-    v: &Rc<CapabilityVar>,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-) -> Rc<CapabilityVar> {
-    let telescope = cache.copied_telescope(v.telescope());
-    let f = CapabilityVar::fresh(solver, target.level_of(v.level(solver)), &telescope);
-    let open = v.open_input(solver);
-    f.set_open_input(solver, open);
-    // Cached before the edges are copied, so a cycle reaches the copy.
-    cache.record_copy(v, Rc::clone(&f));
-    // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
-    // for what each use passes (`InferCtx::open_poly`), as an opened type parameter stands for
-    // itself. A copy above the cutoff is the use's variable for the parameter, as a copied type
-    // parameter is a fresh variable, so it holds what the use's arguments bring instead.
-    for capability in v.own(solver) {
-        match &capability.item {
-            Capability::Param(_) => {}
-            // A use raises the exception at its own instance of the definition's types, and as
-            // an exception of its own: two uses are two exceptions.
-            Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
-                let ty = freshen_above(solver, lim, &raised.ty, target, cache);
-                let raised = raised.instantiated(ty, cache.use_at);
-                f.record(
-                    solver,
-                    crate::ccl::capabilities::LocatedCapability {
-                        item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)),
-                        ..capability.clone()
-                    },
-                );
-            }
-            Capability::Requires(r) if r.ordering().is_some() => {
-                let requirement = freshen_requirement(solver, lim, r, target, cache);
-                f.record(
-                    solver,
-                    crate::ccl::capabilities::LocatedCapability {
-                        item: Capability::Requires(requirement),
-                        ..capability
-                    },
-                );
-            }
-            _ => f.record(solver, capability),
-        }
+/// A copy of a capability variable carries its own capabilities, incoming edges and bounds.
+impl Copied for Capabilities {
+    fn copy_fixed(
+        _solver: &mut Solver,
+        _lim: Level,
+        _original: &Rc<CapabilityVar>,
+        _level: Level,
+        _telescope: &Telescope,
+        _target: FreshenLevel,
+        _cache: &mut FreshenCache,
+    ) {
     }
-    for (source, mut filter) in v.incoming(solver) {
-        let source = freshen_capability_var(solver, lim, &source, target, cache);
-        // A use's `try` catches the use's instances of the types its clauses name, as its
-        // exceptions are the use's instances of the types they are raised at.
-        if let Some(catch) = &filter.catches {
-            let clauses = catch
-                .clauses()
-                .iter()
-                .map(|c| freshen_above(solver, lim, c, target, cache))
-                .collect();
-            filter.catches = Some(Rc::new(catch.instantiated(clauses)));
-        }
-        filter.stated = filter
-            .stated
-            .into_iter()
-            .map(|item| match item {
-                Capability::Requires(r) => {
-                    Capability::Requires(freshen_requirement(solver, lim, &r, target, cache))
+
+    fn copy_recorded(
+        solver: &mut Solver,
+        lim: Level,
+        original: &Rc<CapabilityVar>,
+        copy: &Rc<CapabilityVar>,
+        target: FreshenLevel,
+        cache: &mut FreshenCache,
+    ) {
+        let open = original.open_input(solver);
+        copy.set_open_input(solver, open);
+        // A capability naming a parameter that stands for a clause is the definition's rigid
+        // stand-in for what each use passes (`InferCtx::open_poly`), as an opened type parameter
+        // stands for itself. A copy above the cutoff is the use's variable for the parameter, as a
+        // copied type parameter is a fresh variable, so it holds what the use's arguments bring
+        // instead.
+        for capability in original.own(solver) {
+            match &capability.item {
+                Capability::Param(_) => {}
+                // A use raises the exception at its own instance of the definition's types, and as
+                // an exception of its own: two uses are two exceptions.
+                Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
+                    let ty = freshen_above(solver, lim, &raised.ty, target, cache);
+                    let raised = raised.instantiated(ty, cache.use_at);
+                    copy.record(
+                        solver,
+                        crate::ccl::capabilities::LocatedCapability {
+                            item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
+                                raised,
+                            )),
+                            ..capability.clone()
+                        },
+                    );
                 }
-                item => item,
-            })
-            .collect();
-        f.flows_from(solver, &source, filter);
-    }
-    // Each use answers the bounds the definition states: a use's arguments can add capabilities
-    // its copy holds and the definition's variable never does. A part a parameter stands in
-    // admits whatever the use passes there, and the definition was checked against it, less what
-    // the clause takes from the parameter: the top of its direction less that.
-    for mut upper in v.uppers(solver) {
-        // The copy is noted by the use that makes it ([`CapabilityVar::note_use`]).
-        if let crate::ccl::capabilities::Blame::NestedTransaction { used_at, .. } = &mut upper.blame
-        {
-            *used_at = None;
-        }
-        upper.set.requires = upper
-            .set
-            .requires
-            .into_iter()
-            .map(|r| freshen_requirement(solver, lim, &r, target, cache))
-            .collect();
-        for param in std::mem::take(&mut upper.set.params) {
-            if !param.except.is_empty() {
-                let every = crate::ccl::capabilities::Every::of_direction(param.of_causes)
-                    .less(solver, param.except.iter().cloned());
-                upper.set.add_every_in(solver, every);
-            } else if param.of_causes {
-                upper.of_causes = false;
-            } else {
-                upper.of_requires = false;
+                Capability::Requires(r) if r.ordering().is_some() => {
+                    let requirement = freshen_requirement(solver, lim, r, target, cache);
+                    copy.record(
+                        solver,
+                        crate::ccl::capabilities::LocatedCapability {
+                            item: Capability::Requires(requirement),
+                            ..capability
+                        },
+                    );
+                }
+                _ => copy.record(solver, capability),
             }
         }
-        if upper.of_requires || upper.of_causes || !upper.forbidden.is_empty() {
-            f.bound_above(solver, upper);
+        for (source, mut filter) in original.incoming(solver) {
+            let source = freshen_handle(solver, lim, &source, target, cache);
+            // A use's `try` catches the use's instances of the types its clauses name, as its
+            // exceptions are the use's instances of the types they are raised at.
+            if let Some(catch) = &filter.catches {
+                let clauses = catch
+                    .clauses()
+                    .iter()
+                    .map(|c| freshen_above(solver, lim, c, target, cache))
+                    .collect();
+                filter.catches = Some(Rc::new(catch.instantiated(clauses)));
+            }
+            filter.stated = filter
+                .stated
+                .into_iter()
+                .map(|item| match item {
+                    Capability::Requires(r) => {
+                        Capability::Requires(freshen_requirement(solver, lim, &r, target, cache))
+                    }
+                    item => item,
+                })
+                .collect();
+            copy.flows_from(solver, &source, filter);
+        }
+        // Each use answers the bounds the definition states: a use's arguments can add capabilities
+        // its copy holds and the definition's variable never does. A part a parameter stands in
+        // admits whatever the use passes there, and the definition was checked against it, less
+        // what the clause takes from the parameter: the top of its direction less that.
+        for mut upper in original.uppers(solver) {
+            // The copy is noted by the use that makes it ([`CapabilityVar::note_use`]).
+            if let crate::ccl::capabilities::Blame::NestedTransaction { used_at, .. } =
+                &mut upper.blame
+            {
+                *used_at = None;
+            }
+            upper.set.requires = upper
+                .set
+                .requires
+                .into_iter()
+                .map(|r| freshen_requirement(solver, lim, &r, target, cache))
+                .collect();
+            for param in std::mem::take(&mut upper.set.params) {
+                if !param.except.is_empty() {
+                    let every = crate::ccl::capabilities::Every::of_direction(param.of_causes)
+                        .less(solver, param.except.iter().cloned());
+                    upper.set.add_every_in(solver, every);
+                } else if param.of_causes {
+                    upper.of_causes = false;
+                } else {
+                    upper.of_requires = false;
+                }
+            }
+            if upper.of_requires || upper.of_causes || !upper.forbidden.is_empty() {
+                copy.bound_above(solver, upper);
+            }
         }
     }
-    f
 }
 
-/// Keep a kind variable at or below `lim`, or retrieve its per-instantiation copy from the
-/// cache. A variable above `lim`, or without a recorded level, is quantified. Its copy carries
-/// the definition's constraints and receives this instantiation's constraints independently.
-/// Caching by `uid` keeps repeated occurrences of one kind variable in a copy identified.
-fn freshen_kind_var(
+/// A sort of solver variable a freshening copies ([`copy_var`]).
+trait Copied: Recorded {
+    /// What the copy of `original` carries besides what every variable has, made before the copy
+    /// is minted at `level` in `telescope`.
+    fn copy_fixed(
+        solver: &mut Solver,
+        lim: Level,
+        original: &Rc<SolverVar<Self>>,
+        level: Level,
+        telescope: &Telescope,
+        target: FreshenLevel,
+        cache: &mut FreshenCache,
+    ) -> Self::Fixed;
+
+    /// Carry what the run recorded on `original` to `copy`, which is registered in `cache`.
+    fn copy_recorded(
+        solver: &mut Solver,
+        lim: Level,
+        original: &Rc<SolverVar<Self>>,
+        copy: &Rc<SolverVar<Self>>,
+        target: FreshenLevel,
+        cache: &mut FreshenCache,
+    );
+}
+
+/// A new copy of the solver variable `original` with what the definition recorded on it
+/// ([`freshen_held`]). The copy stands at the target's level for the original's, in the copy of
+/// its telescope. It is registered before anything is freshened from the original: what the
+/// original records can reach it again, through a cycle of bounds or of edges, and the cache is
+/// what makes that reach find this copy rather than mint a second one.
+fn copy_var<V: Copied>(
     solver: &mut Solver,
-    kv: &Rc<FunKindVar>,
     lim: Level,
+    original: &Rc<SolverVar<V>>,
     target: FreshenLevel,
     cache: &mut FreshenCache,
-) -> Rc<FunKindVar> {
-    freshen_handle(solver, lim, kv, target, cache)
+) -> Rc<SolverVar<V>>
+where
+    Rc<SolverVar<V>>: HeldKind,
+{
+    let level = target.level_of(original.level(solver));
+    let telescope = cache.copied_telescope(&original.telescope);
+    let fixed = V::copy_fixed(solver, lim, original, level, &telescope, target, cache);
+    let copy = SolverVar::mint(solver, level, telescope, fixed, V::State::default());
+    cache.record_copy(original, Rc::clone(&copy));
+    V::copy_recorded(solver, lim, original, &copy, target, cache);
+    copy
 }
 
 /// Freshening's one rule for a solver handle (`src/ccl/design/type-inference.md`, "Copying
@@ -961,10 +1003,9 @@ fn freshen_held(
         return held.clone();
     }
     match held {
-        Held::Infer(v) => Held::Infer(copy_infer_var(solver, lim, v, target, cache)),
-        Held::Barrier(b) => Held::Barrier(copy_barrier_var(solver, lim, b, target, cache)),
-        Held::FunKind(k) => Held::FunKind(copy_kind_var(solver, k, lim, target, cache)),
-        Held::Capability(c) => Held::Capability(copy_capability_var(solver, lim, c, target, cache)),
+        Held::Infer(v) => Held::Infer(copy_var(solver, lim, v, target, cache)),
+        Held::FunKind(k) => Held::FunKind(copy_var(solver, lim, k, target, cache)),
+        Held::Capability(c) => Held::Capability(copy_var(solver, lim, c, target, cache)),
         Held::Ordering(r) => Held::Ordering(copy_ordering(solver, lim, r, target, cache)),
         Held::Obligation(o) => Held::Obligation(copy_obligation(solver, lim, o, target, cache)),
     }
@@ -984,131 +1025,137 @@ fn freshen_handle<K: HeldKind + Clone>(
         .clone()
 }
 
-/// Whether freshening copies `held`: a handle with a level of its own is copied where that level
-/// is above the cutoff, and one with none, a kind no function has placed, an ordering
-/// requirement or an obligation, wherever freshening reaches it.
+/// Whether freshening copies `held`: a solver variable is copied where its level is above the
+/// cutoff, and an ordering requirement or an obligation, which has no level, wherever freshening
+/// reaches it. A funkind variable lowering minted is the program's, not a run's: it stands at
+/// level 0, so a copy keeps it.
 fn held_above(solver: &mut Solver, lim: Level, held: &Held) -> bool {
     match held {
         Held::Infer(v) => v.level(solver) > lim,
-        Held::Barrier(b) => freshen_level(solver, &Type::BarrierVar(Rc::clone(b))) > lim,
-        Held::FunKind(k) => kind_level(solver, k) > lim,
+        Held::FunKind(k) => k.level(solver) > lim,
         Held::Capability(c) => c.level(solver) > lim,
         Held::Ordering(_) | Held::Obligation(_) => true,
     }
 }
 
-/// The level `k` stands at. A kind lowering minted is the program's, not a run's: it has no
-/// home and no level, nothing a run records is on it, and a copy keeps it.
-fn kind_level(solver: &Solver, k: &FunKindVar) -> Level {
-    match k.home() {
-        Some(_) => k
-            .level(solver)
-            .expect("a kind a run minted stands where its owner does"),
-        None => 0,
-    }
-}
-
-/// A new copy of `kv` with what the definition recorded on it ([`freshen_held`]).
-fn copy_kind_var(
-    solver: &mut Solver,
-    kv: &Rc<FunKindVar>,
-    lim: Level,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-) -> Rc<FunKindVar> {
-    // Each field of the original, and what the copy makes of it.
-    let crate::ccl::ty::FunKindVarFields {
-        // The copy's own.
-        uid: (),
+/// A copy of a funkind variable carries its construction stamp, its binders renamed, every edge
+/// and what it was built over, and records the original it copies.
+impl Copied for FunKind {
+    fn copy_fixed(
+        _solver: &mut Solver,
+        _lim: Level,
+        original: &Rc<FunKindVar>,
+        _level: Level,
+        _telescope: &Telescope,
+        _target: FreshenLevel,
+        _cache: &mut FreshenCache,
+    ) -> crate::ccl::ty::FunKindVarFixed {
         // An annotation's funkind hole is normalized away before inference, so no funkind
         // variable a freshening copies is one.
-        hole: (),
-        // The construction stamp, carried below with the recorded one (`stamped`).
-        minted: (),
-        // Minted by this solver.
-        home: (),
-        // The target's level for the original's, below.
-        level: (),
-        // The stamp, the binders and every edge, below.
-        bounds: (),
-        // Memos of what the funkind variable resolved to, recomputed for the copy when it is
-        // read.
-        resolved_at: (),
-        component_at: (),
-        // A copy's witness positions belong to its own graph, so start without the cache.
-        binder_positions_at: (),
-    } = kv.fields(solver);
-    let level = kv
-        .level(solver)
-        .expect("a kind a run holds stands where its owner does");
-    let f = FunKindVar::fresh(solver, target.level_of(level));
-    // Registered **before** the bounds are carried across: a collection reaches itself
-    // through a recurrence, and the cache is what terminates the walk.
-    cache.record_copy(kv, Rc::clone(&f));
-    // **Everything the definition recorded comes across; the variable does not.** A pin the
-    // definition site acquires later must not reach this instantiation, which a fresh `uid`
-    // with copied state gives and a shared variable would not.
-    //
-    // All four, because all four are what the definition said: the construction stamp
-    // (`fresh_data`'s `Data`, which no edge spells), the bounds on either side, and what the
-    // collection was built over — a comprehension's instantiation binds one position per
-    // position of its sources exactly as the definition does, and a copy that drops the
-    // relation is a collection of unknown width that defaults to a compute function.
-    if kv.stamped(solver) == crate::ccl::ty::KindPin::Data {
-        f.stamp_data(solver);
+        debug_assert!(
+            !original.is_hole(),
+            "a run's funkind variable is never a hole"
+        );
+        original.fixed.clone()
     }
-    // **The binders come across renamed, before the edges.** A position the original has
-    // named is named in the bounds being copied, and the copy binds its own name there, so
-    // the rename has to be in the cache when those bounds are freshened. Every binder the
-    // original has named, arity known or not: a name is minted ahead of the arity
-    // ([`FunKindVar::binder_id_at`]).
-    let _ = kv.binder_ids(solver);
-    for (i, from) in kv.named_binder_ids(solver).into_iter().enumerate() {
-        cache.witnesses.insert(from, f.binder_id_at(solver, i));
-    }
-    // Each edge's substitution comes across freshened, as a copied bound's does.
-    for (lower, edges) in [
-        (true, kv.lower_edges(solver)),
-        (false, kv.upper_edges(solver)),
-    ] {
-        for (k, edge) in edges {
-            let edge = freshen_subst_payloads(solver, lim, &edge, target, cache);
-            let neighbor = freshen_fun_kind(solver, &k, lim, target, cache);
-            // A neighbor this freshening leaves in place, an enclosing scope's funkind variable,
-            // is not copied, so its side of the edge is recorded here: the edge is recorded on
-            // both ends, and `kv`'s neighbor reads it as it reads its edge to `kv`.
-            if let (FunKind::Var(original), FunKind::Var(kept)) = (&k, &neighbor)
-                && Rc::ptr_eq(original, kept)
-            {
-                let reverse = if lower {
-                    kept.upper_edges(solver)
-                } else {
-                    kept.lower_edges(solver)
-                };
-                for (back, back_edge) in reverse {
-                    if matches!(&back, FunKind::Var(b) if b.uid == kv.uid) {
-                        let back_edge =
-                            freshen_subst_payloads(solver, lim, &back_edge, target, cache);
-                        kept.record_under(solver, FunKind::Var(Rc::clone(&f)), !lower, back_edge);
+
+    fn copy_recorded(
+        solver: &mut Solver,
+        lim: Level,
+        original: &Rc<FunKindVar>,
+        copy: &Rc<FunKindVar>,
+        target: FreshenLevel,
+        cache: &mut FreshenCache,
+    ) {
+        // Each field of the original, and what the copy makes of it.
+        let crate::ccl::ty::FunKindVarFields {
+            // The copy's own.
+            uid: (),
+            // Not a hole, and stamped as the original was at construction (`copy_fixed`).
+            hole: (),
+            minted: (),
+            // Minted by this solver.
+            home: (),
+            // The target's level for the original's.
+            level: (),
+            // The stamp, the binders and every edge, below.
+            bounds: (),
+            // Memos of what the funkind variable resolved to, recomputed for the copy when it is
+            // read.
+            resolved_at: (),
+            component_at: (),
+            // A copy's witness positions belong to its own graph, so start without the cache.
+            binder_positions_at: (),
+        } = original.fields(solver);
+        // **Everything the definition recorded comes across; the variable does not.** A pin the
+        // definition site acquires later must not reach this instantiation, which a fresh `uid`
+        // with copied state gives and a shared variable would not.
+        //
+        // All four, because all four are what the definition said: the construction stamp
+        // (`fresh_data`'s `Data`, which no edge spells), the bounds on either side, and what the
+        // collection was built over — a comprehension's instantiation binds one position per
+        // position of its sources exactly as the definition does, and a copy that drops the
+        // relation is a collection of unknown width that defaults to a compute function.
+        if original.stamped(solver) == crate::ccl::ty::KindPin::Data {
+            copy.stamp_data(solver);
+        }
+        // **The binders come across renamed, before the edges.** A position the original has
+        // named is named in the bounds being copied, and the copy binds its own name there, so
+        // the rename has to be in the cache when those bounds are freshened. Every binder the
+        // original has named, arity known or not: a name is minted ahead of the arity
+        // ([`FunKindVar::binder_id_at`]).
+        let _ = original.binder_ids(solver);
+        for (i, from) in original.named_binder_ids(solver).into_iter().enumerate() {
+            cache.witnesses.insert(from, copy.binder_id_at(solver, i));
+        }
+        // Each edge's substitution comes across freshened, as a copied bound's does.
+        for (lower, edges) in [
+            (true, original.lower_edges(solver)),
+            (false, original.upper_edges(solver)),
+        ] {
+            for (k, edge) in edges {
+                let edge = freshen_subst_payloads(solver, lim, &edge, target, cache);
+                let neighbor = freshen_fun_kind(solver, &k, lim, target, cache);
+                // A neighbor this freshening leaves in place, an enclosing scope's funkind
+                // variable, is not copied, so its side of the edge is recorded here: the edge is
+                // recorded on both ends, and `original`'s neighbor reads it as it reads its edge to
+                // `original`.
+                if let (FunKind::Var(in_place), FunKind::Var(kept)) = (&k, &neighbor)
+                    && Rc::ptr_eq(in_place, kept)
+                {
+                    let reverse = if lower {
+                        kept.upper_edges(solver)
+                    } else {
+                        kept.lower_edges(solver)
+                    };
+                    for (back, back_edge) in reverse {
+                        if matches!(&back, FunKind::Var(b) if b.uid == original.uid) {
+                            let back_edge =
+                                freshen_subst_payloads(solver, lim, &back_edge, target, cache);
+                            kept.record_under(
+                                solver,
+                                FunKind::Var(Rc::clone(copy)),
+                                !lower,
+                                back_edge,
+                            );
+                        }
                     }
                 }
+                copy.record_under(solver, neighbor, lower, edge);
             }
-            f.record_under(solver, neighbor, lower, edge);
         }
+        for src in original.built_over(solver).into_iter().rev() {
+            let kind = freshen_fun_kind(solver, &src, lim, target, cache);
+            copy.contributes_first(solver, kind);
+        }
+        // **And recorded on the copy**, not only in this walk's cache. The cache rewrites the
+        // references this instantiation carries and is then gone; a reference written in the
+        // original's binder that arrives later has nothing to relate it to, since the copy's
+        // relations are freshened and reach the original nowhere. Recorded as a copy rather than
+        // as bounds: what the two share is which binder each position is, not what the kind
+        // resolves to, and the decoupling above is the whole point of the fresh variable.
+        copy.copied_from(solver, original);
     }
-    for src in kv.built_over(solver).into_iter().rev() {
-        let kind = freshen_fun_kind(solver, &src, lim, target, cache);
-        f.contributes_first(solver, kind);
-    }
-    // **And recorded on the copy**, not only in this walk's cache. The cache rewrites the
-    // references this instantiation carries and is then gone; a reference written in the
-    // original's binder that arrives later has nothing to relate it to, since the copy's
-    // relations are freshened and reach the original nowhere. Recorded as a copy rather than
-    // as bounds: what the two share is which binder each position is, not what the kind
-    // resolves to, and the decoupling above is the whole point of the fresh variable.
-    f.copied_from(solver, kv);
-
-    f
 }
 
 /// The highest level of any inference variable **reachable** in `ty` — including
@@ -1151,7 +1198,6 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
     // nothing else to freshen.
     let mut lvl = match ty {
         Type::Infer(v) => v.level(solver),
-        Type::BarrierVar(barrier) => barrier.level(solver),
         // A declared parameter, in an annotation slot a clone copies, is a name the
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
@@ -1173,7 +1219,7 @@ fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
             ..
         } => {
             let kind = match fun_kind {
-                FunKind::Var(k) => kind_level(solver, k),
+                FunKind::Var(k) => k.level(solver),
                 _ => 0,
             };
             capabilities_level(solver, capabilities).max(kind)
@@ -1292,10 +1338,8 @@ pub fn freshen_above(
         // `BoundedHole` is a *pre-inference* annotation marker: `normalize_annotation`
         // erases it into a bounded variable before any constraint is emitted, so
         // the solver never sees one.
-        Type::BoundedHole(_) => {
-            unreachable!(
-                "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
-            )
+        Type::BoundedHole(_) | Type::BarrierHole(_) => {
+            unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
         }
         Type::Base(_)
         | Type::UIntRange(_)
@@ -1501,7 +1545,7 @@ pub fn freshen_above(
         // A witness reference names a binder, not a variable, so what freshening owes it
         // is the α-conversion its binder got. A written sum's binder is re-minted by
         // [`Type::alpha_convert_sum`] on the way out of the `Fun` arm; a kind variable's is
-        // re-minted with the variable ([`freshen_kind_var`]), and the cache is what carries
+        // re-minted with the variable ([`copy_var`]), and the cache is what carries
         // that rename to the references — in this type and in the bounds copied with it.
         // A projection holds a term as a predicate does, and `unbox`'s stamped type holds
         // its own parameter, whose type holds the stamping's variables. Its slots freshen
@@ -1596,293 +1640,257 @@ pub fn freshen_above(
             Type::Poly(Rc::new(out))
         }
         Type::Infer(tv) => Type::Infer(freshen_handle(solver, lim, tv, target, cache)),
-        // Freshens like `Infer`, over what a barrier variable carries ([`copy_barrier_var`]).
-        Type::BarrierVar(barrier) => {
-            Type::BarrierVar(freshen_handle(solver, lim, barrier, target, cache))
-        }
     }
 }
 
-/// A new copy of `tv` with what the definition recorded on it: its bounds, kinding
-/// constraints, guarded bounds and suspended memberships, under a copy of its kind and in the
-/// scope a copy stands in ([`freshen_held`]).
-fn copy_infer_var(
-    solver: &mut Solver,
-    lim: Level,
-    tv: &Rc<InferVar>,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-) -> Rc<InferVar> {
-    {
-        {
-            debug_assert!(
-                tv.fun_kind().level(solver).is_none_or(|level| level > lim),
-                "a quantified type variable's own funkind is quantified at the same cutoff"
-            );
-            // Mint the fresh variable at the level `target` dictates: the use
-            // site's level (`At`) or the original's own level (`Preserve`), raised
-            // (`Raise`).
-            let new_level = target.level_of(tv.level(solver));
-            // A freshened clone stands where the original stood, so it
-            // inherits the original's telescope: the bounds copied below were
-            // recorded against that scope. The exception is an operator-scheme
-            // instantiation, whose template stands nowhere but under its own functions — it
-            // takes the use site's telescope with those functions' binders entered after it
-            // (see [`FreshenCache::site_telescope`]).
-            // **The copy stands over a copy of the original's kind**, registered in the
-            // same cache as the bounds below. A variable's kind carries the edges to the
-            // kinds of the function types that reached it; over a kind the cache does not
-            // know, the copied bounds arrive spelled in *their* copies' binders with
-            // nothing relating those to the copy's own, and a Σ then materializes
-            // declaring one name and referencing another.
-            //
-            // Minted here and related in [`FreshenCache::relate_kind_copy`] after the bounds are
-            // copied, rather than through [`freshen_kind_var`]: that copies a kind's edges
-            // eagerly, and since an edge is recorded on both ends it would pull this
-            // variable's whole undirected component into every instantiation — kinds no
-            // part of this copy names. The edges this copy owes are the ones to kinds the
-            // instantiation actually copied, which is what the cache holds once the bounds
-            // are done.
-            let fun_kind = match cache.copy_of(tv.fun_kind()) {
-                Some(existing) => existing,
-                None => {
-                    let f = FunKindVar::fresh(solver, new_level);
-                    cache.record_copy(tv.fun_kind(), Rc::clone(&f));
-                    f
-                }
-            };
-            let telescope = cache.copied_telescope(&tv.telescope);
-            // Each field of the original, and what the copy makes of it.
-            let crate::ccl::infer_var::InferVarFields {
-                // The copy's own.
-                uid: (),
-                // The target's level for the original's (`new_level`).
-                level: (),
-                // Minted by this solver.
-                home: (),
-                // Rescoped to the use (`telescope`, above).
-                telescope: (),
-                // Freshened below, lower, upper and type kinds.
-                bounds: (),
-                // The original's funkind variable freshened (above), related by
-                // `relate_kind_copy`.
-                fun_kind: (),
-                // Freshened, each obligation's frames copied (`freshen_watches`).
-                watches: (),
-                // A memo of the variables reading this one under substitutions, minted afresh as
-                // the copy is read; the memberships recorded on them come across below.
-                suspensions: (),
-                // `mark_named_domain`, below.
-                named_domain: (),
-                // `inherit_stands_for`, below.
-                stands_for: (),
-                // `inherit_witness_placement_renamed`, below.
-                witness_scopes: (),
-            } = tv.fields(solver);
-            let v = InferVar::fresh_over(solver, new_level, &telescope, fun_kind);
-            // The kinds the original sits under are this copy's kinds, whichever this walk
-            // reaches first: a variable copied before the function it is a part of would
-            // otherwise sit under the definition's kind, which nothing at the use relates to.
-            for k in tv.witness_scope_kinds(solver) {
-                freshen_kind_var(solver, &k, lim, target, cache);
+/// A copy of a type variable carries its funkind variable's copy, made before the copy is
+/// minted, and its bounds, kinding constraints, watches and suspended memberships, copied once
+/// it is registered.
+impl Copied for Type {
+    fn copy_fixed(
+        solver: &mut Solver,
+        lim: Level,
+        original: &Rc<InferVar>,
+        level: Level,
+        _telescope: &Telescope,
+        _target: FreshenLevel,
+        cache: &mut FreshenCache,
+    ) -> crate::ccl::infer_var::TypeVarFixed {
+        debug_assert!(
+            original.fun_kind().level(solver) > lim,
+            "a quantified type variable's own funkind is quantified at the same cutoff"
+        );
+        // Each field of the original, and what the copy makes of it.
+        let crate::ccl::infer_var::InferVarFields {
+            // The copy's own.
+            uid: (),
+            // The target's level for the original's.
+            level: (),
+            // Minted by this solver.
+            home: (),
+            // Rescoped to the use ([`FreshenCache::copied_telescope`]).
+            telescope: (),
+            // A barrier variable's copy is one, under the copies of its opaque binders, below.
+            opaque: (),
+            // Freshened in `copy_recorded`, lower, upper and type kinds.
+            bounds: (),
+            // The original's funkind variable freshened (below), related by
+            // `relate_kind_copy`.
+            fun_kind: (),
+            // Freshened, each obligation's frames copied (`freshen_watches`).
+            watches: (),
+            // A memo of the variables reading this one under substitutions, minted afresh as
+            // the copy is read; the memberships recorded on them come across in `copy_recorded`.
+            suspensions: (),
+            // `mark_named_domain`, in `copy_recorded`.
+            named_domain: (),
+            // `inherit_stands_for`, in `copy_recorded`.
+            stands_for: (),
+            // `inherit_witness_placement_renamed`, in `copy_recorded`.
+            witness_scopes: (),
+            // A barrier variable's checks: each upper bound's report comes across with it, in
+            // `copy_recorded`, and the copy is checked afresh.
+            barrier: (),
+        } = original.fields(solver);
+        // **The copy stands over a copy of the original's kind**, registered in the same cache
+        // as the bounds. A variable's kind carries the edges to the kinds of the function types
+        // that reached it; over a kind the cache does not know, the copied bounds arrive spelled
+        // in *their* copies' binders with nothing relating those to the copy's own, and a Σ then
+        // materializes declaring one name and referencing another.
+        //
+        // Minted here and related in [`FreshenCache::relate_kind_copy`] after the bounds are
+        // copied, rather than through [`copy_var`]: that copies a kind's edges eagerly,
+        // and since an edge is recorded on both ends it would pull this variable's whole
+        // undirected component into every instantiation — kinds no part of this copy names. The
+        // edges this copy owes are the ones to kinds the instantiation actually copied, which is
+        // what the cache holds once the bounds are done.
+        let fun_kind = match cache.copy_of(original.fun_kind()) {
+            Some(existing) => existing,
+            None => {
+                let f = FunKindVar::fresh(solver, level);
+                cache.record_copy(original.fun_kind(), Rc::clone(&f));
+                f
             }
-            v.inherit_witness_placement_renamed(
-                solver,
-                tv,
-                |k| cache.copy_of(k).unwrap_or_else(|| Rc::clone(k)),
-                |w| cache.witnesses.get(w).copied().unwrap_or(*w),
-            );
-            if tv.names_domain(solver) {
-                v.mark_named_domain(solver);
-            }
-            v.inherit_stands_for(solver, tv);
-            cache.record_copy(tv, Rc::clone(&v));
-
-            // Snapshot bounds before recursing — the recursion may touch
-            // other variables but must not see partially-mutated state.
-            let (lows, ups, kinds) = {
-                let s = tv.bounds(solver);
-                (
-                    Rc::clone(s.lower()),
-                    Rc::clone(s.upper()),
-                    s.type_kinds.clone(),
-                )
-            };
-            // Freshen the bound's type *and* its edge substitutions' discharge
-            // payloads: a payload is a captured argument *term* whose type
-            // slots still reference the source graph's variables, so it is
-            // freshened through the same `cache` (the uniform term+type freshen
-            // that subsumes the old separate `freshen_bound_substs` sweep).
-            let new_lows: Vec<_> = lows
-                .iter()
-                .map(|b| Bound {
-                    origin: b.origin,
-                    self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
-                    ty: freshen_above(solver, lim, &b.ty, target, cache),
-                    ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
-                    rendered: Default::default(),
-                })
-                .collect();
-            let new_ups: Vec<_> = ups
-                .iter()
-                .map(|b| Bound {
-                    origin: b.origin,
-                    self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
-                    ty: freshen_above(solver, lim, &b.ty, target, cache),
-                    ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
-                    rendered: Default::default(),
-                })
-                .collect();
-            // Every instantiation gets its own copy of the kinding constraints. A
-            // generalized definition's requirement is part of its scheme, so dropping
-            // it here would make the requirement vanish at each use site — the
-            // constraint would be checked on a variable nothing resolves and never on
-            // the ones that do.
-            let new_kinds: Vec<_> = kinds
-                .iter()
-                .map(|k| k.map_children(|t| freshen_above(solver, lim, t, target, cache)))
-                .collect();
-            // And of the guarded bounds, for the same reason: each instantiation's lower bounds
-            // are checked under its own copy. The guard is freshened as the refinement it is, on
-            // the copy of the variable it guards.
-            let guarded = tv.bounds(solver).guarded_upper.clone();
-            let new_guarded: Vec<_> = guarded
-                .iter()
-                .map(|g| {
-                    let guarded_ty = freshen_above(
-                        solver,
-                        lim,
-                        &Type::refined(Type::Infer(Rc::clone(tv)), g.guard.clone()),
-                        target,
-                        cache,
-                    );
-                    crate::ccl::infer_var::GuardedBound {
-                        guard: guarded_ty.refinements().iter().cloned().collect(),
-                        bound: Bound {
-                            origin: g.bound.origin,
-                            self_subst: freshen_subst_payloads(
-                                solver,
-                                lim,
-                                &g.bound.self_subst,
-                                target,
-                                cache,
-                            ),
-                            ty: freshen_above(solver, lim, &g.bound.ty, target, cache),
-                            ty_subst: freshen_subst_payloads(
-                                solver,
-                                lim,
-                                &g.bound.ty_subst,
-                                target,
-                                cache,
-                            ),
-                            rendered: Default::default(),
-                        },
-                    }
-                })
-                .collect();
-            {
-                let s = v.bounds_mut(solver);
-                s.set_lower(new_lows);
-                s.set_upper(new_ups);
-                s.type_kinds = new_kinds;
-                s.guarded_upper = new_guarded;
-            }
-            // A suspension's kinds are decided on it, and so on its copy
-            // ([`crate::ccl::infer_var::SuspendedMembership`]).
-            for m in crate::ccl::infer_var::suspended_memberships_of(solver, tv) {
-                let kind = m
-                    .kind
-                    .map_children(|t| freshen_above(solver, lim, t, target, cache));
-                let witnesses = m
-                    .witnesses
-                    .map_types(|t| freshen_above(solver, lim, t, target, cache));
-                crate::ccl::infer_var::record_suspended_membership(
-                    solver,
-                    crate::ccl::infer_var::SuspendedMembership {
-                        var: Rc::clone(&v),
-                        kind,
-                        witnesses,
-                        origin: m.origin,
-                    },
-                );
-            }
-            // And a membership recorded on a reading of the original, which only the original's
-            // suspensions reach: the copy reads the same way, and the kind is decided on that.
-            let readings: Vec<Rc<InferVar>> = tv
-                .suspensions(solver)
-                .iter()
-                .map(|(_, held)| Rc::clone(held))
-                .filter(|held| crate::ccl::infer_var::has_suspended_memberships(solver, held))
-                .collect();
-            for held in readings {
-                freshen_above(solver, lim, &Type::Infer(held), target, cache);
-            }
-            cache.relate_kind_copy(solver, tv.fun_kind(), v.fun_kind(), lim, target);
-            let watches = tv.watches(solver).to_vec();
-            freshen_watches(
-                solver,
-                lim,
-                watches,
-                &|solver, original, copy, pos| copy.copy_watch(solver, original, pos, tv.uid, &v),
-                target,
-                cache,
-            );
-            v
-        }
+        };
+        // A barrier variable's copy is one, standing under the same opaque binders.
+        let opaque = original.opaque().cloned();
+        crate::ccl::infer_var::TypeVarFixed::new(fun_kind, opaque)
     }
-}
 
-/// A new copy of `barrier`, as [`copy_infer_var`] copies a variable, over what a barrier
-/// variable carries: its opaque binders, its lower and upper bounds, and its watches. Its level
-/// is read from the bounds, so the copy's follows from the freshened ones. It has no telescope
-/// or kind to copy.
-fn copy_barrier_var(
-    solver: &mut Solver,
-    lim: Level,
-    barrier: &Rc<BarrierVar>,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-) -> Rc<BarrierVar> {
-    {
-        {
-            // Registered before the bounds are copied, so a bound that reaches this
-            // barrier variable again resolves to the copy.
-            let fresh =
-                BarrierVar::fresh(solver, Rc::clone(barrier.opaque()), Vec::new(), Vec::new());
-            cache.record_copy(barrier, Rc::clone(&fresh));
+    fn copy_recorded(
+        solver: &mut Solver,
+        lim: Level,
+        original: &Rc<InferVar>,
+        copy: &Rc<InferVar>,
+        target: FreshenLevel,
+        cache: &mut FreshenCache,
+    ) {
+        // The kinds the original sits under are this copy's kinds, whichever this walk
+        // reaches first: a variable copied before the function it is a part of would
+        // otherwise sit under the definition's kind, which nothing at the use relates to.
+        for k in original.witness_scope_kinds(solver) {
+            freshen_handle(solver, lim, &k, target, cache);
+        }
+        copy.inherit_witness_placement_renamed(
+            solver,
+            original,
+            |k| cache.copy_of(k).unwrap_or_else(|| Rc::clone(k)),
+            |w| cache.witnesses.get(w).copied().unwrap_or(*w),
+        );
+        if original.names_domain(solver) {
+            copy.mark_named_domain(solver);
+        }
+        copy.inherit_stands_for(solver, original);
 
-            // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = barrier.lowers(solver).to_vec();
-            let ups = barrier.uppers(solver).to_vec();
-            let mut freshen_bound = |b: &Bound| Bound {
+        // Snapshot bounds before recursing — the recursion may touch
+        // other variables but must not see partially-mutated state.
+        let (lows, ups, kinds) = {
+            let s = original.bounds(solver);
+            (
+                Rc::clone(s.lower()),
+                Rc::clone(s.upper()),
+                s.type_kinds.clone(),
+            )
+        };
+        // Freshen the bound's type *and* its edge substitutions' discharge
+        // payloads: a payload is a captured argument *term* whose type
+        // slots still reference the source graph's variables, so it is
+        // freshened through the same `cache` (the uniform term+type freshen
+        // that subsumes the old separate `freshen_bound_substs` sweep).
+        let new_lows: Vec<_> = lows
+            .iter()
+            .map(|b| Bound {
                 origin: b.origin,
                 self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
                 ty: freshen_above(solver, lim, &b.ty, target, cache),
                 ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
                 rendered: Default::default(),
-            };
-            let new_lows: Vec<_> = lows.iter().map(&mut freshen_bound).collect();
-            let new_ups: Vec<_> = ups
-                .iter()
-                .map(|u| crate::ccl::BarrierUpper {
-                    bound: freshen_bound(&u.bound),
-                    report: u.report.clone(),
-                })
-                .collect();
-            *fresh.lowers_mut(solver) = new_lows;
-            *fresh.uppers_mut(solver) = new_ups;
+            })
+            .collect();
+        let new_ups: Vec<_> = ups
+            .iter()
+            .map(|b| Bound {
+                origin: b.origin,
+                self_subst: freshen_subst_payloads(solver, lim, &b.self_subst, target, cache),
+                ty: freshen_above(solver, lim, &b.ty, target, cache),
+                ty_subst: freshen_subst_payloads(solver, lim, &b.ty_subst, target, cache),
+                rendered: Default::default(),
+            })
+            .collect();
+        // Every instantiation gets its own copy of the kinding constraints. A
+        // generalized definition's requirement is part of its scheme, so dropping
+        // it here would make the requirement vanish at each use site — the
+        // constraint would be checked on a variable nothing resolves and never on
+        // the ones that do.
+        let new_kinds: Vec<_> = kinds
+            .iter()
+            .map(|k| k.map_children(|t| freshen_above(solver, lim, t, target, cache)))
+            .collect();
+        // And of the guarded bounds, for the same reason: each instantiation's lower bounds
+        // are checked under its own copy. The guard is freshened as the refinement it is, on
+        // the copy of the variable it guards.
+        let guarded = original.bounds(solver).guarded_upper.clone();
+        let new_guarded: Vec<_> = guarded
+            .iter()
+            .map(|g| {
+                let guarded_ty = freshen_above(
+                    solver,
+                    lim,
+                    &Type::refined(Type::Infer(Rc::clone(original)), g.guard.clone()),
+                    target,
+                    cache,
+                );
+                crate::ccl::infer_var::GuardedBound {
+                    guard: guarded_ty.refinements().iter().cloned().collect(),
+                    bound: Bound {
+                        origin: g.bound.origin,
+                        self_subst: freshen_subst_payloads(
+                            solver,
+                            lim,
+                            &g.bound.self_subst,
+                            target,
+                            cache,
+                        ),
+                        ty: freshen_above(solver, lim, &g.bound.ty, target, cache),
+                        ty_subst: freshen_subst_payloads(
+                            solver,
+                            lim,
+                            &g.bound.ty_subst,
+                            target,
+                            cache,
+                        ),
+                        rendered: Default::default(),
+                    },
+                }
+            })
+            .collect();
+        let s = copy.bounds_mut(solver);
+        s.set_lower(new_lows);
+        s.set_upper(new_ups);
+        s.type_kinds = new_kinds;
+        s.guarded_upper = new_guarded;
+        // A suspension's kinds are decided on it, and so on its copy
+        // ([`crate::ccl::infer_var::SuspendedMembership`]).
+        for m in crate::ccl::infer_var::suspended_memberships_of(solver, original) {
+            let kind = m
+                .kind
+                .map_children(|t| freshen_above(solver, lim, t, target, cache));
+            let witnesses = m
+                .witnesses
+                .map_types(|t| freshen_above(solver, lim, t, target, cache));
+            crate::ccl::infer_var::record_suspended_membership(
+                solver,
+                crate::ccl::infer_var::SuspendedMembership {
+                    var: Rc::clone(copy),
+                    kind,
+                    witnesses,
+                    origin: m.origin,
+                },
+            );
+        }
+        // And a membership recorded on a reading of the original, which only the original's
+        // suspensions reach: the copy reads the same way, and the kind is decided on that.
+        let readings: Vec<Rc<InferVar>> = original
+            .suspensions(solver)
+            .iter()
+            .map(|(_, held)| Rc::clone(held))
+            .filter(|held| crate::ccl::infer_var::has_suspended_memberships(solver, held))
+            .collect();
+        for held in readings {
+            freshen_above(solver, lim, &Type::Infer(held), target, cache);
+        }
+        cache.relate_kind_copy(solver, original.fun_kind(), copy.fun_kind(), lim, target);
+        let watches = original.watches(solver).to_vec();
+        if original.is_barrier() {
+            // An upper bound's report is the edge's that recorded it, the copy's too.
+            for (i, upper) in original.barrier_uppers(solver).iter().enumerate() {
+                if let Some(report) = &upper.report {
+                    copy.report_upper(solver, i, Rc::clone(report));
+                }
+            }
             // A barrier variable is never an operand, so the copy records the watch
             // without `TraitObligation::watch`, which would make it one.
-            let watches = barrier.watches(solver).to_vec();
             freshen_watches(
                 solver,
                 lim,
                 watches,
-                &|solver, _, copy, pos| fresh.watches_mut(solver).push((Rc::clone(copy), pos)),
+                &|solver, _, obligation, pos| {
+                    copy.watches_mut(solver).push((Rc::clone(obligation), pos))
+                },
                 target,
                 cache,
             );
-            fresh
+        } else {
+            freshen_watches(
+                solver,
+                lim,
+                watches,
+                &|solver, from, obligation, pos| {
+                    obligation.copy_watch(solver, from, pos, original.uid, copy)
+                },
+                target,
+                cache,
+            );
         }
     }
 }
@@ -1953,7 +1961,7 @@ impl FreshenCache {
                 }
             }
             // **Which binder each position is, recorded on the copy**, as
-            // [`freshen_kind_var`] does: the cache rewrites the references this
+            // [`copy_var`] does: the cache rewrites the references this
             // instantiation carries and is then gone, so a reference written in the
             // original's binder that arrives later has nothing else to relate it to. A copy
             // relation and not an edge — what the two share is which binder each position
@@ -2056,12 +2064,7 @@ fn copy_obligation(
             obligation
                 .effects()
                 .into_iter()
-                .map(|(assoc, var)| {
-                    (
-                        assoc,
-                        freshen_capability_var(solver, lim, &var, target, cache),
-                    )
-                })
+                .map(|(assoc, var)| (assoc, freshen_handle(solver, lim, &var, target, cache)))
                 .collect(),
         );
         let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation_inputs");
@@ -2199,7 +2202,6 @@ pub fn seed_chan_dom_pairings(
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum BoundHolder {
     InferVar(InferVarId),
-    BarrierVar(BarrierVarId),
 }
 
 fn seed_pairings_go(
@@ -2221,11 +2223,19 @@ fn seed_pairings_go(
     // by its `Fun`). Descend through the bounds, once per var (`seen` guards
     // the cyclic bound graph). The use side is resolved; a placeholder var
     // there has no bounds and pairs nothing.
+    // A barrier variable resolves to the join of its lower bounds, so those carry its
+    // structure on either side; its upper bounds are checks against that join and add no
+    // position to pair.
     if let Type::Infer(dv) = peel(def_ty) {
         if seen.insert(BoundHolder::InferVar(dv.uid)) {
             let (lows, ups) = {
                 let s = dv.bounds(solver);
-                (Rc::clone(s.lower()), Rc::clone(s.upper()))
+                let ups = if dv.is_barrier() {
+                    Rc::new(Vec::new())
+                } else {
+                    Rc::clone(s.upper())
+                };
+                (Rc::clone(s.lower()), ups)
             };
             for b in lows.iter().chain(ups.iter()) {
                 seed_pairings_go(solver, use_ty, &b.ty, lim, out, seen);
@@ -2237,30 +2247,14 @@ fn seed_pairings_go(
         if seen.insert(BoundHolder::InferVar(uv.uid)) {
             let (lows, ups) = {
                 let s = uv.bounds(solver);
-                (Rc::clone(s.lower()), Rc::clone(s.upper()))
+                let ups = if uv.is_barrier() {
+                    Rc::new(Vec::new())
+                } else {
+                    Rc::clone(s.upper())
+                };
+                (Rc::clone(s.lower()), ups)
             };
             for b in lows.iter().chain(ups.iter()) {
-                seed_pairings_go(solver, &b.ty, def_ty, lim, out, seen);
-            }
-        }
-        return;
-    }
-    // A barrier variable resolves to the join of its lower bounds, so those carry its
-    // structure on either side. Its upper bounds are checks against that join and
-    // add no position to pair.
-    if let Type::BarrierVar(dh) = peel(def_ty) {
-        if seen.insert(BoundHolder::BarrierVar(dh.uid)) {
-            let lows = dh.lowers(solver).to_vec();
-            for b in &lows {
-                seed_pairings_go(solver, use_ty, &b.ty, lim, out, seen);
-            }
-        }
-        return;
-    }
-    if let Type::BarrierVar(uh) = peel(use_ty) {
-        if seen.insert(BoundHolder::BarrierVar(uh.uid)) {
-            let lows = uh.lowers(solver).to_vec();
-            for b in &lows {
                 seed_pairings_go(solver, &b.ty, def_ty, lim, out, seen);
             }
         }

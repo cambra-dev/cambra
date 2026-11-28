@@ -84,11 +84,12 @@ pub use state::Solver;
 pub fn type_level(solver: &Solver, ty: &Type) -> Level {
     match ty {
         Type::Infer(v) => v.level(solver),
-        Type::BarrierVar(barrier) => barrier.level(solver),
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.
         Type::BoundedHole(t) => type_level(solver, t),
+        // An output annotation's barrier is minted at the level it is normalized at.
+        Type::BarrierHole(_) => 0,
         Type::Fun {
             fun_kind,
             domain: d,

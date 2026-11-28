@@ -17,14 +17,13 @@ use crate::ccl::Type;
 use crate::ccl::capabilities::{Capabilities, CapabilityVar, CapabilityVarId, Requirement};
 use crate::ccl::expr::TypedExpr;
 use crate::ccl::infer::solver::traits::{TraitObligation, TraitObligationId};
-use crate::ccl::infer_var::{BarrierVar, BarrierVarId, InferVar, InferVarId};
+use crate::ccl::infer_var::{InferVar, InferVarId};
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId, HeldTerm, TraitRequirement};
 
 /// One handle to a typing run's state.
 #[derive(Clone)]
 pub enum Held {
     Infer(Rc<InferVar>),
-    Barrier(Rc<BarrierVar>),
     FunKind(Rc<FunKindVar>),
     Capability(Rc<CapabilityVar>),
     /// An ordering requirement, whose proof state its run records.
@@ -37,7 +36,6 @@ pub enum Held {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HeldKey {
     Infer(InferVarId),
-    Barrier(BarrierVarId),
     FunKind(FunKindVarId),
     Capability(CapabilityVarId),
     Ordering(u32),
@@ -48,7 +46,6 @@ impl Held {
     pub fn key(&self) -> HeldKey {
         match self {
             Held::Infer(v) => HeldKey::Infer(v.uid),
-            Held::Barrier(b) => HeldKey::Barrier(b.uid),
             Held::FunKind(k) => HeldKey::FunKind(k.uid),
             Held::Capability(c) => HeldKey::Capability(c.uid),
             Held::Ordering(r) => HeldKey::Ordering(
@@ -90,7 +87,6 @@ macro_rules! held_kind {
 }
 
 held_kind!(Rc<InferVar>, Infer, |v| v.uid);
-held_kind!(Rc<BarrierVar>, Barrier, |b| b.uid);
 held_kind!(Rc<FunKindVar>, FunKind, |k| k.uid);
 held_kind!(Rc<CapabilityVar>, Capability, |c| c.uid);
 held_kind!(Rc<TraitObligation>, Obligation, |o| o.uid);
@@ -121,7 +117,7 @@ impl<F: FnMut(Held)> HeldVisitor for F {
 /// enters every part a walk reports; at each capability value and each ordering requirement it
 /// first asks the rewriter for a replacement.
 pub trait HeldRewriter {
-    /// What `ty`, an inference or barrier variable, becomes, or `None` to keep it. The rewrite
+    /// What `ty`, an inference variable, becomes, or `None` to keep it. The rewrite
     /// then enters what the answer holds.
     fn type_variable(&mut self, _ty: &Type) -> Option<Type> {
         None
@@ -165,7 +161,6 @@ impl HoldsSolverState for Type {
     fn walk_held(&self, v: &mut dyn HeldVisitor) {
         match self {
             Type::Infer(var) => v.held(Held::Infer(Rc::clone(var))),
-            Type::BarrierVar(b) => v.held(Held::Barrier(Rc::clone(b))),
             Type::Fun {
                 fun_kind,
                 capabilities,
@@ -186,7 +181,7 @@ impl HoldsSolverState for Type {
 
     fn rewrite_held(&mut self, m: &mut dyn HeldRewriter) -> bool {
         let mut changed = false;
-        if matches!(self, Type::Infer(_) | Type::BarrierVar(_))
+        if matches!(self, Type::Infer(_))
             && let Some(replaced) = m.type_variable(self)
             && replaced != *self
         {

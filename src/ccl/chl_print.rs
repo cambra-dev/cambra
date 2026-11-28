@@ -434,7 +434,7 @@ impl Printer<'_, '_> {
             Type::DataSource(name) => format!("Source({name})"),
             Type::Txn => "Txn".to_string(),
             Type::Hole => "_".to_string(),
-            Type::SharedHole(_) | Type::BarrierVar(_) | Type::Infer(_) | Type::Undetermined(_) => {
+            Type::SharedHole(_) | Type::BarrierHole(_) | Type::Infer(_) | Type::Undetermined(_) => {
                 self.variable(ty)
             }
             Type::Param(p) => match self.joins.iter().find(|(id, _)| *id == p.id) {

@@ -2620,7 +2620,7 @@ pub fn check_module(
                         | Type::Hole
                         | Type::SharedHole(_)
                         | Type::BoundedHole(_)
-                        | Type::BarrierVar(_)
+                        | Type::BarrierHole(_)
                 )
             })
         {
@@ -3282,8 +3282,8 @@ fn collect_type_errors(
         // `normalize_annotation` resolves both. A survivor means the annotation
         // never reached normalization, which is the same compiler bug either way.
         //
-        // BarrierVar is handled the same way.
-        Type::Hole | Type::BarrierVar(_) | Type::SharedHole(_) => {
+        // An output annotation's barrier is handled the same way.
+        Type::Hole | Type::BarrierHole(_) | Type::SharedHole(_) => {
             errors.push(InferError::UnresolvedHole {
                 at: context_sym.to_string(),
             })
