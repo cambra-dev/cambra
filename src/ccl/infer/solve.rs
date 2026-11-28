@@ -2326,6 +2326,17 @@ fn stands_at(solver: &mut Solver, ty: &Type) -> Type {
 }
 
 pub(crate) fn resolve_var_type(solver: &mut Solver, ty: &Type) -> Result<Type, CoalesceError> {
+    resolve_var_type_with(solver, ty, false)
+}
+
+/// [`resolve_var_type`], with each position's contribution origins collected where `origins`
+/// holds: what a failure reported at a position reads
+/// ([`compact_type_with_origins`](crate::ccl::infer::solver::compact::compact_type_with_origins)).
+fn resolve_var_type_with(
+    solver: &mut Solver,
+    ty: &Type,
+    origins: bool,
+) -> Result<Type, CoalesceError> {
     // A generalized type is born after inference, resolved: the solver has nothing to say about it
     // (`src/ccl/design/type-parameters.md`, "Generalized types").
     if crate::ccl::generalize::holds_generalized_type(ty)
@@ -2333,7 +2344,11 @@ pub(crate) fn resolve_var_type(solver: &mut Solver, ty: &Type) -> Result<Type, C
     {
         return Ok(ty.clone());
     }
-    let compacted = compact_type(solver, ty);
+    let compacted = if origins {
+        crate::ccl::infer::solver::compact::compact_type_with_origins(solver, ty)
+    } else {
+        compact_type(solver, ty)
+    };
     crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(
         solver, &compacted,
     )?;
@@ -2354,7 +2369,7 @@ pub(crate) fn resolve_var_type(solver: &mut Solver, ty: &Type) -> Result<Type, C
 /// from positions. It drops no contribution, so the unsimplified graph fails at the same
 /// position, which still lists them.
 fn failing_position(solver: &mut Solver, ty: &Type) -> Option<FailedPosition> {
-    let compacted = compact_type(solver, ty);
+    let compacted = crate::ccl::infer::solver::compact::compact_type_with_origins(solver, ty);
     let error = crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(
         solver, &compacted,
     )
@@ -2521,6 +2536,7 @@ fn resolve_binder_slot(
     level: Level,
     ctx: &mut CoalesceCtx,
 ) {
+    let source = slot.clone();
     let (resolved, pending) =
         crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
             resolve_var_type(solver, slot)
@@ -2533,7 +2549,7 @@ fn resolve_binder_slot(
         }
     }
     coalesce_type_predicates(solver, slot, level, ctx);
-    decide_memberships(solver, pending, level, ctx, &|_| label.clone());
+    decide_memberships(solver, &source, pending, level, ctx, &|_| label.clone());
 }
 
 /// Resolve a node's capabilities and its own where they are still pending, as coalesce resolves
@@ -2548,16 +2564,24 @@ fn settle_node_capabilities(solver: &mut Solver, expr: &mut Expr) {
     }
 }
 
-/// Decide the memberships a materialization collected, now that the types they read are types
-/// with their predicates coalesced, under the binders in scope here.
+/// Decide the memberships a materialization of `source` collected, now that the types they read
+/// are types with their predicates coalesced, under the binders in scope here.
+///
+/// A materialization collects no contribution origins, and a failed membership's report reads
+/// its position's. So the first failure materializes `source` again with them, which collects
+/// the same memberships in the same order, and each failure is reported at its membership's
+/// position there.
 fn decide_memberships(
     solver: &mut Solver,
+    source: &Type,
     pending: Vec<crate::ccl::infer::solver::coalesce::PendingMembership>,
     level: Level,
     ctx: &mut CoalesceCtx,
     label: &dyn Fn(&mut Solver) -> String,
 ) {
-    for mut m in pending {
+    let mut with_origins: Option<Vec<crate::ccl::infer::solver::coalesce::PendingMembership>> =
+        None;
+    for (i, mut m) in pending.into_iter().enumerate() {
         coalesce_type_predicates(solver, &mut m.found, level, ctx);
         let admitted = crate::ccl::infer::solver::constrain::admits_resolved(
             solver,
@@ -2567,6 +2591,20 @@ fn decide_memberships(
             &ResolvingScope(&ctx.binders),
         );
         if !admitted {
+            if with_origins.is_none() {
+                let (_, again) =
+                    crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
+                        resolve_var_type_with(solver, source, true)
+                    });
+                with_origins = Some(again);
+            }
+            let position = with_origins
+                .as_ref()
+                .and_then(|again| again.get(i))
+                .filter(|again| again.kind == m.kind)
+                .expect("materializing again with origins collects the same memberships")
+                .position
+                .clone();
             let err = CoalesceError::KindMismatch {
                 resolved: Box::new(m.found.clone()),
                 type_kind: m.kind,
@@ -2576,7 +2614,7 @@ fn decide_memberships(
                 .or_default()
                 .extend(reachable_vars(solver, &m.found));
             let label = label(solver);
-            ctx.push_position_error(solver, Some(m.position), map_coalesce_err(err, &label));
+            ctx.push_position_error(solver, Some(position), map_coalesce_err(err, &label));
         }
     }
 }
@@ -3132,6 +3170,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         // which reports it.
         TypedExprNode::Feed { value, row, .. } => {
             coalesce_node(solver, value, level, ctx);
+            let source = row.clone();
             let (resolved, pending) =
                 crate::ccl::infer::solver::coalesce::collecting_memberships(solver, |solver| {
                     resolve_var_type(solver, row)
@@ -3139,7 +3178,9 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             if let Ok(ty) = resolved {
                 *row = ty;
                 coalesce_type_predicates(solver, row, level, ctx);
-                decide_memberships(solver, pending, level, ctx, &|_| "a feed's row".to_string());
+                decide_memberships(solver, &source, pending, level, ctx, &|_| {
+                    "a feed's row".to_string()
+                });
             }
         }
         TypedExprNode::Define { value, .. } => {
@@ -3289,6 +3330,7 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
         expr.node,
         TypedExprNode::Let { .. } | TypedExprNode::ExprStmt { .. } | TypedExprNode::MutDecl { .. }
     ) && !never_has_value(expr);
+    let source = expr.ty.clone();
     let pending = if spine {
         settle_node_capabilities(solver, expr);
         Vec::new()
@@ -3439,7 +3481,9 @@ fn coalesce_node_inner(solver: &mut Solver, expr: &mut Expr, level: Level, ctx: 
             coalesce_type_predicates(solver, target, level, ctx);
         }
     }
-    decide_memberships(solver, pending, level, ctx, &|solver| label(solver, expr));
+    decide_memberships(solver, &source, pending, level, ctx, &|solver| {
+        label(solver, expr)
+    });
 
     // A compiler instance builds its function at the type the call resolved to, so it is
     // chosen once that type is.
