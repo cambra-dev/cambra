@@ -68,7 +68,7 @@ pub use compact::{
 };
 pub use constrain::{
     ConstrainCache, ConstrainError, Derivation, constrain_subtype, constrain_subtype_in,
-    constrain_subtype_under_in, extrude,
+    constrain_subtype_under_in, constrain_subtype_under_lets_in, extrude,
 };
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
@@ -131,6 +131,9 @@ pub fn type_level(solver: &Solver, ty: &Type) -> Level {
             .max()
             .unwrap_or(0)
             .max(type_level(solver, body)),
+        // The definition is a held term, which the level reads no more than a refinement's
+        // predicate.
+        Type::Let(l) => type_level(solver, &l.body),
         Type::Record(fs) => fs
             .iter()
             .map(|(_, t)| type_level(solver, t))

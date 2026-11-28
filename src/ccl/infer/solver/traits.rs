@@ -695,7 +695,7 @@ impl Trait {
         match self.products {
             ProductReading::None => false,
             ProductReading::AnyProduct => true,
-            ProductReading::Tuples => matches!(product.peel_refinements(), Type::Tuple(_)),
+            ProductReading::Tuples => matches!(product.former(), Type::Tuple(_)),
         }
     }
 
@@ -2570,7 +2570,7 @@ impl TraitObligation {
                 operator: self.operator_node_id,
             });
         }
-        if let Type::Nominal(decl, args) = contribution.peel_refinements() {
+        if let Type::Nominal(decl, args) = contribution.lets_distributed().peel_refinements() {
             self.expand(solver, pos, decl, args, cache)?;
         }
         self.try_deposit(solver, cache)
@@ -2604,7 +2604,7 @@ impl TraitObligation {
         }
         for (index, arg) in args.iter().enumerate() {
             let slot = self.arg_slot(pos, index as u8, decl);
-            match arg.peel_refinements() {
+            match arg.lets_distributed().peel_refinements() {
                 Type::Infer(var) => {
                     let watched = Type::Infer(Rc::clone(var));
                     self.watch(solver, &watched, slot);
@@ -4208,13 +4208,17 @@ struct Place {
 }
 
 /// Strip every refinement, as [`offered`] does: `{𝑇 | 𝑝}` constrains a place
-/// exactly as `𝑇` does, so structure underneath a refinement is still structure.
+/// exactly as `𝑇` does, so structure underneath a refinement is still structure. A held
+/// `let` stands over its body's places, which the grouping reads by structure alone.
 fn peel_refinements(ty: &Type) -> &Type {
     let mut cur = ty;
-    while let Type::Refinement(inner, _) = cur {
-        cur = inner;
+    loop {
+        match cur {
+            Type::Refinement(inner, _) => cur = inner,
+            Type::Let(l) => cur = &l.body,
+            _ => return cur,
+        }
     }
-    cur
 }
 
 /// Group everything reachable from `root` into the [`Place`] it constrains, keyed by
@@ -4357,7 +4361,9 @@ fn places_under(solver: &mut Solver, root: &Rc<InferVar>) -> BTreeMap<StepPath, 
                 Type::Family { .. } => {}
                 Type::Poly(_) => unreachable!("a polymorphic type is never a recorded bound"),
                 // `peel_refinements` returns a non-refinement by construction.
-                Type::Refinement(_, _) => unreachable!("refinements are peeled above"),
+                Type::Refinement(_, _) | Type::Let(_) => {
+                    unreachable!("refinements and type `let`s are peeled above")
+                }
                 // `BoundedHole` is a *pre-inference* annotation marker:
                 // `normalize_annotation` erases it into a bounded variable before any
                 // constraint is emitted, so it is never a recorded bound.
@@ -4967,7 +4973,7 @@ pub(super) fn link_watches(
         // A method call reads a nominal type from above too ([`notify_upper`]).
         let nominal_above: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = uppers
             .iter()
-            .filter(|b| matches!(b.ty.peel_refinements(), Type::Nominal(..)))
+            .filter(|b| matches!(b.ty.former(), Type::Nominal(..)))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
         let below: Vec<(Rc<InferVar>, crate::ccl::subst::Subst)> = lowers
@@ -5130,7 +5136,7 @@ fn deliver_in_frame(
     value: Option<crate::ccl::infer_var::Origin>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    if let Type::FamilyApp(_) = contribution.peel_refinements() {
+    if let Type::FamilyApp(_) = contribution.former() {
         let frame = obligation.frame_of(pos, var);
         if !frame.is_id() {
             let at = frame
@@ -5164,8 +5170,7 @@ pub(super) fn notify_upper(
         .filter(|(obligation, _)| {
             (obligation.trait_.reads_collections() && is_structural_collection(solver, bound))
                 || (obligation.trait_.reads_places() && bound.is_place())
-                || (obligation.trait_.is_method()
-                    && matches!(bound.peel_refinements(), Type::Nominal(..)))
+                || (obligation.trait_.is_method() && matches!(bound.former(), Type::Nominal(..)))
         })
         .cloned()
         .collect();
@@ -5229,10 +5234,12 @@ fn offer(
         // instances left tell apart by them.
         Offered::Nominal(decl) => obligation
             .narrow(solver, pos, &InstanceHead::Nominal(Rc::clone(decl)), cache)
-            .and_then(|()| match contribution.peel_refinements() {
-                Type::Nominal(decl, args) => obligation.expand(solver, pos, decl, args, cache),
-                _ => Ok(()),
-            }),
+            .and_then(
+                |()| match contribution.lets_distributed().peel_refinements() {
+                    Type::Nominal(decl, args) => obligation.expand(solver, pos, decl, args, cache),
+                    _ => Ok(()),
+                },
+            ),
         Offered::Product(product) => obligation.narrow_product(solver, pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
         Offered::Param(param) => obligation.narrow_param(solver, pos, param, cache),
@@ -5245,7 +5252,7 @@ fn offer(
 /// one. A function whose kind is not settled
 /// yet counts, and a compute function does not: a function that is only called is no collection.
 pub fn is_structural_collection(solver: &Solver, ty: &Type) -> bool {
-    match ty.peel_refinements() {
+    match ty.former() {
         Type::Fun { fun_kind, .. } => {
             fun_kind.resolved_in(solver) != crate::ccl::ty::KindPin::Compute
         }

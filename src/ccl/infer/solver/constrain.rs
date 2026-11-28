@@ -632,6 +632,20 @@ pub fn constrain_subtype_in(
     constrain_go(solver, lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
 }
 
+/// [`constrain_subtype_in`] with both sides read under `lets`, the `let` exits of the scope the
+/// edge is drawn in: the morphism a type `let` around each side composes ahead of it.
+pub fn constrain_subtype_under_lets_in(
+    solver: &mut Solver,
+    lhs: &Type,
+    rhs: &Type,
+    lets: &Subst,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
+    solver.proxies.walk();
+    constrain_go(solver, lhs, rhs, lets, lets, cache, scope)
+}
+
 /// [`constrain_subtype_in`] with `rhs` read under `rhs_subst`: an argument against its
 /// parameter, whose type reads the parameters before it, discharged at their arguments.
 pub fn constrain_subtype_discharged_in(
@@ -718,7 +732,8 @@ pub(super) fn constrain_opaque_upper(
     result
 }
 
-/// [`constrain_subtype`], with both sides judged **under `binders`** and in `scope`.
+/// [`constrain_subtype`], with both sides judged **under `binders`** and in `scope`, and read
+/// under `lets` as in [`constrain_subtype_under_lets_in`].
 ///
 /// For an edge drawn between parts of a type the caller has already taken apart: a function's
 /// domain compared on its own is a reference stripped of the Σ that classifies it, so the
@@ -732,8 +747,8 @@ pub fn constrain_subtype_under_in(
     solver: &mut Solver,
     lhs: &Type,
     rhs: &Type,
-    lhs_binders: &[crate::ccl::ty::Witness],
-    rhs_binders: &[crate::ccl::ty::Witness],
+    (lhs_binders, rhs_binders): (&[crate::ccl::ty::Witness], &[crate::ccl::ty::Witness]),
+    lets: &Subst,
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
@@ -743,9 +758,11 @@ pub fn constrain_subtype_under_in(
     // the instantiation off the two types is what puts both sides in one spelling, so the
     // reference comparison below is name equality rather than two unrelated names.
     let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
+    // Both sides are read under the scope's `let` exits, the right after its instantiation.
+    let rhs_subst = Subst::then(solver, lets, &instantiation);
     solver.proxies.walk();
     cache.under(lhs_binders, rhs_binders, |cache| {
-        constrain_go(solver, lhs, rhs, &Subst::id(), &instantiation, cache, scope)
+        constrain_go(solver, lhs, rhs, lets, &rhs_subst, cache, scope)
     })
 }
 
@@ -1161,9 +1178,7 @@ fn distinct_data_domains(
             Type::DepTuple(components) => Type::dep_tuple_in(solver, components),
             d => d,
         };
-        if matches!(d.peel_refinements(), Type::WitnessRef(_))
-            || crate::ccl::subst::type_contains_infer(&d)
-        {
+        if matches!(d.former(), Type::WitnessRef(_)) || crate::ccl::subst::type_contains_infer(&d) {
             continue;
         }
         // Compaction's rule, so the solver and the merge never answer this differently.
@@ -1371,16 +1386,27 @@ fn admits(
         type_kind: k.clone(),
     };
     // Each side is read in its own frame, through the edge's substitutions: two candidates
-    // spelling a binder each side names differently are one candidate.
+    // spelling a binder each side names differently are one candidate
+    // ([`crate::ccl::ty::alpha_eq`]).
     let mut listed = |k: &TypeKind| match k {
         TypeKind::Enumerated(sups) => {
             let d = sl.apply_type_in(solver, d);
-            sups.iter().any(|s| sr.apply_type_in(solver, s) == d)
+            sups.iter().any(|s| {
+                let s = sr.apply_type_in(solver, s);
+                crate::ccl::ty::alpha_eq(&s, &d)
+            })
         }
         _ => false,
     };
-    let filtered = !d.refinements().is_empty();
-    let range = match d.peel_refinements() {
+    let filtered = !d.standalone_refinements().is_empty();
+    // A projection under type `let`s is admitted as the projection is, its range read under
+    // the `let`s, as [`witness_range`] reads it.
+    let (lets, shape) = if projection_under_lets(d.peel_refinements()) {
+        crate::ccl::ty::TypeLet::peel(d.peel_refinements())
+    } else {
+        (Vec::new(), d.peel_refinements())
+    };
+    let range = match shape {
         Type::Infer(v) => {
             if mode == Membership::Check {
                 return Ok(());
@@ -1421,7 +1447,10 @@ fn admits(
         }
         _ if listed(k) => return Ok(()),
         Type::WitnessProjection(p) => match p.witness() {
-            Some(w) => Some(w.type_kind()),
+            Some(w) => Some(
+                w.type_kind()
+                    .map_children(|c| crate::ccl::ty::TypeLet::innermost_each(&lets, c.clone())),
+            ),
             None if mode == Membership::Check => {
                 return if filtered && matches!(k, TypeKind::UIntRanges) {
                     Err(not_of_kind())
@@ -1598,10 +1627,8 @@ pub fn contains_resolved(
 /// the types the witness ordering rule leaves to other arms. A refinement of a witness is
 /// compared by the refinement arms, which reach the witness beneath it.
 fn is_witness_or_var(t: &Type) -> bool {
-    matches!(
-        t.peel_refinements(),
-        Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::Infer(_)
-    )
+    let t = t.peel_refinements();
+    is_witness(t) || matches!(t, Type::Infer(_))
 }
 
 /// What the witness `t` ranges over: a reference's binder as `gamma` classifies it, a
@@ -1610,6 +1637,13 @@ fn is_witness_or_var(t: &Type) -> bool {
 /// scheme's binder carries into a variable before the term's sum is solved, has no range to
 /// compare against.
 fn witness_range(t: &Type, gamma: &crate::ccl::ty::WitnessContext) -> Option<TypeKind> {
+    // A held projection's range is its projection's, under the `let`s it reads.
+    if let Type::Let(_) = t {
+        let (lets, projection) = crate::ccl::ty::TypeLet::peel(t);
+        return witness_range(projection, gamma).map(|range| {
+            range.map_children(|c| crate::ccl::ty::TypeLet::innermost_each(&lets, c.clone()))
+        });
+    }
     match t {
         Type::WitnessRef(w) => gamma.type_kind_of(w),
         Type::WitnessProjection(p) => match p.witness() {
@@ -1617,7 +1651,7 @@ fn witness_range(t: &Type, gamma: &crate::ccl::ty::WitnessContext) -> Option<Typ
             // A term planning erased to a plain collection carries no witness: erasing a
             // determined sum leaves the collection over its one candidate, which is the
             // projection's one member.
-            None => match p.term.ty.peel_refinements() {
+            None => match p.term.ty.lets_distributed().peel_refinements() {
                 Type::Fun {
                     fun_kind: FunKind::Data(None),
                     domain,
@@ -1729,14 +1763,35 @@ fn constrain_go(
 
 /// The projection `ty` becomes under `s`, where `s` is not the identity: the projection's term
 /// substituted. A projection binds no witness, so nothing else in `s` reaches it.
+///
+/// A `let` exit is held: the projection reading `𝑥` under the exit `[𝑥 ↦ 𝑒]` becomes
+/// `let 𝑥 = 𝑒 in σ(𝑥)` ([`projection_under_lets`]), the spelling compaction gives it too. A held
+/// projection is a projection to every arm, and compares as the projection with the definition
+/// discharged.
 fn substituted_projection(solver: &mut Solver, ty: &Type, s: &Subst) -> Option<Type> {
-    let Type::WitnessProjection(_) = ty else {
-        return None;
-    };
-    if s.is_id() {
+    if !is_projection(ty) || s.is_id() {
         return None;
     }
     Some(s.apply_type_in(solver, ty))
+}
+
+/// Whether `ty` is a projection under type `let`s ([`substituted_projection`]).
+fn projection_under_lets(ty: &Type) -> bool {
+    matches!(ty, Type::Let(_))
+        && matches!(
+            crate::ccl::ty::TypeLet::peel(ty).1,
+            Type::WitnessProjection(_)
+        )
+}
+
+/// Whether `ty` is a projection, bare or under type `let`s.
+fn is_projection(ty: &Type) -> bool {
+    matches!(ty, Type::WitnessProjection(_)) || projection_under_lets(ty)
+}
+
+/// Whether `ty` is a witness: a reference, or a projection bare or under type `let`s.
+fn is_witness(ty: &Type) -> bool {
+    matches!(ty, Type::WitnessRef(_)) || is_projection(ty)
 }
 
 /// The type a witness reference `ty` becomes under `s`, where `s` discharges it rather than
@@ -1802,10 +1857,10 @@ fn constrain_go_impl(
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
-    // The trivial-equality short-circuit is only sound when the edge carries
-    // no transformation — under non-identity morphisms `lhs` and `rhs` live
-    // in different contexts even when structurally equal.
-    if sl.is_id() && sr.is_id() && lhs == rhs {
+    // The trivial-equality short-circuit is sound where both sides are read under one
+    // morphism, the identity or the scope's `let` exits on both: under different morphisms
+    // `lhs` and `rhs` live in different contexts even when structurally equal.
+    if ((sl.is_id() && sr.is_id()) || std::ptr::eq(sl, sr) || sl == sr) && lhs == rhs {
         return Ok(());
     }
 
@@ -1839,6 +1894,29 @@ fn constrain_go_impl(
         // is read back into it (`src/ccl/design/type-inference.md`, "A run closes what it
         // hands back").
         (Type::Undetermined(_), _) | (_, Type::Undetermined(_)) => Ok(()),
+        // A type `let` stands for its body with the definition held: the body is read under
+        // the `let`'s exit, composed ahead of its side's morphism, as compaction reads it, so a
+        // bound recorded below keeps the exit on its edge.
+        (Type::Let(l), _) if !projection_under_lets(lhs) => {
+            let exit = Subst::let_exit(l.name.clone(), Rc::clone(&l.definition));
+            let sl = Subst::then(solver, &exit, sl);
+            constrain_go(solver, &l.body, rhs, &sl, sr, cache, scope)
+        }
+        (_, Type::Let(r)) if !projection_under_lets(rhs) => {
+            let exit = Subst::let_exit(r.name.clone(), Rc::clone(&r.definition));
+            let sr = Subst::then(solver, &exit, sr);
+            constrain_go(solver, lhs, &r.body, sl, &sr, cache, scope)
+        }
+        // **Two projections are one witness where their terms are one value**, a projection
+        // reading a type `let`'s definition and the projection with the definition discharged among
+        // them (`Type`'s `==`).
+        (l, r) if is_projection(l) && is_projection(r) => {
+            if l == r {
+                Ok(())
+            } else {
+                Err(mismatch(solver, lhs, rhs, sl, sr))
+            }
+        }
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
         // `0..𝑛` is the `UInt`s below `𝑛`, so a range is below every range that includes it and
@@ -1893,10 +1971,16 @@ fn constrain_go_impl(
                     Variance::Contravariant => {
                         cache.swapped(|cache| constrain_go(solver, y, x, sr, sl, cache, scope))?
                     }
+                    // Each side's type `let`s stay around its argument, which then stands alone
+                    // under no morphism.
                     Variance::Invariant => {
-                        constrain_go(solver, x, y, &Subst::id(), &Subst::id(), cache, scope)?;
+                        let (x, y) = (
+                            sl.lets_over(solver, x.clone()),
+                            sr.lets_over(solver, y.clone()),
+                        );
+                        constrain_go(solver, &x, &y, &Subst::id(), &Subst::id(), cache, scope)?;
                         cache.swapped(|cache| {
-                            constrain_go(solver, y, x, &Subst::id(), &Subst::id(), cache, scope)
+                            constrain_go(solver, &y, &x, &Subst::id(), &Subst::id(), cache, scope)
                         })?;
                     }
                     // The output sides relate as a covariant argument does and the input
@@ -1905,9 +1989,17 @@ fn constrain_go_impl(
                     // with no morphism carried in, as an invariant pair's.
                     Variance::Bipolar => {
                         let ((xi, xo), (yi, yo)) = (sides(x), sides(y));
-                        constrain_go(solver, xo, yo, &Subst::id(), &Subst::id(), cache, scope)?;
+                        let (xi, xo) = (
+                            sl.lets_over(solver, xi.clone()),
+                            sl.lets_over(solver, xo.clone()),
+                        );
+                        let (yi, yo) = (
+                            sr.lets_over(solver, yi.clone()),
+                            sr.lets_over(solver, yo.clone()),
+                        );
+                        constrain_go(solver, &xo, &yo, &Subst::id(), &Subst::id(), cache, scope)?;
                         cache.swapped(|cache| {
-                            constrain_go(solver, yi, xi, &Subst::id(), &Subst::id(), cache, scope)
+                            constrain_go(solver, &yi, &xi, &Subst::id(), &Subst::id(), cache, scope)
                         })?;
                     }
                 }
@@ -2173,9 +2265,11 @@ fn constrain_go_impl(
                             {
                                 Err(joined)
                             }
+                            // Each read under its side's substitution, as [`mismatch`] reads
+                            // the two sides: a type `let`'s exit is there.
                             _ => Err(ConstrainError::DataDomainMismatch {
-                                lhs: Box::new((**d0).clone()),
-                                rhs: Box::new((**d1).clone()),
+                                lhs: Box::new(sl.apply_type_in(solver, d0)),
+                                rhs: Box::new(sr.apply_type_in(solver, d1)),
                                 cause: Box::new(err),
                             }),
                         };
@@ -2328,8 +2422,12 @@ fn constrain_go_impl(
                             cs,
                             |j, _| {
                                 let name = cs[j].0.clone().unwrap_or_else(|| {
-                            panic!("a component a later one reads by index names a binder: {lhs}")
-                        });
+                                    panic!(
+                                        "component {j}, which a later one reads by index, names \
+                                         a binder: {}",
+                                        Type::DepTuple(cs.to_vec())
+                                    )
+                                });
                                 crate::ccl::subst::Mapping::Rename(name)
                             },
                             crate::ccl::Ids::Fresh,
@@ -2475,7 +2573,7 @@ fn constrain_go_impl(
         // `src/ccl/design/type-inference.md`, "Data domains are invariant"). A variable is not
         // a type: it falls through to the variable arms below, and the witness lands in its
         // bounds like any other leaf. Two witnesses compare by identity (the arm above).
-        (Type::WitnessRef(_) | Type::WitnessProjection(_), other) if !is_witness_or_var(other) => {
+        (witness, other) if is_witness(witness) && !is_witness_or_var(other) => {
             let Some(range) = witness_range(lhs, &cache.lctx) else {
                 return Err(mismatch(solver, lhs, rhs, sl, sr));
             };
@@ -2492,7 +2590,7 @@ fn constrain_go_impl(
                 Membership::Solve,
             )
         }
-        (other, Type::WitnessRef(_) | Type::WitnessProjection(_)) if !is_witness_or_var(other) => {
+        (other, witness) if is_witness(witness) && !is_witness_or_var(other) => {
             let Some(TypeKind::Enumerated(candidates)) = witness_range(rhs, &cache.rctx) else {
                 return Err(mismatch(solver, lhs, rhs, sl, sr));
             };
@@ -2810,7 +2908,7 @@ fn constrain_go_impl(
             // watch list instead.
             // A family application's terms are read where the variable stands, so the edge's
             // substitution on its side reaches them before it is delivered.
-            if let Type::FamilyApp(_) = lhs.peel_refinements() {
+            if let Type::FamilyApp(_) = lhs.former() {
                 let into = edge_into_holder(solver, sl, sr);
                 let at = into
                     .copying(crate::ccl::Ids::Kept)
@@ -2892,14 +2990,14 @@ fn constrain_go_impl(
         // `𝑃` on the right stays with the refinement arm, which has no sort for a
         // parameter and so cannot discharge the refinement. With no bound, nothing
         // but `𝑃` itself is above `𝑃`.
-        (Type::Param(param), _) if !matches!(rhs.peel_refinements(), Type::Param(q) if q == param) => {
+        (Type::Param(param), _) if !matches!(rhs.former(), Type::Param(q) if q == param) => {
             match &param.bound {
                 Some(bound) => constrain_go(solver, bound, rhs, sl, sr, cache, scope),
                 None => Err(mismatch(solver, lhs, rhs, sl, sr)),
             }
         }
         // A family's bound holds at every value it is applied to.
-        (Type::FamilyApp(app), _) if !matches!(rhs.peel_refinements(), Type::FamilyApp(b) if b.param == app.param) =>
+        (Type::FamilyApp(app), _) if !matches!(rhs.former(), Type::FamilyApp(b) if b.param == app.param) =>
         {
             match &app.param.bound {
                 // A bound on a family's values is a family itself, read at the application's
@@ -3033,21 +3131,14 @@ fn constrain_go_impl(
             // Each side's refinements are forced through its own morphism into the ambient
             // frame before comparing (`sl(S₁)` vs `sr(S₂)`), each in its normal form
             // ([`normal_refinement_in`]), which is what refinement equality compares and what
-            // the SMT encoder can read: it has no `let` or eliminated combinator.
-            let lrefs_in_ambient: Vec<Refinement> = lhs
-                .refinements()
-                .iter()
-                .map(|l| {
-                    let forced = sl.force_refinement(solver, l);
-                    normal_refinement_in(solver, &forced)
-                })
-                .collect();
+            // the SMT encoder can read, under the type `let`s the morphism holds ([`Ambient`]).
+            let lrefs_in_ambient = Ambient::forced(solver, sl, lhs.refinements());
             constrain_refined(
                 solver,
                 lhs,
                 lbase,
                 lrefs_in_ambient,
-                &[],
+                &Ambient::default(),
                 rhs,
                 sl,
                 sr,
@@ -3077,8 +3168,8 @@ fn constrain_refined(
     solver: &mut Solver,
     lhs: &Type,
     lbase: &Type,
-    lrefs_in_ambient: Vec<Refinement>,
-    guard: &[Refinement],
+    lrefs_in_ambient: Ambient,
+    guard: &Ambient,
     rhs: &Type,
     sl: &Subst,
     sr: &Subst,
@@ -3091,20 +3182,18 @@ fn constrain_refined(
     // same thing on both. It is also what makes the entailment decidable at
     // all here — an untransported lhs predicate mentions the `let` binder a
     // discharge edge on `sl` replaces with the bound term.
-    let rrefs_in_ambient: Vec<Refinement> = rrefs
-        .iter()
-        .map(|r| {
-            let forced = sr.force_refinement(solver, r);
-            normal_refinement_in(solver, &forced)
-        })
-        .collect();
-    // The refinements rhs requires that no transported lhs layer matches (by
-    // `Refinement`'s structural `PartialEq`). The deficit keeps the *untransported* rhs
-    // refinements, since the recursive constraint below carries `sr` for them.
+    let rrefs_in_ambient = Ambient::forced(solver, sr, rrefs).apart_from(&lrefs_in_ambient, guard);
+    // The refinements rhs requires that no transported lhs layer matches (by `Refinement`'s
+    // structural `PartialEq`, each side's read of a type `let`'s binder compared as the
+    // definition). The deficit keeps the *untransported* rhs refinements, since the recursive
+    // constraint below carries `sr` for them.
     let deficit: RefinementSet = rrefs
         .iter()
-        .zip(&rrefs_in_ambient)
-        .filter(|(_, forced)| !lrefs_in_ambient.contains(forced) && !guard.contains(forced))
+        .zip(&rrefs_in_ambient.refinements)
+        .filter(|(_, forced)| {
+            !lrefs_in_ambient.holds(forced, &rrefs_in_ambient.lets)
+                && !guard.holds(forced, &rrefs_in_ambient.lets)
+        })
         .map(|(r, _)| r.clone())
         .collect();
     // `0..𝑛` is the `UInt`s below `𝑛`, so a refined `UInt` or wider range is below it
@@ -3126,7 +3215,7 @@ fn constrain_refined(
     if cache.in_data_domains
         && matches!(lbase, Type::Infer(_))
         && matches!(rbase, Type::Infer(_))
-        && !lrefs_in_ambient.is_empty()
+        && !lrefs_in_ambient.refinements.is_empty()
         && !rrefs.is_empty()
     {
         return Ok(());
@@ -3147,22 +3236,20 @@ fn constrain_refined(
         if cache.in_data_domains {
             return Ok(());
         }
-        let guard: RefinementSet = lrefs_in_ambient
-            .into_iter()
-            .chain(guard.iter().cloned())
-            .collect();
+        let guard = lrefs_in_ambient.with(guard);
         record_guarded_upper(solver, lv, &guard, rhs, sl, sr, cache, scope)
     } else if scope.is_skip_smt() {
         Err(mismatch(solver, lhs, rhs, sl, sr))
     } else if range_demand {
         // Both bases are leaves, so the entailment is the whole edge.
+        let scope = super::smt::UnderLets::of(scope, &[&lrefs_in_ambient, &rrefs_in_ambient]);
         let proven = super::smt::smt_sub_at(
             solver,
             lbase,
             rbase,
-            &lrefs_in_ambient,
-            &rrefs_in_ambient,
-            scope,
+            &lrefs_in_ambient.refinements,
+            &rrefs_in_ambient.refinements,
+            &scope,
         )
         .or_else(|error| smt_undecided_is_mismatch(solver, error, lhs, rhs, sl, sr))?;
         if proven {
@@ -3173,10 +3260,10 @@ fn constrain_refined(
     } else if super::smt::smt_sub_guarded(
         solver,
         lbase,
-        &lrefs_in_ambient,
-        guard,
-        &rrefs_in_ambient,
-        scope,
+        &lrefs_in_ambient.refinements,
+        &guard.refinements,
+        &rrefs_in_ambient.refinements,
+        &super::smt::UnderLets::of(scope, &[&lrefs_in_ambient, guard, &rrefs_in_ambient]),
     )
     .or_else(|error| smt_undecided_is_mismatch(solver, error, lhs, rhs, sl, sr))?
     {
@@ -3198,7 +3285,7 @@ fn constrain_refined(
 fn record_guarded_upper(
     solver: &mut Solver,
     lv: &Rc<InferVar>,
-    guard: &RefinementSet,
+    guard: &Ambient,
     rhs: &Type,
     sl: &Subst,
     sr: &Subst,
@@ -3215,7 +3302,7 @@ fn record_guarded_upper(
         rhs.clone()
     };
     let entry = GuardedBound {
-        guard: guard.clone(),
+        guard: guard.as_guard(),
         bound: Bound::edge(solver, sl.clone(), rhs, sr.clone()).with_origin(cache.origins.1),
     };
     let lows = {
@@ -3266,28 +3353,10 @@ fn close_guarded(
     };
     let low_subst = Subst::then(solver, &low.ty_subst, &tau_l);
     let upper_subst = Subst::then(solver, &entry.bound.ty_subst, &tau_u);
-    let lrefs_in_ambient: Vec<Refinement> = low
-        .ty
-        .refinements()
-        .iter()
-        .map(|l| {
-            let forced = low_subst.force_refinement(solver, l);
-            normal_refinement_in(solver, &forced)
-        })
-        .collect();
-    let guard: Vec<Refinement> = entry
-        .guard
-        .iter()
-        .map(|g| {
-            if tau_u.is_id() {
-                g.clone()
-            } else {
-                let forced = tau_u.force_refinement(solver, g);
-                normal_refinement_in(solver, &forced)
-            }
-        })
-        .filter(|g| !lrefs_in_ambient.contains(g))
-        .collect();
+    let lrefs_in_ambient = Ambient::forced(solver, &low_subst, low.ty.refinements());
+    let guard = Ambient::of_guard(solver, &entry.guard, &tau_u)
+        .apart_from(&lrefs_in_ambient, &Ambient::default())
+        .without_held_by(&lrefs_in_ambient);
     cache.with_origins((low.origin, entry.bound.origin), |cache| {
         if cache.refinement_blind() {
             return constrain_go(
@@ -3313,6 +3382,153 @@ fn close_guarded(
             scope,
         )
     })
+}
+
+/// Refinements in the ambient frame where two sides of an edge meet, each forced through its
+/// side's morphism in its normal form ([`normal_refinement_in`]), and the type `let`s they read,
+/// outermost first. A morphism's `let` exit is held ([`Subst::force_refinement_holding`]): a
+/// refinement keeps reading the binder, a comparison reads the read as the definition
+/// ([`crate::ccl::ty::refinement_eq_under_lets`]), and the solver assumes the binder equals it
+/// ([`super::smt::UnderLets`]).
+#[derive(Clone, Debug, Default)]
+pub(super) struct Ambient {
+    pub(super) refinements: Vec<Refinement>,
+    pub(super) lets: Vec<crate::ccl::ty::TypeLetExit>,
+}
+
+impl Ambient {
+    /// `refinements` forced through `s`.
+    fn forced(solver: &mut Solver, s: &Subst, refinements: &[Refinement]) -> Ambient {
+        let bare = s.without_lets();
+        let refinements: Vec<Refinement> = refinements
+            .iter()
+            .map(|r| {
+                let forced = bare.force_refinement(solver, r);
+                normal_refinement_in(solver, &forced)
+            })
+            .collect();
+        let lets = if s.has_lets() {
+            s.lets_read_by(
+                refinements
+                    .iter()
+                    .flat_map(|r| crate::ccl::ccl_utils::free_names(&r.predicate)),
+            )
+        } else {
+            Vec::new()
+        };
+        Ambient { refinements, lets }
+    }
+
+    /// The refinements a guarded bound's guard states ([`Self::as_guard`]), moved through `s`.
+    fn of_guard(solver: &mut Solver, guard: &Type, s: &Subst) -> Ambient {
+        let moved = if s.is_id() {
+            guard.clone()
+        } else {
+            s.apply_type_in(solver, guard)
+        };
+        let (lets, under) = crate::ccl::ty::TypeLet::peel(&moved);
+        Ambient {
+            refinements: under
+                .refinements()
+                .iter()
+                .map(|r| normal_refinement_in(solver, r))
+                .collect(),
+            lets: lets
+                .iter()
+                .map(|l| (l.name.clone(), Rc::clone(&l.definition)))
+                .collect(),
+        }
+    }
+
+    /// These refinements as the type a guarded bound stores, `let 𝐿 in {_ | 𝑅}`
+    /// ([`GuardedBound::guard`]).
+    fn as_guard(&self) -> Type {
+        let lets: Vec<crate::ccl::ty::TypeLet> = self
+            .lets
+            .iter()
+            .map(|(n, d)| crate::ccl::ty::TypeLet::new(n.clone(), Rc::clone(d), Type::Hole))
+            .collect();
+        let lets: Vec<&crate::ccl::ty::TypeLet> = lets.iter().collect();
+        crate::ccl::ty::TypeLet::innermost_each(
+            &lets,
+            Type::refined(Type::Hole, self.refinements.iter().cloned().collect()),
+        )
+    }
+
+    /// Whether `r`, read under `lets`, is one of these refinements.
+    fn holds(&self, r: &Refinement, lets: &[crate::ccl::ty::TypeLetExit]) -> bool {
+        self.refinements
+            .iter()
+            .any(|l| crate::ccl::ty::refinement_eq_under_lets(l, &self.lets, r, lets))
+    }
+
+    /// These refinements and `other`'s, under both's `let`s, each refinement once.
+    fn with(mut self, other: &Ambient) -> Ambient {
+        for r in &other.refinements {
+            if !self.holds(r, &other.lets) {
+                self.refinements.push(r.clone());
+            }
+        }
+        for l in &other.lets {
+            if !self.lets.iter().any(|(n, _)| *n == l.0) {
+                self.lets.push(l.clone());
+            }
+        }
+        self
+    }
+
+    /// These refinements without the ones `other` holds.
+    fn without_held_by(mut self, other: &Ambient) -> Ambient {
+        let lets = self.lets.clone();
+        self.refinements.retain(|r| !other.holds(r, &lets));
+        self
+    }
+
+    /// These refinements with each `let` binder that `a` or `b` binds to another definition
+    /// renamed apart, so one name means one definition across the three, as the solver reads
+    /// them in one query. Copies of a `let` whose definition a substitution rewrote bind one
+    /// name to two definitions.
+    fn apart_from(self, a: &Ambient, b: &Ambient) -> Ambient {
+        let clashes = |n: &Name, d: &Rc<crate::ccl::ty::HeldTerm>| {
+            a.lets.iter().chain(&b.lets).any(|(m, e)| {
+                m == n && !Rc::ptr_eq(d, e) && !crate::ccl::eq_term_modulo_ty_slots(d, e)
+            })
+        };
+        let renames: Vec<(Name, Name)> = self
+            .lets
+            .iter()
+            .filter(|(n, d)| clashes(n, d))
+            .map(|(n, _)| (n.clone(), Name::fresh_like(n)))
+            .collect();
+        if renames.is_empty() {
+            return self;
+        }
+        let rename = |e: &crate::ccl::TypedExpr| {
+            renames
+                .iter()
+                .fold(e.clone_preserving_ids(), |e, (from, to)| {
+                    Subst::rename(from.clone(), to.clone()).apply_expr(&e)
+                })
+        };
+        Ambient {
+            refinements: self
+                .refinements
+                .iter()
+                .map(|r| Refinement::born(Rc::new(rename(&r.predicate))))
+                .collect(),
+            lets: self
+                .lets
+                .iter()
+                .map(|(n, d)| {
+                    let n = renames
+                        .iter()
+                        .find(|(from, _)| from == n)
+                        .map_or_else(|| n.clone(), |(_, to)| to.clone());
+                    (n, crate::ccl::ty::IntoHeldTerm::into_held(rename(d)))
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The failed edge `lhs‹sl› <: rhs‹sr›`, each side under its substitution, so a message
@@ -4867,7 +5083,10 @@ mod tests {
             .iter()
             .map(|g| {
                 (
-                    Type::refined(prim(BaseType::Int), g.guard.clone()),
+                    Type::refined(
+                        prim(BaseType::Int),
+                        g.guard.refinements().iter().cloned().collect(),
+                    ),
                     g.bound.ty.clone(),
                 )
             })

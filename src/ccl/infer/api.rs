@@ -1467,7 +1467,7 @@ fn identical_rendering_hint(
 /// (`docs/chl-spec.md`, "3.15 Variant constructors").
 fn option_variant_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     let is_option = |t: &Type| t.peel_refinements().option_payload().is_some();
-    let is_variant = |t: &Type| matches!(t.peel_refinements(), Type::Variant(..));
+    let is_variant = |t: &Type| matches!(t.former(), Type::Variant(..));
     (is_option(type_a) && is_variant(type_b) || is_variant(type_a) && is_option(type_b)).then_some(
         "hint: `Option` is a nominal type, not a variant: build one with `Option::some(v)` or \
          `Option::none`, and match one with `case Option::some(v):` and `case Option::none:`",
@@ -1493,7 +1493,7 @@ fn tuple_width(ty: &Type) -> Option<usize> {
 /// [`InferError::CallArity`], for a callee read through a field or returned by another call.
 /// `expected` is the function the call expects and `found` the one it reached.
 fn call_arity_hint(ctx: &str, expected: &Type, found: &Type) -> Option<String> {
-    let length = |ty: &Type| match ty.peel_refinements() {
+    let length = |ty: &Type| match ty.lets_distributed().peel_refinements() {
         Type::Fun { binder, .. } => Some(binder.parameter_count().unwrap_or(1)),
         _ => None,
     };
@@ -1569,7 +1569,7 @@ fn undischarged_index_hint(
     /// domain stays excluded for the reason it always was — its mismatch already reads as
     /// what it is, and the checked form fails on it identically.
     fn is_present_key_domain(ty: &Type) -> bool {
-        ty.refinements()
+        ty.standalone_refinements()
             .iter()
             .any(crate::ccl::ty::Refinement::is_collection_membership)
     }
@@ -1586,7 +1586,7 @@ fn undischarged_index_hint(
     };
     // A lookup's index is a value of the key type, never a function: a function on the other
     // side is a collection the domain was required to belong to (a kind's sum), not an index.
-    if matches!(index.peel_refinements(), Type::Fun { .. }) {
+    if matches!(index.former(), Type::Fun { .. }) {
         return None;
     }
     Some(format!(
@@ -3357,6 +3357,13 @@ fn collect_type_errors(
         Type::Nominal(..) | Type::Split { .. } => {}
         // A family stands as a nominal type's argument, which stays to operator conversion.
         Type::Family { .. } => {}
+        // The body is walked below; the definition is a held term, whose slots are walked as a
+        // predicate's are.
+        Type::Let(l) => {
+            if seen_refinements.insert(Rc::as_ptr(&l.definition)) {
+                collect_expr_errors(&l.definition, strictness, errors.errors, seen_refinements);
+            }
+        }
         Type::Fun { fun_kind, .. } => {
             // Coalesce resolves every kind var to a concrete `Data`/`Compute`
             // (`FunKind::resolved`); a surviving `FunKind::Var` is a missed resolution
@@ -3867,7 +3874,7 @@ fn check_places_go(expr: &Expr, argument: bool, errors: &mut Vec<LocatedInferErr
 /// A compute function's latent capabilities. A collection's capabilities record what ran when
 /// it was built, rather than an access its value can perform during a later call.
 fn function_capabilities(ty: &Type) -> Option<&crate::ccl::capabilities::Capabilities> {
-    match ty.peel_refinements() {
+    match ty.former() {
         Type::Fun {
             fun_kind,
             capabilities,

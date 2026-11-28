@@ -2676,32 +2676,20 @@ fn module_runs_declare_distinct_feeds() {
     acc := 1
     out << [z for z in [1, 2, 3] if z > acc]
 "#}, "[() -> [1 -> 2, 2 -> 3]]")]
+// A generic `let` the filter calls: the row's type holds the specialization the call reads.
+#[case::a_generic_let_the_filter_calls(indoc! {r#"
+    out = test_sink()
+    f = \x -> x
+    out << [v for v in [1, 2, 3] if f(v) > 1]
+"#}, "[() -> [1 -> 2, 2 -> 3]]")]
+// The filter calls it at two types: the row's type holds both specializations.
+#[case::a_generic_let_the_filter_calls_at_two_types(indoc! {r#"
+    out = test_sink()
+    f = \x -> x
+    out << [v for v in [1, 2, 3] if f(v) > 1 and f(True)]
+"#}, "[() -> [1 -> 2, 2 -> 3]]")]
 fn a_feed_crossing_a_let(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
-}
-
-/// A feed crossing a generic `let` that its row's filter calls. The crossing discharges the
-/// `let` to its generalized definition, whose type slots no use instantiates, so the row's
-/// type keeps them past channelize. Pinned on that failure as a known gap: the residue check
-/// is debug-only, and without it the post-channelize tree check fails on the same slots.
-#[test]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "type residue survived channelize")
-)]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "post-channelize produced an invalid tree")
-)]
-fn a_feed_crossing_a_generic_let() {
-    check_sink(
-        indoc! {r#"
-            out = test_sink()
-            f = \x -> x
-            out << [v for v in [1, 2, 3] if f(v) > 1]
-        "#},
-        "[() -> [1 -> 2, 2 -> 3]]",
-    );
 }
 
 /// A `def` borrows a feed place explicitly, from the top level or a loop. The
@@ -3381,8 +3369,8 @@ fn a_feed_reading_its_iteration_under_a_gated_condition_is_refused(#[case] sourc
 }
 
 /// Which conditions a channel's type states: one reading a plain `let` declared after the
-/// channel keeps the refinement, its type lifted past the binder, and one reading a value a
-/// recursive group computes gates the fed values over the unrefined source
+/// channel keeps the refinement, its type holding the binder's definition, and one reading a
+/// value a recursive group computes gates the fed values over the unrefined source
 /// (`src/ccl/design/mutability.md`, "A condition the channel's type cannot state").
 #[rstest]
 #[case::a_plain_let(indoc! {"
@@ -3392,7 +3380,7 @@ fn a_feed_reading_its_iteration_under_a_gated_condition_is_refused(#[case] sourc
         if x > t:
             out << x
     out
-"}, "letrec out : ({0..4 | ", false)]
+"}, "letrec out : (let t = Sum([1, 2]) in {0..4 | ", false)]
 #[case::a_final_value(indoc! {"
     out: Feed(_)
     n := 0

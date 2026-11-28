@@ -40,7 +40,7 @@ pub(crate) fn bind_parameters(
     bound: &mut HashMap<TypeParamId, Type>,
 ) -> bool {
     let ty = ty.peel_refinements();
-    match pattern.peel_refinements() {
+    match pattern.lets_distributed().peel_refinements() {
         Type::Param(p) => {
             let stated = crate::ccl::ccl_utils::strip_refinements_in(solver, ty);
             match bound.get(&p.id) {

@@ -180,11 +180,11 @@ pub(crate) fn cast_target_predicates(target: &Type) -> Vec<&TypedExpr> {
     let Type::Fun { domain, .. } = target else {
         return Vec::new();
     };
-    let Type::Refinement(_, refinements) = domain.as_ref() else {
+    // A domain holding definitions states its refinements under them.
+    let Type::Refinement(_, refinements) = crate::ccl::TypeLet::peel(domain).1 else {
         return Vec::new();
     };
-    let mut predicates: Vec<&TypedExpr> =
-        refinements.iter().map(|r| r.predicate.as_ref()).collect();
+    let mut predicates: Vec<&TypedExpr> = refinements.iter().map(|r| r.predicate.term()).collect();
     predicates.sort_unstable_by_key(|p| content_hash(p).0);
     predicates
 }
@@ -389,6 +389,14 @@ fn hash_type<'a>(
                 hash_type(t, env, wenv, free, state);
             }
             hash_type(body, env, wenv, free, state);
+        }
+        // The definition is hashed where the `let` stands, and the body under its binder, so
+        // the binder's spelling stays out as a `let` term's does.
+        T::Let(l) => {
+            hash_rel(&l.definition, env, wenv, free).hash(state);
+            env.push(&l.name);
+            hash_type(&l.body, env, wenv, free, state);
+            env.pop();
         }
         T::Record(fields) => hash_type_fields(fields, env, wenv, free, state),
         // Openness is not decoration: an open arm set commits only to the arms it

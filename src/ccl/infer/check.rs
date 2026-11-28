@@ -9,7 +9,7 @@ use crate::ccl::infer::solver::smt::ScopeEnv;
 use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme,
     constrain::admits_in_context,
-    constrain_subtype_in, constrain_subtype_under_in, fresh_var, prim,
+    constrain_subtype_under_in, constrain_subtype_under_lets_in, fresh_var, prim,
     traits::{product_components, product_fields},
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -17,6 +17,7 @@ use crate::ccl::infer_var::{Telescope, TelescopeWalk};
 use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
+use crate::ccl::ty::IntoHeldTerm;
 use crate::ccl::{
     BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Type, TypedBinding,
     TypedExpr, TypedExprNode,
@@ -139,6 +140,16 @@ pub(super) struct CheckCtx {
     /// check: `checked_predicates` keys by address, and a copy freed mid-walk lends its
     /// address to a later predicate, which would then be skipped as already checked.
     opened_types: Vec<Type>,
+    /// The `let`s around the position being checked, outermost first: the held ones
+    /// ([`crate::ccl::ty::TypeLet`]) around a type position [`check_slot_predicates`] checks,
+    /// and the tree's transparent ones in scope. A type there can read a binder where one a
+    /// rule derives has the definition discharged, so [`Self::require_sub`] draws its edge
+    /// under these `let`s.
+    scope_lets: Vec<crate::ccl::ty::TypeLet>,
+    /// The names some type slot in the checked tree reads. A comparison meets a transparent
+    /// binder's read only where it is one of these, so only these are recorded in
+    /// [`Self::scope_lets`].
+    type_read_names: std::collections::HashSet<Name>,
     /// The scratch lambdas [`check_slot_predicates`] checked, kept alive for the rest of the
     /// check for the reason `opened_types` is: renaming a predicate's element rebuilds the
     /// nested predicates that read it, and `checked_predicates` holds their addresses.
@@ -203,6 +214,28 @@ impl ScopeEnv for CheckScope<'_> {
 }
 
 impl CheckCtx {
+    /// The `let` exits of the `let`s around the position ([`CheckCtx::scope_lets`]) that `sub` or
+    /// `sup` reads, directly or through another's definition, composed outermost first as
+    /// constrain composes the exit of a type `let` around a side: the morphism both sides of an
+    /// edge drawn here are read under. The identity where neither reads one.
+    fn scope_exits(&mut self, sub: &Type, sup: &Type) -> crate::ccl::subst::Subst {
+        use crate::ccl::subst::Subst;
+        if self.scope_lets.is_empty() {
+            return Subst::id();
+        }
+        let lets: Vec<&crate::ccl::ty::TypeLet> = self.scope_lets.iter().collect();
+        let mut reads = crate::ccl::subst::type_free_vars(sub);
+        reads.extend(crate::ccl::subst::type_free_vars(sup));
+        let read = crate::ccl::ty::TypeLet::read_by(&lets, reads);
+        lets.iter()
+            .zip(read)
+            .filter(|(_, read)| *read)
+            .fold(Subst::id(), |outer, (l, _)| {
+                let exit = Subst::let_exit(l.name.clone(), Rc::clone(&l.definition));
+                Subst::then(&mut self.solver, &exit, &outer)
+            })
+    }
+
     fn new(
         mut solver: Solver,
         root: NodeId,
@@ -228,6 +261,8 @@ impl CheckCtx {
             facts: Vec::new(),
             checked_predicates: Default::default(),
             opened_types: Vec::new(),
+            scope_lets: Vec::new(),
+            type_read_names: Default::default(),
             scratch_lambdas: Vec::new(),
             instances,
             opened_params: Vec::new(),
@@ -585,21 +620,27 @@ impl Typing for CheckCtx {
         // `{Int | __elem >= 0}` is the shape that needs it: the two predicates match
         // nowhere structurally, and the entailment holds given the type `__read` is
         // bound at.
-        let (sub, sup) = crate::ccl::generalize::align(sub, sup);
-        let (sub, sup) = (&sub, &sup);
-        let mut cache = self.cache();
-        let outcome = constrain_subtype_in(
-            &mut self.solver,
-            sub,
-            sup,
-            &mut cache,
-            &CheckScope {
-                scopes: &self.scopes,
-                opaque_binders: &self.opaque_binders,
-                facts: &self.facts,
-            },
-        );
-        if let Err(e) = outcome {
+        //
+        // **Under the `let`s around the position**: a side reading a `let`'s binder and one with
+        // its definition discharged are one type there ([`CheckCtx::scope_exits`]).
+        let lets = self.scope_exits(sub, sup);
+        let edge = |ctx: &mut Self, sub: &Type, sup: &Type| {
+            let (sub, sup) = crate::ccl::generalize::align(sub, sup);
+            let mut cache = ctx.cache();
+            constrain_subtype_under_lets_in(
+                &mut ctx.solver,
+                &sub,
+                &sup,
+                &lets,
+                &mut cache,
+                &CheckScope {
+                    scopes: &ctx.scopes,
+                    opaque_binders: &ctx.opaque_binders,
+                    facts: &ctx.facts,
+                },
+            )
+        };
+        if let Err(e) = edge(self, sub, sup) {
             let located = {
                 let error = map_constrain_err(&mut self.solver, e, &at());
                 self.raise(error)
@@ -607,6 +648,17 @@ impl Typing for CheckCtx {
             self.errors.push(located);
         }
         Ok(())
+    }
+
+    fn scoped_type_let<R>(
+        &mut self,
+        held: &crate::ccl::ty::TypeLet,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.scope_lets.push(held.clone());
+        let r = self.scoped(&held.name, &held.definition.ty, f);
+        self.scope_lets.pop();
+        r
     }
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -732,7 +784,32 @@ impl Typing for CheckCtx {
             }
             _ => binding.ty.clone(),
         };
-        self.scoped(&binding.name, &assumed, f)
+        // A transparent binder stands for its definition, as a type `let`'s does, so a
+        // comparison in its scope is drawn under the `let` ([`CheckCtx::scope_lets`]). A type
+        // holds no iteration marker, so the definition is read without the ones planning puts
+        // on a source. A definition a pass made a statement, as mutability elimination makes a
+        // generator's call a `letrec`, is no term a type holds: a type reads its binder by name.
+        let held = match definition {
+            Some(definition)
+                if binding.transparency == BindingTransparency::Transparent
+                    && self.type_read_names.contains(&binding.name)
+                    && crate::ccl::ty::statement_shape(definition).is_none() =>
+            {
+                self.scope_lets.push(crate::ccl::ty::TypeLet::new(
+                    binding.name.clone(),
+                    crate::ccl::ccl_utils::strip_iterate_markers(definition, crate::ccl::Ids::Kept)
+                        .into_held(),
+                    Type::Hole,
+                ));
+                true
+            }
+            _ => false,
+        };
+        let r = self.scoped(&binding.name, &assumed, f);
+        if held {
+            self.scope_lets.pop();
+        }
+        r
     }
 
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
@@ -797,6 +874,15 @@ impl Typing for CheckCtx {
         t: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
+        // A type `let` at the root holds the function: each part keeps the `let`s it reads.
+        let (lets, under) = crate::ccl::ty::TypeLet::peel(t);
+        if !lets.is_empty() {
+            let (d, c) = self.as_function(under, at)?;
+            return Ok((
+                crate::ccl::ty::TypeLet::rewrap(&lets, d),
+                crate::ccl::ty::TypeLet::rewrap(&lets, c),
+            ));
+        }
         // Destructure the resolved type directly (no inference vars), through its read
         // view ([`Type::read_view`]) — a `Mut`-typed collection used as a for-loop source
         // reads as the collection, a defer's channel as the collection it accumulates.
@@ -833,7 +919,7 @@ impl Typing for CheckCtx {
         binder: &Name,
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), LocatedInferError> {
-        let fun_binder = match t.read_view().as_ref() {
+        let fun_binder = match crate::ccl::ty::TypeLet::peel(t).1.read_view().as_ref() {
             Type::Fun { binder, .. } => binder.clone(),
             _ => crate::ccl::FunBinder::None,
         };
@@ -860,23 +946,26 @@ impl Typing for CheckCtx {
         sup_binders: &[crate::ccl::ty::Witness],
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        let (sub, sup) = crate::ccl::generalize::align(sub, sup);
-        let (sub, sup) = (&sub, &sup);
-        let mut cache = self.cache();
-        let outcome = constrain_subtype_under_in(
-            &mut self.solver,
-            sub,
-            sup,
-            sub_binders,
-            sup_binders,
-            &mut cache,
-            &CheckScope {
-                scopes: &self.scopes,
-                opaque_binders: &self.opaque_binders,
-                facts: &self.facts,
-            },
-        );
-        if let Err(e) = outcome {
+        // Under the `let`s around the position, as in `require_sub`.
+        let lets = self.scope_exits(sub, sup);
+        let edge = |ctx: &mut Self, sub: &Type, sup: &Type| {
+            let (sub, sup) = crate::ccl::generalize::align(sub, sup);
+            let mut cache = ctx.cache();
+            constrain_subtype_under_in(
+                &mut ctx.solver,
+                &sub,
+                &sup,
+                (sub_binders, sup_binders),
+                &lets,
+                &mut cache,
+                &CheckScope {
+                    scopes: &ctx.scopes,
+                    opaque_binders: &ctx.opaque_binders,
+                    facts: &ctx.facts,
+                },
+            )
+        };
+        if let Err(e) = edge(self, sub, sup) {
             let located = {
                 let error = map_constrain_err(&mut self.solver, e, &at());
                 self.raise(error)
@@ -917,7 +1006,7 @@ impl Typing for CheckCtx {
         };
         // The **domain** is what the function's binders classify. The argument is written
         // where the application is, and what binds it there is the ambient context.
-        let binders = function.peel_refinements().sum().unwrap_or(&[]).to_vec();
+        let binders = function.sum_binders();
         self.require_sub_under(arg, &[], &domain, &binders, at)
     }
 
@@ -956,14 +1045,15 @@ impl Typing for CheckCtx {
         // (`Typing::apply`); any other takes its argument whole.
         match parameters_at_arguments(&mut self.solver, &function, argument) {
             Some(parameters) => {
-                let arguments: &[Type] = match arg_ty.peel_refinements() {
+                let arg_shape = arg_ty.lets_distributed();
+                let arguments: &[Type] = match arg_shape.peel_refinements() {
                     Type::Tuple(ts) if ts.len() == parameters.len() => ts,
                     other => unreachable!(
                         "a call's argument list is the tuple of its {} arguments, got {other}",
                         parameters.len()
                     ),
                 };
-                let binders = function.peel_refinements().sum().unwrap_or(&[]).to_vec();
+                let binders = function.sum_binders();
                 for (argument, parameter) in arguments.iter().zip(&parameters) {
                     self.require_sub_under(argument, &[], parameter, &binders, at)?;
                 }
@@ -977,8 +1067,8 @@ impl Typing for CheckCtx {
         // The binder's references are indices when the function is closed (the
         // usual case — application opens the function at the argument, β) and
         // free names when a name-spelled form survived; both discharge to
-        // the same argument term.
-        let result = match function.as_ref() {
+        // the same argument term. A function under type `let`s binds as the function does.
+        let result = match crate::ccl::ty::TypeLet::peel(function.as_ref()).1 {
             Type::Fun { binder, .. } => crate::ccl::subst::discharge_at_binder_in(
                 &mut self.solver,
                 binder,
@@ -1340,7 +1430,8 @@ fn check_realized(
     ctx: &mut CheckCtx,
 ) -> Result<Type, LocatedInferError> {
     let bug = |what: String| InferError::Unsupported(format!("{what}; this is a compiler bug"));
-    let Some(bodies) = candidate_bodies(ctx.solver(), recorded.peel_refinements()) else {
+    let recorded_shape = recorded.lets_distributed();
+    let Some(bodies) = candidate_bodies(ctx.solver(), recorded_shape.peel_refinements()) else {
         return check_realized_domain_membership(legs, recorded, ctx);
     };
     if legs.is_empty() {
@@ -1352,18 +1443,38 @@ fn check_realized(
     for leg in legs.iter_mut() {
         let leg_ty = ctx.subexpr(leg)?;
         // Candidates can share a base, `0..3` and `{0..3 | 𝑝}`, and a leg over the narrower one
-        // refines both; it realizes the one whose refinements it carries most of.
+        // refines both; it realizes the one whose refinements it carries most of. The two compare
+        // equal under the definitions of the `let`s around the position
+        // ([`CheckCtx::scope_lets`]), so a side reading a binder and one with its definition
+        // discharged match.
+        let scope_lets = &ctx.scope_lets;
+        let realizes = |leg_dom: &Type, d: &Type| {
+            let definitions = |n: &Name| {
+                scope_lets
+                    .iter()
+                    .rev()
+                    .find(|l| l.name == *n)
+                    .map(|l| l.definition.term())
+            };
+            let (written, carried) = (d.standalone_refinements(), leg_dom.standalone_refinements());
+            (crate::ccl::ty::type_eq_under_definitions(
+                leg_dom.peel_refinements(),
+                d.peel_refinements(),
+                &definitions,
+            ) && written.iter().all(|r| {
+                carried
+                    .iter()
+                    .any(|c| crate::ccl::ty::refinement_eq_under_definitions(c, r, &definitions))
+            }))
+            .then_some(written.len())
+        };
         let found = leg_ty.domain().and_then(|leg_dom| {
             bodies
                 .iter()
                 .enumerate()
                 .filter_map(|(i, body)| {
                     let d = body.domain()?;
-                    (leg_dom.peel_refinements() == d.peel_refinements()
-                        && d.refinements()
-                            .iter()
-                            .all(|r| leg_dom.refinements().contains(r)))
-                    .then(|| (d.refinements().len(), i))
+                    Some((realizes(&leg_dom, &d)?, i))
                 })
                 .max()
                 .map(|(_, i)| i)
@@ -1507,6 +1618,18 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
         }
     }
     fn in_type_go(ty: &Type, ctx: &mut CheckCtx) {
+        // A type `let`'s definition is a term standing where the `let` does, typed there once
+        // per shared definition. A copy is checked, as a predicate's scratch lambda is, so the
+        // check consumes no identity and leaves the shared term as it was.
+        if let Type::Let(l) = ty
+            && ctx.checked_predicates.insert(Rc::as_ptr(&l.definition))
+        {
+            let mut definition = l.definition.as_ref().clone_preserving_ids();
+            if let Err(e) = check_node(&mut definition, ctx) {
+                ctx.errors.push(e);
+            }
+            ctx.scratch_lambdas.push(definition);
+        }
         if let Type::Refinement(base, refinements) = ty {
             for r in refinements {
                 if !ctx.checked_predicates.insert(Rc::as_ptr(&r.predicate)) {
@@ -1559,11 +1682,21 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
         crate::ccl::subst::walk_children_opened(ctx.solver(), ty, |binders, child| {
             children.push((binders.to_vec(), child));
         });
+        // A type `let`'s body is checked with the `let` around it ([`CheckCtx::scope_lets`]).
+        let held = if let Type::Let(l) = ty {
+            ctx.scope_lets.push((**l).clone());
+            true
+        } else {
+            false
+        };
         for (binders, child) in children {
             in_type_under(&binders, &child, ctx);
             if let std::borrow::Cow::Owned(child) = child {
                 ctx.opened_types.push(child);
             }
+        }
+        if held {
+            ctx.scope_lets.pop();
         }
     }
     fn in_type_under(binders: &[(Name, Type)], ty: &Type, ctx: &mut CheckCtx) {
@@ -1615,6 +1748,9 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
 fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     // A generalized type is checked at its body, its parameters standing for any type.
     let ty = crate::ccl::generalize::body(ty);
+    // A type `let` at the root holds the function, and one at the domain holds the sum: each
+    // part is read under them and keeps the ones it reads.
+    let (lets, ty) = crate::ccl::ty::TypeLet::peel(ty);
     let expected = (|| {
         let Type::Fun {
             binder,
@@ -1625,9 +1761,10 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         else {
             return None;
         };
+        let (domain_lets, sum) = crate::ccl::ty::TypeLet::peel(domain);
         // A plain collection has no witness, so `unbox` of it is the identity, and its
         // result does not depend on the argument.
-        if domain.peel_refinements().sum().is_none() {
+        if sum.peel_refinements().sum().is_none() {
             return Some(((**domain).clone(), (**codomain).clone()));
         }
         let (boxed, recorded) = match binder.whole() {
@@ -1638,7 +1775,7 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
             // A sum whose every witness is determined projects each to its one candidate, which
             // reads no argument, so the result names no binder (`ty::unbox_type`) and the term
             // below is never read.
-            None if domain
+            None if sum
                 .peel_refinements()
                 .sum()?
                 .iter()
@@ -1649,13 +1786,23 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
             None => return None,
         };
         // A reference compared against and rendered, never placed in a tree.
-        let term =
-            Rc::new(Expr::throwaway(TypedExprNode::Var(boxed.clone())).with_ty((**domain).clone()));
+        let term = Expr::throwaway(TypedExprNode::Var(boxed.clone()))
+            .with_ty((**domain).clone())
+            .into_held();
         Some((
-            crate::ccl::ty::unboxed_type_in(ctx.solver(), domain, &term)?,
+            crate::ccl::ty::TypeLet::rewrap(
+                &domain_lets,
+                crate::ccl::ty::unboxed_type_in(ctx.solver(), sum, &term)?,
+            ),
             recorded,
         ))
-    })();
+    })()
+    .map(|(expected, recorded)| {
+        (
+            crate::ccl::ty::TypeLet::rewrap(&lets, expected),
+            crate::ccl::ty::TypeLet::rewrap(&lets, recorded),
+        )
+    });
     let Some((expected, recorded)) = expected else {
         let error = ctx.raise(InferError::TypeMismatch {
             found: Box::new(ty.clone()),
@@ -1723,6 +1870,51 @@ pub(crate) fn check_located_against(
     })
 }
 
+/// The names the type slots of `expr` and of the terms below it read free, and the names the
+/// definitions of the transparent `let`s binding those read, in turn: a type with a binder's
+/// definition discharged reads what the definition reads. The binders of `expr`'s root `let`
+/// chain are among them: planning binds there the definitions types hold, whose terms read the
+/// binder where the types hold the definition (`planning::held::bind_reads`), so a type a term
+/// derives reads it.
+fn type_read_names(expr: &Expr) -> std::collections::HashSet<Name> {
+    fn go<'e>(
+        e: &'e Expr,
+        out: &mut std::collections::HashSet<Name>,
+        lets: &mut HashMap<Name, &'e Expr>,
+    ) {
+        e.walk_type_slots(|t| out.extend(crate::ccl::subst::type_free_vars(t)));
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+            && binding.transparency == BindingTransparency::Transparent
+        {
+            lets.insert(binding.name.clone(), bound_expr);
+        }
+        e.walk_children(|c| go(c, out, lets));
+    }
+    let mut out = std::collections::HashSet::new();
+    let mut lets = HashMap::new();
+    go(expr, &mut out, &mut lets);
+    let mut root = expr;
+    while let TypedExprNode::Let { binding, body, .. } = &root.node {
+        out.insert(binding.name.clone());
+        root = body;
+    }
+    let mut pending: Vec<Name> = out.iter().cloned().collect();
+    while let Some(n) = pending.pop() {
+        if let Some(definition) = lets.get(&n) {
+            for read in crate::ccl::ccl_utils::free_names(definition) {
+                if out.insert(read.clone()) {
+                    pending.push(read);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn check_located_memoized(
     expr: &Expr,
     sources: Option<&HashMap<String, Type>>,
@@ -1732,6 +1924,7 @@ fn check_located_memoized(
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(Solver::new(), cloned.node_id(), Rc::clone(instances), mode);
     ctx.sources = sources.cloned();
+    ctx.type_read_names = type_read_names(&cloned);
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
     // going and reports everything it can. But a few propagate instead —
     // `emit_case`'s `EmptyCase`, `emit_node`'s `UnboundVariable` — so the returned
@@ -1774,6 +1967,7 @@ fn parameters_at_arguments(
     else {
         return None;
     };
+    let domain = domain.lets_distributed();
     let Type::DepTuple(components) = domain.peel_refinements() else {
         return None;
     };

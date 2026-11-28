@@ -397,7 +397,7 @@ fn bind_ahead(source: &mut Expr, id: NodeId) -> Option<(Name, Expr)> {
     let plain = match &source.node {
         TypedExprNode::List(_) | TypedExprNode::Comprehension { .. } => true,
         TypedExprNode::Cast { target, .. } => matches!(
-            target.peel_refinements(),
+            target.former(),
             Type::Fun {
                 fun_kind: FunKind::Data(None),
                 ..

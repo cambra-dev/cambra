@@ -385,7 +385,7 @@ pub(crate) fn assert_copied_apart_from(
                 }
             }
         }
-        fn term(&mut self, term: &Rc<TypedExpr>) {
+        fn term(&mut self, term: &Rc<crate::ccl::ty::HeldTerm>) {
             if !self.terms.insert(Rc::as_ptr(term)) {
                 return;
             }
@@ -435,7 +435,7 @@ pub(crate) fn assert_copied_apart_from(
                     );
                 }
             }
-            for r in ty.refinements() {
+            for r in ty.own_refinements() {
                 self.term(&r.predicate);
             }
             ty.held_terms().for_each(|term| self.term(term));
@@ -1571,11 +1571,14 @@ pub(crate) fn freshen_level(solver: &mut Solver, ty: &Type) -> Level {
         }
         _ => 0,
     };
-    for r in ty.refinements() {
+    for r in ty.own_refinements() {
         lvl = lvl.max(predicate_level(solver, &r.predicate));
     }
-    if let Type::WitnessProjection(p) = ty {
-        lvl = lvl.max(predicate_level(solver, &p.term));
+    match ty {
+        Type::WitnessProjection(p) => lvl = lvl.max(predicate_level(solver, &p.term)),
+        // A type `let`'s definition stands where the `let` does, as a projection's term does.
+        Type::Let(l) => lvl = lvl.max(predicate_level(solver, &l.definition)),
+        _ => {}
     }
     ty.walk_children(|c| lvl = lvl.max(freshen_level(solver, c)));
     lvl
@@ -1597,14 +1600,14 @@ fn freshen_family_app(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Type {
-    let args: Vec<Rc<TypedExpr>> = app
+    let args: Vec<Rc<crate::ccl::ty::HeldTerm>> = app
         .args
         .iter()
         .map(|a| {
             let _f = crate::ccl::provenance::copy_frame("infer.freshen_family_arg");
-            let mut term = (*a.term).duplicate();
+            let mut term = a.term.term().duplicate();
             freshen_expr_type_slots(solver, &mut term, lim, target, cache);
-            Rc::new(term)
+            crate::ccl::ty::IntoHeldTerm::into_held(term)
         })
         .collect();
     let param = &app.param;
@@ -2007,14 +2010,7 @@ pub(crate) fn rename_instance_binders(solver: &mut Solver, cache: &FreshenCache)
         let guarded = guarded
             .iter()
             .map(|g| crate::ccl::infer_var::GuardedBound {
-                guard: {
-                    let refined = Type::refined(Type::Hole, g.guard.clone());
-                    instance_type(solver, &refined, &renames)
-                        .refinements()
-                        .iter()
-                        .cloned()
-                        .collect()
-                },
+                guard: instance_type(solver, &g.guard, &renames),
                 bound: instance_bound(solver, &g.bound, &renames),
             })
             .collect();
@@ -2280,36 +2276,21 @@ impl Copied for Type {
         let guarded = original.bounds(solver).guarded_upper.clone();
         let new_guarded: Vec<_> = guarded
             .iter()
-            .map(|g| {
-                let guarded_ty = freshen_above(
-                    solver,
-                    lim,
-                    &Type::refined(Type::Infer(Rc::clone(original)), g.guard.clone()),
-                    target,
-                    cache,
-                );
-                crate::ccl::infer_var::GuardedBound {
-                    guard: guarded_ty.refinements().iter().cloned().collect(),
-                    bound: Bound {
-                        origin: g.bound.origin,
-                        self_subst: freshen_subst_payloads(
-                            solver,
-                            lim,
-                            &g.bound.self_subst,
-                            target,
-                            cache,
-                        ),
-                        ty: freshen_above(solver, lim, &g.bound.ty, target, cache),
-                        ty_subst: freshen_subst_payloads(
-                            solver,
-                            lim,
-                            &g.bound.ty_subst,
-                            target,
-                            cache,
-                        ),
-                        rendered: Default::default(),
-                    },
-                }
+            .map(|g| crate::ccl::infer_var::GuardedBound {
+                guard: freshen_above(solver, lim, &g.guard, target, cache),
+                bound: Bound {
+                    origin: g.bound.origin,
+                    self_subst: freshen_subst_payloads(
+                        solver,
+                        lim,
+                        &g.bound.self_subst,
+                        target,
+                        cache,
+                    ),
+                    ty: freshen_above(solver, lim, &g.bound.ty, target, cache),
+                    ty_subst: freshen_subst_payloads(solver, lim, &g.bound.ty_subst, target, cache),
+                    rendered: Default::default(),
+                },
             })
             .collect();
         let s = copy.bounds_mut(solver);
@@ -2570,9 +2551,11 @@ fn seed_pairings_go(
     out: &mut HashMap<crate::ccl::Name, crate::ccl::Name>,
     seen: &mut std::collections::HashSet<BoundHolder>,
 ) {
+    // A type `let` decorates the shape under it, as a refinement does.
     fn peel(ty: &Type) -> &Type {
         match ty {
             Type::Refinement(inner, _) => peel(inner),
+            Type::Let(l) => peel(&l.body),
             _ => ty,
         }
     }
@@ -2902,7 +2885,7 @@ mod tests {
         let solver = &mut Solver::new();
         let quantified = InferVar::fresh(solver, 5);
         // A predicate term whose *type slot* holds the quantified variable.
-        let predicate = Rc::new(
+        let predicate = crate::ccl::ty::IntoHeldTerm::into_held(
             TypedExpr::lit(crate::ccl::Lit::Bool(true))
                 .with_ty(Type::Infer(Rc::clone(&quantified))),
         );

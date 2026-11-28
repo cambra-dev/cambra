@@ -113,7 +113,7 @@ impl OrderableIfRequiredBy {
             crate::ccl::infer::solve::resolve_var_type(solver, t).unwrap_or_else(|_| t.clone())
         };
         let positions = resolve(solver, &self.positions);
-        if matches!(positions.peel_refinements(), Type::Infer(_)) {
+        if matches!(positions.former(), Type::Infer(_)) {
             return self.positions.clone();
         }
         let Type::WitnessRef(id) = positions.peel_refinements() else {
@@ -123,27 +123,29 @@ impl OrderableIfRequiredBy {
             return positions;
         };
         let iter = resolve(solver, iter);
-        let kind = match iter.peel_refinements().sum() {
+        let kind = match iter.lets_distributed().peel_refinements().sum() {
             Some([only]) => Some(only.type_kind()),
             Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
             None => None,
         }
-        .or_else(|| match self.positions.peel_refinements() {
-            Type::Infer(v) => v.witness_scope_kinds(solver).iter().find_map(|k| {
-                let k: &Rc<crate::ccl::ty::FunKindVar> = k;
-                let index = k.binder_position(solver, id)?;
-                let carrier = Type::Fun {
-                    binder: crate::ccl::FunBinder::None,
-                    fun_kind: crate::ccl::ty::FunKind::Var(Rc::clone(k)),
-                    domain: Box::new(self.positions.clone()),
-                    codomain: Box::new(Type::Base(crate::ccl::BaseType::Unit)),
-                    capabilities: Capabilities::none(),
-                };
-                let carrier = resolve(solver, &carrier);
-                carrier.sum()?.get(index).map(|w| w.type_kind())
-            }),
-            _ => None,
-        });
+        .or_else(
+            || match self.positions.lets_distributed().peel_refinements() {
+                Type::Infer(v) => v.witness_scope_kinds(solver).iter().find_map(|k| {
+                    let k: &Rc<crate::ccl::ty::FunKindVar> = k;
+                    let index = k.binder_position(solver, id)?;
+                    let carrier = Type::Fun {
+                        binder: crate::ccl::FunBinder::None,
+                        fun_kind: crate::ccl::ty::FunKind::Var(Rc::clone(k)),
+                        domain: Box::new(self.positions.clone()),
+                        codomain: Box::new(Type::Base(crate::ccl::BaseType::Unit)),
+                        capabilities: Capabilities::none(),
+                    };
+                    let carrier = resolve(solver, &carrier);
+                    carrier.sum()?.get(index).map(|w| w.type_kind())
+                }),
+                _ => None,
+            },
+        );
         match kind {
             Some(TypeKind::SubtypesOf(key)) => *key,
             Some(TypeKind::UIntRanges) => Type::Base(crate::ccl::BaseType::UInt),
@@ -610,7 +612,7 @@ pub(crate) fn covers(
 pub(crate) fn excludes(solver: &mut Solver, a: &crate::ccl::Type, b: &crate::ccl::Type) -> bool {
     use crate::ccl::{BaseType, Type};
     // An index range is a refined `UInt`, and the empty tuple is the unit.
-    let unrefined = |ty: &Type| match ty.peel_refinements() {
+    let unrefined = |ty: &Type| match ty.lets_distributed().peel_refinements() {
         Type::UIntRange(_) => Type::Base(BaseType::UInt),
         Type::Tuple(ts) if ts.is_empty() => Type::Base(BaseType::Unit),
         other => other.clone(),
@@ -655,15 +657,11 @@ fn refinements_exclude(
 ) -> bool {
     use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
     use crate::ccl::{BaseType, Expr, Lit, Type, TypedExprNode, ty::Refinement};
-    if a.refinements().is_empty() && b.refinements().is_empty() {
+    let (a_refinements, b_refinements) = (a.standalone_refinements(), b.standalone_refinements());
+    if a_refinements.is_empty() && b_refinements.is_empty() {
         return false;
     }
-    let both: Vec<Refinement> = a
-        .refinements()
-        .iter()
-        .chain(b.refinements())
-        .cloned()
-        .collect();
+    let both: Vec<Refinement> = a_refinements.into_iter().chain(b_refinements).collect();
     // Only the query reads the predicate, so it reaches no tree.
     let never = Refinement::born(Rc::new(
         Expr::throwaway(TypedExprNode::Lit(Lit::Bool(false))).with_ty(Type::Base(BaseType::Bool)),

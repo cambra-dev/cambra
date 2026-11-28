@@ -77,7 +77,10 @@ pub(super) fn insert_per_group_filters(
         // A site may head the chain: a component of a `zip`, `(𝑚 ≫ sum, sum) ▷ zip`, receives
         // the collection as the chain's own input, and the filter inserted before it takes
         // that input.
-        if let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) {
+        if let Some(site) = elts
+            .iter()
+            .position(|e| per_group_filter_site(e, &ctx.held).is_some())
+        {
             insert_before(elts, site, ctx)?;
         }
         return Ok(());
@@ -96,7 +99,7 @@ pub(super) fn insert_per_group_filters(
             "planning.per_group_filter",
             provenance::Nature::Machinery,
         );
-        if per_group_filter_site(child).is_none() {
+        if per_group_filter_site(child, &ctx.held).is_none() {
             return;
         }
         let site_ty = child.ty.clone();
@@ -112,7 +115,9 @@ pub(super) fn insert_per_group_filters(
 
 /// Materialize the narrowing of the site at `elts[site]` ([`insert_per_group_filters`]).
 fn insert_before(elts: &mut Vec<Expr>, site: usize, ctx: &mut PlanningCtx) -> Result<(), String> {
-    let Some((binder, site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
+    let Some((binder, site_codomain, value_predicate)) =
+        per_group_filter_site(&elts[site], &ctx.held)
+    else {
         unreachable!("position found it")
     };
     // The filter evaluates its predicate per value, so it is planned as a `restrict`'s
@@ -194,13 +199,13 @@ fn insert_before(elts: &mut Vec<Expr>, site: usize, ctx: &mut PlanningCtx) -> Re
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
 /// filter site. See [`insert_per_group_filters`] for the shape.
-fn per_group_filter_site(expr: &Expr) -> Option<(Name, Type, Expr)> {
+fn per_group_filter_site(expr: &Expr, held: &held::TypeLetRoles) -> Option<(Name, Type, Expr)> {
     let Narrowing {
         binder,
         opened,
         consumed,
         added,
-    } = narrowing(expr)?;
+    } = narrowing(expr, held)?;
     // `application_order` is the one place planning fixes an order on a refinement
     // set. One filter materializes the whole conjunction, so the element types
     // it pairs with — the stages of a filter *pipeline* — have no counterpart here.
@@ -226,7 +231,7 @@ struct Narrowing {
     added: Vec<Refinement>,
 }
 
-fn narrowing(expr: &Expr) -> Option<Narrowing> {
+fn narrowing(expr: &Expr, held: &held::TypeLetRoles) -> Option<Narrowing> {
     let Type::Fun {
         binder: crate::ccl::FunBinder::Whole(binder),
         domain,
@@ -258,12 +263,12 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
     if narrowed.peel_refinements() != consumed.peel_refinements() {
         return None;
     }
-    let already = consumed.refinements();
-    if !already.iter().all(|r| narrowed.refinements().contains(r)) {
+    let already = predicates::refinements_under_lets(&consumed, held);
+    let narrowing = predicates::refinements_under_lets(&narrowed, held);
+    if !already.iter().all(|r| narrowing.contains(r)) {
         return None;
     }
-    let added: Vec<Refinement> = narrowed
-        .refinements()
+    let added: Vec<Refinement> = narrowing
         .iter()
         .filter(|r| !already.contains(r))
         .cloned()
@@ -329,9 +334,13 @@ fn filters_its_keys(e: &Expr) -> bool {
 /// A site is rejected wherever its codomain claims a narrowing, not only where it has the shape
 /// [`narrowing`] matches: a codomain whose domain adds a refinement reading the site's input,
 /// over a base other than the one the site consumes, is a narrowing no operator performs either.
-pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
-    let unmaterialized =
-        |e: &Expr| (narrowing(e).is_some() || refines_by_its_input(e)) && !is_per_group_filter(e);
+pub(super) fn reject_unmaterialized_narrowings(
+    expr: &Expr,
+    held: &held::TypeLetRoles,
+) -> Result<(), String> {
+    let unmaterialized = |e: &Expr| {
+        (narrowing(e, held).is_some() || refines_by_its_input(e)) && !is_per_group_filter(e)
+    };
     // A chain's elements, or a site standing alone among another node's children.
     let mut candidates: Vec<&Expr> = Vec::new();
     match &expr.node {
@@ -357,7 +366,7 @@ pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String
     let mut result = Ok(());
     expr.walk_children(|child| {
         if result.is_ok() {
-            result = reject_unmaterialized_narrowings(child);
+            result = reject_unmaterialized_narrowings(child, held);
         }
     });
     result
@@ -378,12 +387,12 @@ fn refines_by_its_input(e: &Expr) -> bool {
     else {
         return false;
     };
-    let consumed = domain.domain().map(|d| d.refinements().to_vec());
+    let consumed = domain.domain().map(|d| d.standalone_refinements());
     let Some(narrowed) = open_codomain(crate::ccl::generalize::opened(&e.ty), codomain).domain()
     else {
         return false;
     };
-    narrowed.refinements().iter().any(|r| {
+    narrowed.standalone_refinements().iter().any(|r| {
         !r.is_collection_membership()
             && looks_up_at_the_key(&r.predicate, binder)
             && !consumed.as_ref().is_some_and(|c| c.contains(r))
@@ -568,7 +577,7 @@ mod tests {
         insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(planned(&expr).0, None, "no filter was inserted");
         assert_eq!(expr, before, "the site is untouched");
-        let rejected = reject_unmaterialized_narrowings(&expr)
+        let rejected = reject_unmaterialized_narrowings(&expr, &Default::default())
             .expect_err("the narrowing no operator performs is rejected");
         assert!(rejected.contains("cannot materialize"), "{rejected}");
     }
@@ -587,7 +596,7 @@ mod tests {
         let mut expr = Expr::compose(vec![var("u").with_ty(unfiltered), site]);
         insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(planned(&expr).0, None, "no filter was inserted");
-        let rejected = reject_unmaterialized_narrowings(&expr)
+        let rejected = reject_unmaterialized_narrowings(&expr, &Default::default())
             .expect_err("the narrowing no operator performs is rejected");
         assert!(rejected.contains("cannot materialize"), "{rejected}");
     }
@@ -597,6 +606,9 @@ mod tests {
     fn a_materialized_site_is_not_rejected() {
         let (mut expr, _) = site_adding(&["q1"]);
         insert_per_group_filters(&mut expr, &mut Default::default()).unwrap();
-        assert_eq!(reject_unmaterialized_narrowings(&expr), Ok(()));
+        assert_eq!(
+            reject_unmaterialized_narrowings(&expr, &Default::default()),
+            Ok(())
+        );
     }
 }

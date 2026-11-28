@@ -3372,8 +3372,8 @@ impl TypedExpr {
     /// ([`Type::walk_held_terms`]), a refinement's predicate or a projection's sum, then the
     /// conditional a [`TypedExprNode::Realized`] stages. Term walks reach none of them; id
     /// enumeration must reach all of them.
-    pub fn walk_held_terms<'a>(&'a self, f: &mut impl FnMut(&'a std::rc::Rc<TypedExpr>)) {
-        self.walk_type_slots(|t| t.walk_held_terms(f));
+    pub fn walk_held_terms<'a>(&'a self, f: &mut impl FnMut(&'a TypedExpr)) {
+        self.walk_type_slots(|t| t.walk_held_terms(&mut |h| f(h.term())));
         if let TypedExprNode::Realized { staged, .. } = &self.node {
             f(staged);
         }

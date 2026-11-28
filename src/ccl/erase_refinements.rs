@@ -23,13 +23,16 @@ pub fn run(mut expr: Expr) -> Expr {
 /// the parameter's and asserts the two agree.
 fn erase_refinements(expr: &mut Expr) {
     expr.walk_type_slots_mut(erase_in_type);
+    // The function's type can hold `let`s its domain reads, which the parameter's type holds too.
+    let (lets, fun) = crate::ccl::ty::TypeLet::peel(&expr.ty);
     if let TypedExprNode::Lambda { params, .. } = &mut expr.node
         && let Type::Fun {
             fun_kind, domain, ..
-        } = expr.ty.peel_refinements()
+        } = fun.peel_refinements()
         && fun_kind.resolved().is_data()
     {
-        crate::ccl::one_param_mut(params).ty = (**domain).clone();
+        crate::ccl::one_param_mut(params).ty =
+            crate::ccl::ty::TypeLet::innermost_each(&lets, (**domain).clone());
     }
     expr.walk_children_mut(erase_refinements);
 }
@@ -70,6 +73,11 @@ fn erase_in_type(ty: &mut Type) {
                 erase_in_type(component);
             }
             *ty = Type::closed_dep_tuple(&mut Solver::none(), components, crate::ccl::Ids::Fresh);
+        }
+        // Erasing may remove every read of the binder, and the `let` then goes.
+        Type::Let(l) => {
+            erase_in_type(&mut std::rc::Rc::make_mut(l).body);
+            crate::ccl::ccl_utils::inline_rewritten_let(ty);
         }
         other => other.walk_children_mut(erase_in_type),
     }

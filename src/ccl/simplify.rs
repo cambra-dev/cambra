@@ -447,7 +447,7 @@ fn zip_of(arms: Vec<Expr>, fun_kind: &FunKind) -> Expr {
     }
     let ty = arms
         .iter()
-        .map(|a| match a.ty.peel_refinements() {
+        .map(|a| match a.ty.lets_distributed().peel_refinements() {
             Type::Fun {
                 binder,
                 domain,
@@ -960,10 +960,12 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
 /// map_domain`), and nothing after marking rebuilds a source from a type.
 fn keys_only_in_the_data(expr: &Expr) -> bool {
     fn in_the_data(ty: &Type) -> bool {
+        // The shape under the type `let`s that decorate it.
+        let ty = crate::ccl::ty::TypeLet::peel(ty).1;
         ty.refinements()
             .iter()
             .any(|r| r.membership_collection().is_some())
-            || match ty.peel_refinements() {
+            || match ty.lets_distributed().peel_refinements() {
                 Type::WitnessProjection(_) => true,
                 Type::Tuple(cs) => cs.iter().any(in_the_data),
                 _ => false,
@@ -1541,8 +1543,8 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
 /// zip gives satisfies `h`'s domain: the refinement is a fact about the pair, and the zip
 /// states it, as a producer supplies the refinement its consumer's domain demands.
 fn stating_domain_of(mut pair: Expr, h: &Expr) -> Expr {
-    let refinements = match h.ty.peel_refinements() {
-        Type::Fun { domain, .. } => domain.refinements().to_vec(),
+    let refinements = match h.ty.lets_distributed().peel_refinements() {
+        Type::Fun { domain, .. } => domain.standalone_refinements(),
         _ => Vec::new(),
     };
     if refinements.is_empty() {
@@ -1633,9 +1635,12 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
 /// Transact{…}`) are recognized by their binding, and substituting either one away
 /// strands the consumer that recognizes it.
 ///
-/// **One occurrence** makes the rewrite a move rather than a copy, so it duplicates
-/// nothing and drops nothing — which is what makes it safe on a subtree holding an
-/// `iterate` ([`is_iteration`]).
+/// **One occurrence** makes the rewrite a move rather than a copy, so it duplicates nothing. A
+/// move within the term drops nothing either, which makes it safe on a subtree holding an
+/// `iterate` ([`is_iteration`]). A move to a read in a type takes the binding out of the tree,
+/// so it applies only to a binding holding no `iterate`. A binding holding one is a value the
+/// program computes, such as the root binding planning gives a type `let`'s definition that compiled
+/// refinements read (`src/ccl/design/type-inference.md`, "A type `let`").
 ///
 /// **Either function kind.** A collection is a data function, and a collection standing
 /// in a value former is substituted in here: planning reads a record component's chain
@@ -1659,8 +1664,10 @@ fn try_let_morphism_inline(expr: &mut Expr) -> bool {
         return false;
     };
     if !binding.name.is_anf_temp()
-        || !matches!(bound_expr.ty, Type::Fun { .. })
+        || !matches!(bound_expr.ty.former(), Type::Fun { .. })
         || count_free(&binding.name, body) != 1
+        || (crate::ccl::ccl_utils::count_free_in_value(&binding.name, body) == 0
+            && !iteration_ids(bound_expr).is_empty())
     {
         return false;
     }

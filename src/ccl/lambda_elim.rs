@@ -546,6 +546,31 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     expr
 }
 
+/// `expr`, the body of the transparent `let name = definition`, with the `let` gone: each read
+/// of `name` in the term replaced by `definition`, as [`substitute`] does, and each type in the
+/// body that reads `name` holding the definition instead (`let name = definition in 𝑇`,
+/// [`crate::ccl::subst::Subst::let_exit`]), as the types lifted out of the `let`'s scope do. The
+/// two forms then never meet: every type reading a definition holds it.
+pub(crate) fn inline_let(expr: Expr, name: &Name, definition: &Expr) -> Expr {
+    fn hold(solver: &mut Solver, e: &mut Expr, name: &Name, exit: &crate::ccl::subst::Subst) {
+        e.walk_type_slots_mut(|ty| {
+            if crate::ccl::ccl_utils::is_free_in_type(name, ty) {
+                *ty = exit.apply_type_in(solver, ty);
+            }
+        });
+        e.walk_children_mut(|c| hold(solver, c, name, exit));
+    }
+    let solver = &mut Solver::none();
+    let exit = crate::ccl::subst::Subst::let_exit(
+        name,
+        crate::ccl::ccl_utils::predicate_term(solver, definition),
+    );
+    let mut expr = expr;
+    hold(solver, &mut expr, name, &exit);
+    crate::ccl::subst::Subst::discharge_in_place_in(solver, &mut expr, name, definition);
+    expr
+}
+
 // ---------------------------------------------------------------------------
 // BinOp desugaring
 // ---------------------------------------------------------------------------
@@ -588,7 +613,10 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// the type is built rather than where it is read.
 pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
     // A refinement on an operand states a fact about that operand, not about the pair.
-    match (f.ty.peel_refinements(), g.ty.peel_refinements()) {
+    match (
+        f.ty.lets_distributed().peel_refinements(),
+        g.ty.lets_distributed().peel_refinements(),
+    ) {
         (
             Type::Fun {
                 binder,
@@ -708,7 +736,7 @@ fn extract_filter_case(body: Expr) -> (Expr, Expr) {
 /// whose arms are collections takes the data-typed gate fan-out; a `Case`
 /// returning a scalar / compute value takes the C-form below.
 fn is_collection_result(ty: &Type) -> bool {
-    matches!(ty.peel_refinements(), Type::Fun { .. })
+    matches!(ty.former(), Type::Fun { .. })
 }
 
 /// Compile a guard-based **value-selecting** `Case` (a ternary or `if`/`elif`/
@@ -877,8 +905,10 @@ fn arm_compose(
 /// inference"). Only its own refinement is peeled: one inside a type argument is what the
 /// arms' binders read.
 fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
-    if let nominal @ Type::Nominal(..) = scrut_ty.peel_refinements() {
-        return nominal.clone();
+    // Under the type `let`s the scrutinee's type holds, which the nominal type keeps.
+    let (lets, under) = crate::ccl::ty::TypeLet::peel(scrut_ty);
+    if let nominal @ Type::Nominal(..) = under.peel_refinements() {
+        return crate::ccl::ty::TypeLet::innermost_each(&lets, nominal.clone());
     }
     let scrut_head = strip_refinements(scrut_ty);
     let mut tags: Vec<(FieldKey, Type)> = branches
@@ -1135,6 +1165,19 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
         Type::Split { input, output } => {
             reads_in_collection_domain(param, input) || reads_in_collection_domain(param, output)
         }
+        // A binder of the `let` that shadows `param` ends the walk below it. An occurrence of
+        // the binder stands for its definition, so a domain reading the binder reads `param`
+        // where the definition does.
+        Type::Let(l) => {
+            l.name != *param
+                && (reads_in_collection_domain(param, &l.body)
+                    || (crate::ccl::free_names::names(
+                        &l.definition,
+                        crate::ccl::free_names::EVERY_READ,
+                    )
+                    .contains(param)
+                        && reads_in_collection_domain(&l.name, &l.body)))
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
@@ -1172,11 +1215,11 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
 /// its subterms carry restate the domain they range over.
 fn builds_domain_reading(param: &Name, expr: &Expr) -> bool {
     // The refinements on `domain` that narrow by `param`, less those `restated` carries.
+    // A domain holding definitions narrows by its refinements standing alone, each under the
+    // definitions it reads.
     fn narrows_by(param: &Name, domain: &Type, restated: &[Refinement]) -> bool {
-        let Type::Refinement(_, refinements) = domain else {
-            return false;
-        };
-        refinements
+        domain
+            .standalone_refinements()
             .iter()
             .any(|r| is_free_in_value(param, &r.predicate) && !restated.contains(r))
     }
@@ -1188,7 +1231,7 @@ fn builds_domain_reading(param: &Name, expr: &Expr) -> bool {
             TypedExprNode::Lambda { params, body } => {
                 let binding = crate::ccl::one_param(params);
                 matches!(
-                    e.ty.peel_refinements(),
+                    e.ty.former(),
                     Type::Fun {
                         fun_kind: FunKind::Data(..),
                         ..
@@ -1212,9 +1255,9 @@ fn source_refinements(binder: &Name, body: &Expr) -> Vec<Refinement> {
     fn go(binder: &Name, e: &Expr, out: &mut Vec<Refinement>) {
         if let TypedExprNode::Apply { argument, function } = &e.node
             && matches!(&argument.node, TypedExprNode::Var(n) if n == binder)
-            && let Some(Type::Refinement(_, refinements)) = function.ty.domain()
+            && let Some(domain) = function.ty.domain()
         {
-            out.extend(refinements.iter().cloned());
+            out.extend(domain.standalone_refinements());
         }
         e.walk_children(|c| go(binder, c, out));
     }
@@ -1295,7 +1338,7 @@ fn eta_expanded(v: Expr) -> Expr {
     let codomain = v.ty.codomain().unwrap_or(Type::Hole);
     let fun_kind = v.ty.fun_kind().cloned().unwrap_or(FunKind::Data(None));
     let y = Name::fresh("__elem_at");
-    let source_binder = match v.ty.peel_refinements() {
+    let source_binder = match v.ty.lets_distributed().peel_refinements() {
         Type::Fun { binder, .. } => binder.clone(),
         _ => crate::ccl::FunBinder::None,
     };
@@ -1350,7 +1393,7 @@ fn refined_lambda(value: Expr, target: &Type, ty: Type) -> Expr {
             );
             Type::refined(
                 inner_binding.ty.clone(),
-                narrowing.refinements().iter().cloned().collect(),
+                narrowing.standalone_refinements().into_iter().collect(),
             )
         }
         None => inner_binding.ty.clone(),
@@ -1528,7 +1571,7 @@ fn elim_lambda_impl(
             // `.1` out of it carries the filter its readers need. Nothing lifts: planning
             // applies it from the component (`emit_pair_filter` in
             // `src/ccl/planning/correlated.rs`).
-            let refinements = y_ty.refinements().to_vec();
+            let refinements = y_ty.standalone_refinements();
             let membership_dependent = refinements
                 .iter()
                 .any(|r| r.is_collection_membership() && is_free_in_value(param, &r.predicate));
@@ -1554,15 +1597,12 @@ fn elim_lambda_impl(
                 })
                 .cloned()
                 .collect();
+            // Built by [`Type::refined`], which lifts the type `let`s standing refinements
+            // carry back around the type.
             let y_ty = {
-                let base = y_ty.peel_refinements().clone();
-                if staying.is_empty() {
-                    base
-                } else {
-                    let mut set = crate::ccl::ty::RefinementSet::new();
-                    set.extend(staying);
-                    Type::Refinement(Box::new(base), set)
-                }
+                let mut set = crate::ccl::ty::RefinementSet::new();
+                set.extend(staying);
+                Type::refined(y_ty.peel_refinements().clone(), set)
             };
             // A `y_ty` naming the inner lambda's witness escapes the Σ binding it here.
             // [`compose_sum_generators`] keeps a generator over a sum from reaching this rule,
@@ -1604,13 +1644,9 @@ fn elim_lambda_impl(
                         r
                     })
                     .collect();
-                if lifted.is_empty() {
-                    bare_pair.clone()
-                } else {
-                    let mut set = crate::ccl::ty::RefinementSet::new();
-                    set.extend(lifted);
-                    Type::Refinement(Box::new(bare_pair.clone()), set)
-                }
+                let mut set = crate::ccl::ty::RefinementSet::new();
+                set.extend(lifted);
+                Type::refined(bare_pair.clone(), set)
             };
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
@@ -1702,9 +1738,10 @@ fn elim_lambda_impl(
             // apply: Tuple([B, B→C]) → C; its domain is the codomain of pair.
             // The transformer sits under the pair's binder, so its domain speaks
             // the opened form `body_ty` is already in.
-            let apply_ty = match &pair.ty {
+            let pair_ty = pair.ty.lets_distributed();
+            let apply_ty = match &*pair_ty {
                 Type::Fun { codomain: cod, .. } => {
-                    let input = crate::ccl::subst::open_codomain(&pair.ty, cod);
+                    let input = crate::ccl::subst::open_codomain(&pair_ty, cod);
                     match &operands {
                         Some((a, f)) => operation_type(&[a, f], &input, &body_ty),
                         None => Type::compute_fun_or_hole(&input, &body_ty),
@@ -1757,7 +1794,8 @@ fn elim_lambda_impl(
                 // it is only decomposed element-wise when it mentions the parameter,
                 // and the next `zip_pair` then has an untyped operand and cannot type
                 // the `zip` it builds.
-                let (compose_ty, step_ty) = match &pair.ty {
+                let pair_shape = pair.ty.lets_distributed();
+                let (compose_ty, step_ty) = match &*pair_shape {
                     Type::Fun {
                         binder: pair_name,
                         domain: pair_domain,
@@ -1765,7 +1803,8 @@ fn elim_lambda_impl(
                         ..
                     } => {
                         let pair_name = &pair_name.whole().cloned();
-                        match cod.as_ref() {
+                        let cod = cod.lets_distributed();
+                        match &*cod {
                             Type::Tuple(elts) if elts.len() == 2 => {
                                 match (&elts[0], &elts[1]) {
                                     (
@@ -1853,7 +1892,7 @@ fn elim_lambda_impl(
                                             crate::ccl::subst::open_codomain(&pair.ty, t)
                                         };
                                         let compose_ty = Type::compute_fun_or_hole(
-                                            &under_binder(cod),
+                                            &under_binder(&cod),
                                             &under_binder(&chain),
                                         );
                                         // An unnamed pair the chain reads by index takes the
@@ -2032,7 +2071,8 @@ fn elim_lambda_impl(
             // reads `x` makes `v` dependent, and the application's type is its codomain
             // opened at `x`.
             let x = Expr::var(param).with_ty(param_ty.clone());
-            let call_v_result_ty = match &new_def.ty {
+            let new_def_ty = new_def.ty.lets_distributed();
+            let call_v_result_ty = match &*new_def_ty {
                 Type::Fun {
                     binder, codomain, ..
                 } => crate::ccl::subst::discharge_at_binder(
@@ -2061,7 +2101,7 @@ fn elim_lambda_impl(
             // eliminated body reads `v` at the position (`x ▷ v`), which the discharge
             // turns into `x ▷ new_def`.
             let let_ty = if crate::ccl::ccl_utils::is_free_in_type(&v, &result_ty) {
-                crate::ccl::subst::Subst::discharge(&v, new_def.clone_preserving_ids())
+                crate::ccl::subst::Subst::let_exit(&v, new_def.clone_preserving_ids())
                     .apply_type(&new_body.ty)
             } else {
                 result_ty
@@ -2737,7 +2777,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // with `name: None`; see `Type::without_pi_names`.
             #[cfg(debug_assertions)]
             assert!(
-                original_ty.without_pi_names() == result.ty.without_pi_names(),
+                same_type_up_to_names(&original_ty, &result.ty),
                 "{}\nto\n{}\nwith {} vs {}",
                 original,
                 symbolic(&result),
@@ -3043,11 +3083,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 // the post-pass check reconstructs this node from the tree it is
                 // handed, which holds only that one. Whether the two ever diverge
                 // in practice is open.
-                crate::ccl::subst::Subst::discharge(
-                    binding.name.clone(),
-                    def.clone_preserving_ids(),
-                )
-                .apply_type(&new_body.ty)
+                crate::ccl::subst::Subst::let_exit(binding.name.clone(), def.clone_preserving_ids())
+                    .apply_type(&new_body.ty)
             } else {
                 ty
             };
@@ -3093,7 +3130,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     #[cfg(debug_assertions)]
     if let Ok(e) = &result {
         assert!(
-            reclosed_let_ty || original_ty.without_pi_names() == e.ty.without_pi_names(),
+            reclosed_let_ty || same_type_up_to_names(&original_ty, &e.ty),
             "lambda elimination changed a node's type: {} vs {}",
             original_ty,
             e.ty
@@ -3105,6 +3142,14 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Whether lambda elimination left a node's type as it was, up to Pi binder presence
+/// ([`Type::without_pi_names`]) and binder names ([`crate::ccl::ty::alpha_eq`]).
+#[cfg(debug_assertions)]
+fn same_type_up_to_names(before: &Type, after: &Type) -> bool {
+    let (before, after) = (before.without_pi_names(), after.without_pi_names());
+    crate::ccl::ty::alpha_eq(&before, &after)
+}
 
 #[cfg(test)]
 mod tests {

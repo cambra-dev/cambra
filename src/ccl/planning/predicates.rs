@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::ccl::Duplicate;
 use crate::ccl::RefinementSet;
+use crate::ccl::ty::TypeLet;
 
 // Predicate compilation is a predicate-*rebuilding* pass like any other, so it
 // memoizes with the shared [`ccl_utils::PredMemo`] — including its keepalive
@@ -44,7 +45,7 @@ use crate::ccl::RefinementSet;
 // rebuilt predicate that must be compiled on its own, so keying by id would skip
 // it and leave it in lambda form.
 
-// The refinement's **base** is the memo's context (`PredMemo<Type>`), because
+// The refinement's **base** is the memo's context ([`PredicateContext`]), because
 // compilation reads it: `fn_of_bare_predicate` eta-expands `λ 𝑒 : base →
 // bare[__elem ↦ 𝑒]`, and `bare_predicate_of_fn` stamps it on the element var. An entry is
 // therefore reused only for an occurrence over an equal base. That holds in
@@ -61,6 +62,136 @@ use crate::ccl::RefinementSet;
 // shallow value. Measured against the pre-context memo the difference is in the
 // noise; a base that ever became large enough to matter would be a signal about
 // the types, not about this key.
+
+/// What compiling a refinement reads besides its predicate, which keys the pass's memo: the
+/// element type the predicate is applied at, and the type `let`s around the refinement that the
+/// predicate or the element type reads, each as its binder, its definition, and the binders
+/// between the `let` and the refinement ([`TypeLetScope`]). Two occurrences of one predicate under
+/// different definitions compile apart.
+#[derive(Clone, PartialEq)]
+pub(crate) struct PredicateContext {
+    element: Type,
+    lets: Vec<(Name, Rc<crate::ccl::ty::HeldTerm>, u32)>,
+}
+
+/// The type `let`s ([`TypeLet`]) around the position a predicate walk has reached, outermost
+/// first, each with the walk's binder depth at the `let`; `depth` counts the binders an index
+/// counts at the position. The ones left after the program's root binds what it can
+/// ([`super::held`]) hold a value per position, and a compiled refinement has the ones it reads
+/// discharged ([`Self::compiled_form`]). They key the memo ([`PredicateContext`]).
+#[derive(Clone, Default)]
+pub(crate) struct TypeLetScope {
+    lets: Vec<(Rc<TypeLet>, u32)>,
+    depth: u32,
+    /// What planning does with each type `let`'s definition ([`super::PlanningCtx::held`]).
+    held: Rc<held::TypeLetRoles>,
+    /// The compiled definitions of the type `let`s the walk has met, by binder
+    /// ([`Self::share_definition`]).
+    compiled: Rc<std::cell::RefCell<std::collections::HashMap<Name, ccl_utils::SharedTerms>>>,
+}
+
+impl TypeLetScope {
+    /// Point the definition of the type `let` `l` at an equal compiled definition of a `let` of
+    /// the same binder, or record it as one. Each position holding a `let` compiles its
+    /// definition under the `let`s around it, so one definition held at many positions compiles
+    /// to many equal copies ([`ccl_utils::SharedTerms`]).
+    fn share_definition(&self, l: &mut TypeLet) {
+        if let Some(kept) = self
+            .compiled
+            .borrow_mut()
+            .entry(l.name.clone())
+            .or_default()
+            .share(&l.definition, || ccl_utils::term_reads(&l.definition))
+        {
+            l.definition = kept;
+        }
+    }
+
+    /// `predicate` reading each type `let`'s definition the program's root binds by the root's binder,
+    /// with every other type `let`'s definition it reads discharged, directly or through another's,
+    /// each raised by the binders between its `let` and the predicate. Copies the definitions,
+    /// so the caller holds a recording open.
+    fn compiled_form(&self, predicate: Expr) -> Expr {
+        // A root `let` of the predicate is the type's: dropped where the program's root binds
+        // its binder, and discharged into the predicate otherwise.
+        let mut term = predicate;
+        while let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &term.node
+            && binding.transparency == crate::ccl::BindingTransparency::Transparent
+            && crate::ccl::subst::free_elem_indices(bound_expr).is_empty()
+        {
+            let bound = self
+                .held
+                .role_of(&binding.name, bound_expr)
+                .filter(|role| self.held.bound.contains(role));
+            let TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } = term.node
+            else {
+                unreachable!("matched a `let` above")
+            };
+            term = match bound {
+                None => lambda_elim::substitute(*body, &binding.name, &bound_expr),
+                // A copy's own name for the binder the root binds.
+                Some(role) if role != binding.name => {
+                    crate::ccl::subst::Subst::rename(binding.name, role).apply_expr(&body)
+                }
+                Some(_) => *body,
+            };
+        }
+        let mut term = self.with_unbound_discharged(term);
+        held::list_elements_discharged(&mut term, &|n| {
+            self.held.definitions.get(n).map(|d| d.term())
+        });
+        term
+    }
+
+    /// `term`, standing under every `let` of the scope, with each definition the program's root
+    /// does not bind discharged, raised by the binders between its `let` and `term`. A
+    /// definition can read another, so each round writes in an outer one.
+    fn with_unbound_discharged(&self, mut term: Expr) -> Expr {
+        loop {
+            let reads = ccl_utils::free_names(&term);
+            let definitions: std::collections::HashMap<Name, Expr> = self
+                .lets
+                .iter()
+                .filter(|(l, _)| !self.held.bound.contains(&l.name) && reads.contains(&l.name))
+                .map(|(l, at)| {
+                    (
+                        l.name.clone(),
+                        crate::ccl::subst::raised_term(&l.definition, self.depth - at),
+                    )
+                })
+                .collect();
+            if definitions.is_empty() {
+                break;
+            }
+            term = crate::ccl::subst::Subst::discharge_env_in_place_in(
+                &mut Solver::none(),
+                term,
+                &definitions,
+                crate::ccl::Ids::Fresh,
+            );
+        }
+        term
+    }
+
+    /// The `let`s that a term or type reading `reads` reads, directly or through another's
+    /// definition.
+    fn read_by(&self, reads: impl IntoIterator<Item = Name>) -> Vec<&(Rc<TypeLet>, u32)> {
+        let lets: Vec<&TypeLet> = self.lets.iter().map(|(l, _)| &**l).collect();
+        TypeLet::read_by(&lets, reads)
+            .into_iter()
+            .zip(&self.lets)
+            .filter_map(|(read, l)| read.then_some(l))
+            .collect()
+    }
+}
 
 /// True if a `__pair` binder ([`Name::is_synthetic_pair`]) other than one of
 /// `referenced` appears anywhere in the **term** `e` — its node and child
@@ -114,7 +245,28 @@ fn term_mentions_pair_binder(e: &Expr, referenced: &HashSet<Name>) -> bool {
 /// predicates and still match under refinement equality; for the nested-lambda
 /// case the per-`Rc` memo keeps shared occurrences equal despite `lambda_elim`'s
 /// `__pair` minting (see [`PredMemo`]).
-pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Type>) {
+pub(crate) fn compile_refinement_predicates(
+    expr: &mut Expr,
+    memo: &PredMemo<PredicateContext>,
+    held: &Rc<held::TypeLetRoles>,
+) {
+    compile_refinement_predicates_under(
+        expr,
+        memo,
+        &mut TypeLetScope {
+            held: Rc::clone(held),
+            ..TypeLetScope::default()
+        },
+    );
+}
+
+/// [`compile_refinement_predicates`] in a term at `scope`: a type `let`'s definition, under the
+/// `let`s around it.
+fn compile_refinement_predicates_under(
+    expr: &mut Expr,
+    memo: &PredMemo<PredicateContext>,
+    scope: &mut TypeLetScope,
+) {
     // A `Cast`'s target refinements are assertions on the cast's *value*: the
     // checker types them with `__elem` bound at the value's domain (see
     // `emit_cast`), which carries the value's own refinements. Compile them against
@@ -124,13 +276,13 @@ pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Typ
     // whose domain the value's refinements narrow.
     if let TypedExprNode::Cast { value, target } = &mut expr.node {
         let value_dom = value.ty.domain();
-        compile_cast_target(target, value_dom, memo);
-        compile_predicates_in_type(&mut expr.ty, memo, &[]);
-        compile_refinement_predicates(value, memo);
+        compile_cast_target(target, value_dom, memo, scope);
+        compile_predicates_in_type(&mut expr.ty, memo, &[], scope);
+        compile_refinement_predicates_under(value, memo, scope);
         return;
     }
-    expr.walk_type_slots_mut(|ty| compile_predicates_in_type(ty, memo, &[]));
-    expr.walk_children_mut(|child| compile_refinement_predicates(child, memo));
+    expr.walk_type_slots_mut(|ty| compile_predicates_in_type(ty, memo, &[], scope));
+    expr.walk_children_mut(|child| compile_refinement_predicates_under(child, memo, scope));
 }
 
 /// Compile a cast target's domain refinements against the value's domain (the
@@ -138,12 +290,27 @@ pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &PredMemo<Typ
 /// the target generically. The top-level domain refinement must not be
 /// revisited by the generic walk: recompiling it against the target's bare
 /// base would re-stamp `__elem` with the narrower context lost.
-fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMemo<Type>) {
+fn compile_cast_target(
+    target: &mut Type,
+    value_dom: Option<Type>,
+    memo: &PredMemo<PredicateContext>,
+    scope: &mut TypeLetScope,
+) {
     if let Type::Fun {
-        domain, codomain, ..
+        binder,
+        domain,
+        codomain,
+        ..
     } = target
     {
-        if let Type::Refinement(base, refinements) = domain.as_mut() {
+        // The type `let`s over the domain are in scope at its refinements.
+        let outside = scope.lets.len();
+        let mut at = domain.as_mut();
+        while let Type::Let(l) = at {
+            scope.lets.push((Rc::clone(l), scope.depth));
+            at = &mut Rc::make_mut(l).body;
+        }
+        if let Type::Refinement(base, refinements) = at {
             // The base an assertion *filters*: the value's domain with the assertion itself
             // taken back out. A target holds only the cast's born refinements, so its own
             // set cannot say what precedes them, and the value's domain says it once the
@@ -152,8 +319,8 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
             // narrowing the restrict pipeline gives this predicate, and the value's domain
             // hands the predicate a domain its own assertion already narrowed — which only
             // reconciled while a predicate was a compute function and contravariance absorbed it.
-            let assert_base = match &value_dom {
-                Some(Type::Refinement(value_base, value_set)) => {
+            let assert_base = match value_dom.as_ref().map(TypeLet::peel) {
+                Some((value_lets, Type::Refinement(value_base, value_set))) => {
                     let preceding = value_set
                         .as_slice()
                         .iter()
@@ -163,19 +330,143 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
                             acc.insert(r);
                             acc
                         });
-                    Type::refined((**value_base).clone(), preceding)
+                    TypeLet::rewrap(
+                        &value_lets,
+                        Type::refined((**value_base).clone(), preceding),
+                    )
                 }
-                Some(unrefined) => unrefined.clone(),
+                Some(_) => value_dom.clone().expect("matched `Some`"),
                 None => (**base).clone(),
             };
-            compile_refinements(refinements, &assert_base, memo, &[]);
-            compile_predicates_in_type(base, memo, &[]);
+            compile_refinements(refinements, &assert_base, memo, &[], scope);
+            compile_predicates_in_type(base, memo, &[], scope);
         } else {
-            compile_predicates_in_type(domain, memo, &[]);
+            compile_predicates_in_type(at, memo, &[], scope);
         }
-        compile_predicates_in_type(codomain, memo, &[]);
+        scope.lets.truncate(outside);
+        settle_lets(domain);
+        compile_codomain(binder, domain, codomain, memo, &[], scope);
     } else {
-        compile_predicates_in_type(target, memo, &[]);
+        compile_predicates_in_type(target, memo, &[], scope);
+    }
+}
+
+/// `ty` with each type `let` at its root that compilation left unread dropped, or its
+/// definition discharged where that is a variable or a literal: a compiled predicate has the
+/// definitions it reads discharged.
+fn settle_lets(ty: &mut Type) {
+    if let Type::Let(l) = ty {
+        settle_lets(&mut Rc::make_mut(l).body);
+        ccl_utils::inline_rewritten_let(ty);
+    }
+}
+
+/// The refinements of `ty` under the type `let`s at its root, each in the form a compiled
+/// predicate takes ([`TypeLetScope::compiled_form`]): reading the binders the program's root binds,
+/// with every other definition it reads discharged.
+pub(crate) fn refinements_under_lets(
+    ty: &Type,
+    held: &held::TypeLetRoles,
+) -> Vec<crate::ccl::Refinement> {
+    let (lets, under) = TypeLet::peel(ty);
+    let scope = TypeLetScope {
+        lets: lets.iter().map(|l| (Rc::new((*l).clone()), 0)).collect(),
+        depth: 0,
+        held: Rc::new(held.clone()),
+        compiled: Default::default(),
+    };
+    under
+        .own_refinements()
+        .iter()
+        .map(|r| {
+            let reads = ccl_utils::free_names(&r.predicate);
+            let root_let = matches!(&r.predicate.node, TypedExprNode::Let { .. });
+            if !root_let && scope.read_by(reads).is_empty() {
+                return r.clone();
+            }
+            let _g = provenance::enter(
+                r.predicate.node_id(),
+                "planning.predicate_under_lets",
+                provenance::Nature::Machinery,
+            );
+            crate::ccl::Refinement::born(Rc::new(scope.compiled_form(r.predicate.duplicate())))
+        })
+        .collect()
+}
+
+/// The witness projection `ty` is under the type `let`s at its root, its term in the form a
+/// compiled predicate takes ([`refinements_under_lets`]). `None` where `ty` is no projection
+/// under its `let`s.
+pub(crate) fn projection_under_lets(
+    ty: &Type,
+    held: &held::TypeLetRoles,
+) -> Option<crate::ccl::ty::WitnessProjection> {
+    let (lets, under) = TypeLet::peel(ty);
+    let Type::WitnessProjection(projection) = under else {
+        return None;
+    };
+    let scope = TypeLetScope {
+        lets: lets.iter().map(|l| (Rc::new((*l).clone()), 0)).collect(),
+        depth: 0,
+        held: Rc::new(held.clone()),
+        compiled: Default::default(),
+    };
+    let reads = ccl_utils::free_names(&projection.term);
+    if scope.read_by(reads).is_empty() {
+        return Some(projection.clone());
+    }
+    let _g = provenance::enter(
+        projection.term.node_id(),
+        "planning.projection_under_lets",
+        provenance::Nature::Machinery,
+    );
+    Some(crate::ccl::ty::WitnessProjection::new(
+        Rc::new(scope.compiled_form(projection.term.duplicate())),
+        projection.position,
+    ))
+}
+
+/// `ty`'s refined shape under the type `let`s at its root: the base, holding the `let`s it reads
+/// where it reads them ([`TypeLet::innermost`]), which keeps its structure, and the refinements
+/// ([`refinements_under_lets`]). `None` where `ty` is no refinement under its `let`s.
+pub(crate) fn refined_under_lets(
+    ty: &Type,
+    held: &held::TypeLetRoles,
+) -> Option<(Type, Vec<crate::ccl::Refinement>)> {
+    let (lets, under) = TypeLet::peel(ty);
+    match under {
+        Type::Refinement(base, _) => Some((
+            TypeLet::innermost_each(&lets, (**base).clone()),
+            refinements_under_lets(ty, held),
+        )),
+        _ => None,
+    }
+}
+
+/// Compile a function type's codomain. A codomain under a binder that names the input is
+/// compiled in its opened form: a predicate there may hold a subterm whose type reads the
+/// binder, and compiled closed, that index is carried under the crossings the compiled morphisms
+/// add, where it names another function. An unnamed binder's codomain stands one binder deeper.
+fn compile_codomain(
+    binder: &crate::ccl::FunBinder,
+    domain: &Type,
+    codomain: &mut Type,
+    memo: &PredMemo<PredicateContext>,
+    slot: &[crate::ccl::ty::Witness],
+    scope: &mut TypeLetScope,
+) {
+    if binder.is_none() {
+        scope.depth += 1;
+        compile_predicates_in_type(codomain, memo, slot, scope);
+        scope.depth -= 1;
+    } else {
+        crate::ccl::subst::map_opened_codomain(
+            &mut Solver::none(),
+            binder,
+            domain,
+            codomain,
+            |opened| compile_predicates_in_type(opened, memo, slot, scope),
+        )
     }
 }
 
@@ -327,9 +618,40 @@ fn pre_planning_source_form(e: &Expr) -> Option<&'static str> {
 
 fn compile_predicates_in_type(
     ty: &mut Type,
-    memo: &PredMemo<Type>,
+    memo: &PredMemo<PredicateContext>,
     slot: &[crate::ccl::ty::Witness],
+    scope: &mut TypeLetScope,
 ) {
+    // A type `let` is in scope over its body, whose refinements take its definition discharged
+    // ([`TypeLetScope`]). Afterwards only a read outside the refinements keeps it, and its
+    // definition compiles as a term under the `let`s around it.
+    if let Type::Let(l) = ty {
+        scope.lets.push((Rc::clone(l), scope.depth));
+        compile_predicates_in_type(&mut Rc::make_mut(l).body, memo, slot, scope);
+        scope.lets.pop();
+        if !ccl_utils::inline_rewritten_let(ty)
+            && let Type::Let(_) = ty
+        {
+            let context = PredicateContext {
+                element: Type::Hole,
+                lets: scope
+                    .lets
+                    .iter()
+                    .map(|(l, at)| (l.name.clone(), Rc::clone(&l.definition), scope.depth - at))
+                    .collect(),
+            };
+            for quoted in ty.held_terms_mut() {
+                memo.rebuild(quoted, &context, |definition| {
+                    compile_refinement_predicates_under(definition, memo, scope);
+                    true
+                });
+            }
+            if let Type::Let(l) = ty {
+                scope.share_definition(Rc::make_mut(l));
+            }
+        }
+        return;
+    }
     let here = ty.sum().unwrap_or(&[]).to_vec();
     let extended: Vec<crate::ccl::ty::Witness> = if here.is_empty() {
         slot.to_vec()
@@ -339,7 +661,7 @@ fn compile_predicates_in_type(
     let slot = extended.as_slice();
     if let Type::Refinement(base, refinements) = ty {
         let base = base.clone();
-        compile_refinements(refinements, &base, memo, slot);
+        compile_refinements(refinements, &base, memo, slot, scope);
     }
     // Recurse into structural type children (refinement base, function
     // domain/codomain, tuple/record/variant elements).
@@ -363,14 +685,8 @@ fn compile_predicates_in_type(
             codomain,
             ..
         } => {
-            compile_predicates_in_type(domain, memo, slot);
-            crate::ccl::subst::map_opened_codomain(
-                &mut Solver::none(),
-                binder,
-                domain,
-                codomain,
-                |opened| compile_predicates_in_type(opened, memo, slot),
-            );
+            compile_predicates_in_type(domain, memo, slot, scope);
+            compile_codomain(binder, domain, codomain, memo, slot, scope);
         }
         Type::DepTuple(components) => {
             let names = crate::ccl::subst::tuple_component_names(components);
@@ -383,7 +699,7 @@ fn compile_predicates_in_type(
             .into_iter()
             .zip(&names)
             .map(|(mut t, name)| {
-                compile_predicates_in_type(&mut t, memo, slot);
+                compile_predicates_in_type(&mut t, memo, slot, scope);
                 (Some(name.clone()), t)
             })
             .collect();
@@ -399,16 +715,16 @@ fn compile_predicates_in_type(
         // A family's body is compiled under its binders' names, as a codomain is.
         Type::Family { binders, body } => {
             for (_, t) in binders.iter_mut() {
-                compile_predicates_in_type(t, memo, slot);
+                compile_predicates_in_type(t, memo, slot, scope);
             }
             crate::ccl::subst::map_opened_family_body(
                 &mut Solver::none(),
                 binders,
                 body,
-                |opened| compile_predicates_in_type(opened, memo, slot),
+                |opened| compile_predicates_in_type(opened, memo, slot, scope),
             );
         }
-        _ => ty.walk_children_mut(|child| compile_predicates_in_type(child, memo, slot)),
+        _ => ty.walk_children_mut(|child| compile_predicates_in_type(child, memo, slot, scope)),
     }
 }
 
@@ -421,16 +737,42 @@ fn compile_predicates_in_type(
 fn compile_refinements(
     refinements: &mut RefinementSet,
     base: &Type,
-    memo: &PredMemo<Type>,
+    memo: &PredMemo<PredicateContext>,
     slot: &[crate::ccl::ty::Witness],
+    scope: &TypeLetScope,
 ) {
     // Indexed by physical position (`application_elem_types`), because the
     // rewrite below walks the set in place and the application order is a
     // *permutation* of the physical one.
     let elem_tys = crate::ccl::application_elem_types(refinements.as_slice(), base);
     refinements.rewrite_each(|i, refinement| {
-        let base_ctx = elem_tys[i].clone();
-        memo.rebuild(refinement, &base_ctx, |bare| {
+        let base_ctx = &elem_tys[i];
+        let context = PredicateContext {
+            element: base_ctx.clone(),
+            lets: scope
+                .read_by(
+                    ccl_utils::free_names(&refinement.predicate)
+                        .into_iter()
+                        .chain(crate::ccl::subst::type_free_vars(base_ctx)),
+                )
+                .into_iter()
+                .map(|(l, at)| (l.name.clone(), Rc::clone(&l.definition), scope.depth - at))
+                .collect(),
+        };
+        memo.rebuild(refinement, &context, |bare| {
+            // The predicate takes the form a compiled predicate takes under the type `let`s. A
+            // membership is carried rather than compiled ([`fn_of_bare_predicate`]), so it keeps
+            // reading the definitions by the names the type holds them under.
+            let carried = matches!(
+                &bare.node,
+                TypedExprNode::Apply { function, .. }
+                    if matches!(&function.node, TypedExprNode::Apply { function: contains, .. }
+                        if is_builtin(contains, Builtin::CollectionContains))
+                        && !crate::ccl::channelize::holds_defer(function)
+            );
+            if !carried {
+                *bare = scope.compiled_form(std::mem::take(bare));
+            }
             // Normalize the bare predicate to `__elem ▷ p` with `p` point-free:
             // recover the predicate function and re-wrap it. This keeps the stored
             // predicate in the single bare form while pinning a point-free core, so
@@ -440,14 +782,15 @@ fn compile_refinements(
                 .into_iter()
                 .filter(Name::is_synthetic_pair)
                 .collect();
-            let p = fn_of_bare_predicate(&base_ctx, bare, slot);
-            let mut compiled = ccl_utils::bare_predicate_of_fn(&base_ctx, p);
+            let p = fn_of_bare_predicate(base_ctx, bare, slot);
+            let mut compiled = ccl_utils::bare_predicate_of_fn(base_ctx, p);
             // The compiled predicate's own sub-expressions can carry *nested*
             // refinements (a filter over an already-filtered source: the inner
             // refinement rides a sub-expression's type slot inside this predicate).
             // `Type::walk_children_mut` below does not descend into a predicate term,
-            // so compile those here, sharing the memo.
-            compile_refinement_predicates(&mut compiled, memo);
+            // so compile those here, sharing the memo, under the type `let`s around this one:
+            // a type `let`'s definition reads no element, so the predicate stands where its type does.
+            compile_refinement_predicates_under(&mut compiled, memo, &mut scope.clone());
             // The producer/consumer refinement match (`sum`'s domain vs. its feed, a
             // compose adjacency) compares *distinct* predicate `Rc`s — the memo only
             // dedups occurrences sharing one `Rc`. That match rests on compilation

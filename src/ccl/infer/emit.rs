@@ -238,7 +238,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             if let Type::Infer(v) = &arg {
                 v.fun_kind().stamp_data(ctx.solver());
             }
-            let term = std::rc::Rc::new(Expr::var(c.clone()).with_ty(arg.clone()));
+            let term =
+                crate::ccl::ty::IntoHeldTerm::into_held(Expr::var(c.clone()).with_ty(arg.clone()));
             let result =
                 crate::ccl::subst::Subst::eliminating(term).apply_type_in(ctx.solver(), &arg);
             Type::pi_in(ctx.solver(), c, arg, result)
@@ -337,12 +338,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // fresh var that `emit_proj` ties to `domain ⇒ codomain`, or with the
             // function of the dependent tuple its application found it projecting
             // (`emit_apply`).
-            let seed = match recorded_ty.peel_refinements() {
+            let seed = match recorded_ty.lets_distributed().peel_refinements() {
                 Type::Fun {
                     binder: FunBinder::Whole(_),
                     domain,
                     ..
-                } if matches!(domain.peel_refinements(), Type::DepTuple(_)) => recorded_ty.clone(),
+                } if matches!(domain.former(), Type::DepTuple(_)) => recorded_ty.clone(),
                 _ => ctx.fresh(),
             };
             emit_proj(key, &seed, expr.node_id, ctx)?
@@ -698,6 +699,8 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         // `BoundedHole` here: recurse into the bound, or a predicate written inside one
         // (`x <: {Int | p}`) never gets typed.
         Type::BoundedHole(bound) => emit_annotation_predicates(bound, ctx),
+        // A program never writes a `let` in a type; only a scope exit makes one.
+        Type::Let(_) => unreachable!("an annotation holds a `let` type: {ty:?}"),
         Type::Refinement(inner, refinements) => {
             // The annotation's refinements are bare over REFINEMENT_BINDER, just
             // like a cast target's — bind the element over the refined base and
@@ -1197,7 +1200,8 @@ pub(super) fn emit_lambda<C: Typing>(
     };
     let ty = Type::Fun {
         binder,
-        fun_kind: match recorded {
+        // Under the type `let`s the recorded type can hold at its root.
+        fun_kind: match crate::ccl::ty::TypeLet::peel(recorded).1 {
             Type::Fun { fun_kind, .. } => fun_kind.clone(),
             _ => FunKind::Compute,
         },
@@ -1334,6 +1338,14 @@ pub(super) fn emit_cast<C: Typing>(
     let value_ty = emit_value_read(value, ctx)?;
     // Re-view `value : D ⇒ V` as `{D | r} ⇒ V` (the refinement on the domain).
     let (d, v) = ctx.as_function(&value_ty, &|| "this expression".to_string())?;
+    // A target holding definitions (`let 𝑥 = 𝑒 in 𝑇`) re-views at `𝑇`, and the domain built
+    // from it keeps the `let`s it reads.
+    let lets: Vec<crate::ccl::ty::TypeLet> = crate::ccl::ty::TypeLet::peel(target)
+        .0
+        .into_iter()
+        .cloned()
+        .collect();
+    let target = target.under_lets_mut();
     // Type the domain-refinement's bare predicate with the implicit binder
     // bound to the (unrefined) domain `d`, enforcing `Bool` (§6.2). Rebuilding
     // it on the `target` slot is what carries the typed predicate onto the
@@ -1349,7 +1361,12 @@ pub(super) fn emit_cast<C: Typing>(
         fun_kind, domain, ..
     } = target
         && fun_kind.witnesses().is_empty()
-        && let Type::Refinement(_, refinements) = domain.as_mut()
+        && let domain_lets = crate::ccl::ty::TypeLet::peel(domain)
+            .0
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>()
+        && let Type::Refinement(_, refinements) = domain.under_lets_mut()
     {
         // Each predicate is typed at the element type it sees in the restrict
         // pipeline — the value's domain narrowed by the refinements applied
@@ -1359,12 +1376,42 @@ pub(super) fn emit_cast<C: Typing>(
         // type is `d` itself, so Emit is unchanged; a multi-refinement target
         // is planning's (a gate over a filter), seen here only by Check.
         let elem_tys = crate::ccl::application_elem_types(refinements.as_slice(), &d);
-        refinements.try_rewrite_each(|i, r| emit_bare_predicate(r, &elem_tys[i], ctx))?;
+        // The predicates read the binders of the `let`s the target and its domain hold, which
+        // are in scope for them as a term's binder is.
+        let around: Vec<crate::ccl::ty::TypeLet> = lets
+            .iter()
+            .cloned()
+            .chain(domain_lets.iter().cloned())
+            .collect();
+        under_type_lets(&around, ctx, |ctx| {
+            refinements.try_rewrite_each(|i, r| emit_bare_predicate(r, &elem_tys[i], ctx))
+        })?;
     }
-    let domain = match cast_target_refinement(target) {
+    // The target domain's refinements read the definitions the domain holds, so the domain
+    // built from them holds those too.
+    let (domain_lets, refinements) = match target.domain() {
+        Some(target_domain) => {
+            let (held, under) = crate::ccl::ty::TypeLet::peel(&target_domain);
+            let refinements = match under {
+                Type::Refinement(_, refinements) => Some(refinements.clone()),
+                _ => None,
+            };
+            (held.into_iter().cloned().collect::<Vec<_>>(), refinements)
+        }
+        None => (Vec::new(), None),
+    };
+    debug_assert_eq!(
+        refinements.is_some(),
+        domain_lets.is_empty() && cast_target_refinement(target).is_some()
+            || !domain_lets.is_empty() && refinements.is_some(),
+        "the cast target's refinement is read under the domain's `let`s or not at all"
+    );
+    let domain = match refinements {
         Some(refinements) => Type::refined(d, refinements),
         None => d,
     };
+    let domain = crate::ccl::ty::TypeLet::rewrap(&domain_lets.iter().collect::<Vec<_>>(), domain);
+    let domain = crate::ccl::ty::TypeLet::rewrap(&lets.iter().collect::<Vec<_>>(), domain);
     // A cast re-views the value *at* `target`, so the result carries `target`'s
     // kind: a cast to a filtered-collection target (`refined_data_fun`, `Data`)
     // yields a `Data` collection even though the underlying value is a `Compute`
@@ -1384,7 +1431,7 @@ pub(super) fn emit_cast<C: Typing>(
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
     // which is what keeps the O8 contravariant-domain discharge from leaving an
     // undischarged binder in the domain's refinement predicate (design §5.2, O8).
-    let binder = match value_ty.peel_refinements() {
+    let binder = match value_ty.former() {
         Type::Fun { binder, .. } => binder.clone(),
         _ => FunBinder::None,
     };
@@ -1533,7 +1580,7 @@ pub(super) fn emit_apply<C: Typing>(
             && matches!(function.ty, Type::Hole | Type::Infer(_))
         {
             let tuple = read_through(&raw_arg_ty);
-            if let Type::DepTuple(_) = tuple.peel_refinements() {
+            if let Type::DepTuple(_) = tuple.former() {
                 let b = Name::fresh("__tuple");
                 let codomain = ctx.scoped(&b, &tuple, |ctx| ctx.fresh());
                 function.ty = Type::Fun {
@@ -1619,7 +1666,7 @@ fn call_arity(function: &Expr, fn_ty: &Type, list: Option<usize>) -> Result<(), 
     ) {
         return Ok(());
     }
-    let Type::Fun { binder, .. } = fn_ty.peel_refinements() else {
+    let Type::Fun { binder, .. } = fn_ty.former() else {
         return Ok(());
     };
     let params = binder.parameter_count();
@@ -1710,7 +1757,9 @@ fn borrowed_arguments<C: Typing>(
         Some(parts) => parts.iter().collect(),
         None => vec![argument],
     };
-    let params: Option<Vec<Type>> = match fn_ty.peel_refinements() {
+    // Each parameter's type under the `let`s the function's type holds.
+    let fn_ty = fn_ty.lets_distributed();
+    let params: Option<Vec<Type>> = match fn_ty.lets_distributed().peel_refinements() {
         Type::Fun { domain, .. } if parts.len() == 1 => Some(vec![(**domain).clone()]),
         Type::Fun { domain, .. } => param_components(domain, parts.len()),
         _ => None,
@@ -1793,7 +1842,8 @@ fn keyed_access_value<C: Typing>(
     // them. Keep the collection's base as the upper bound; only presence is checked later.
     // A range's base is `UInt`: `0..𝑛` states which keys are present, and a key outside it is
     // a lookup that answers `none`.
-    let base = match keys.peel_refinements() {
+    let keys_shape = keys.lets_distributed();
+    let base = match keys_shape.peel_refinements() {
         Type::UIntRange(_) => &Type::Base(BaseType::UInt),
         base => base,
     };
@@ -1849,8 +1899,8 @@ fn emit_lookup_checked<C: Typing>(
 /// `(_ ⇒ Option(_))` (`lower_subscript` in `src/ccl/lower/exprs.rs`), or that an earlier
 /// emission of the same node stamped with the concrete instance.
 fn stamped_option(ty: &Type) -> std::rc::Rc<crate::ccl::nominal::NominalDecl> {
-    match ty.peel_refinements() {
-        Type::Fun { codomain, .. } => match codomain.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
+        Type::Fun { codomain, .. } => match codomain.lets_distributed().peel_refinements() {
             Type::Nominal(decl, _) if decl.is_option() => std::rc::Rc::clone(decl),
             other => panic!("`lookup?` answers `Option`, stamped `{other}`"),
         },
@@ -2105,7 +2155,8 @@ fn emit_function<C: Typing>(function: &mut Expr, ctx: &mut C) -> Result<Type, Lo
 /// earlier component at `value.𝑗`, the part a tuple built in place has in hand. Any other type is
 /// unchanged. Mints the projections, so the caller opens a recording.
 fn dep_tuple_at(solver: &mut Solver, domain: &Type, value: &Expr) -> Type {
-    let Type::DepTuple(components) = domain.peel_refinements() else {
+    let distributed = domain.lets_distributed();
+    let Type::DepTuple(components) = distributed.peel_refinements() else {
         return domain.clone();
     };
     let mut tuple = crate::ccl::ccl_utils::predicate_term(solver, value);
@@ -2154,7 +2205,7 @@ fn argument_tuple(argument: &Expr, erased: bool) -> Option<(NodeId, usize)> {
 /// (`Type::params_domain`). A dependent tuple's components read the ones before them by
 /// index, which a by-reference test of their head does not open.
 fn param_components(param: &Type, width: usize) -> Option<Vec<Type>> {
-    match param.peel_refinements() {
+    match param.lets_distributed().peel_refinements() {
         Type::Tuple(ts) if ts.len() == width => Some(ts.clone()),
         Type::DepTuple(cs) if cs.len() == width => {
             Some(cs.iter().map(|(_, t)| t.clone()).collect())
@@ -2465,7 +2516,7 @@ fn feed_channel(
     if target_ty.as_feed().is_some() {
         return Ok(target_ty.read_view().into_owned());
     }
-    let error = if matches!(target_ty.peel_refinements(), Type::Infer(_)) {
+    let error = if matches!(target_ty.former(), Type::Infer(_)) {
         InferError::Place {
             name: target.base().to_string(),
             defect: crate::ccl::infer::PlaceDefect::FeedTargetNotAPlace,
@@ -2530,7 +2581,7 @@ pub(super) fn emit_copair<C: Typing>(
         // shared `cod_var`, its domain becomes the variant tag for operand `i`.
         let (dom, cod) = ctx.as_function(&ty, &|| "an operand of `++`".to_string())?;
         // The codomain left this element's Σ behind, so the edge carries it.
-        let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+        let binders = ty.sum_binders();
         ctx.require_sub_under(&cod, &binders, &cod_var, &[], &|| {
             "Copair codomain".to_string()
         })?;
@@ -2567,7 +2618,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // the type lambda elimination stamped names that lambda's binder. Each arm's codomain is
     // opened at that one name and related under it, so the joined codomain is minted where
     // the binder is in scope.
-    let binder = match recorded.peel_refinements() {
+    let binder = match recorded.former() {
         Type::Fun {
             binder: FunBinder::Whole(b),
             ..
@@ -2591,7 +2642,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
         // operands over genuinely different index sets are a type error here rather
         // than being silently tagged apart.
         // Both parts left this element's Σ behind, so both edges carry it.
-        let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+        let binders = ty.sum_binders();
         ctx.require_sub_under(&dom, &binders, &dom_var, &[], &|| {
             "DisjointJoin domain".to_string()
         })?;
@@ -2672,6 +2723,19 @@ pub(super) fn emit_aggregate<C: Typing>(
         )?;
     }
     Ok(result)
+}
+
+/// Run `f` with the binder of each of `lets` in scope, outermost first, each at its
+/// definition's type: a term a type `let` is around reads them as it reads a term's binder.
+fn under_type_lets<C: Typing, R>(
+    lets: &[crate::ccl::ty::TypeLet],
+    ctx: &mut C,
+    f: impl FnOnce(&mut C) -> R,
+) -> R {
+    match lets.split_first() {
+        None => f(ctx),
+        Some((l, rest)) => ctx.scoped_type_let(l, |ctx| under_type_lets(rest, ctx, f)),
+    }
 }
 
 /// Emit/check a `let`, returning the body type.
@@ -3261,7 +3325,10 @@ fn emit_let_bound<C: Typing>(
             // A tuple built in place meets a written dependent tuple with each later
             // component read at the parts before it, as a call's arguments meet a dependent
             // domain; the binder keeps the dependent tuple ([`dep_tuple_at`]).
-            let bound = match (declared.peel_refinements(), built_tuple(bound_expr)) {
+            let bound = match (
+                declared.lets_distributed().peel_refinements(),
+                built_tuple(bound_expr),
+            ) {
                 (Type::DepTuple(_), true) => {
                     let _g = crate::ccl::provenance::enter(
                         bound_expr.node_id(),
@@ -3545,7 +3612,7 @@ pub(super) fn emit_for<C: Typing>(
     // resolved source, with the witnesses projected through it
     // (`crate::ccl::mut_elim::loop_domain`).
     // The element type left the source's Σ behind, so the edge carries it.
-    let source_binders = iter_ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+    let source_binders = iter_ty.sum_binders();
     let target_label = target.name.clone();
     // A loop whose iterations interact runs in its source's position order, so the positions
     // must be orderable (`docs/chl-spec.md`, "Ordered loops").
@@ -3675,10 +3742,10 @@ pub(super) fn emit_proj<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     // A projection seeded as a function of the dependent tuple it projects (`emit_apply`)
     // already has its shape; any other node supplies one.
-    let (domain, codomain) = match node_ty.peel_refinements() {
+    let (domain, codomain) = match node_ty.lets_distributed().peel_refinements() {
         Type::Fun {
             domain, codomain, ..
-        } if matches!(domain.peel_refinements(), Type::DepTuple(_)) => {
+        } if matches!(domain.former(), Type::DepTuple(_)) => {
             ((**domain).clone(), (**codomain).clone())
         }
         _ => ctx.provide_function(node_ty, &|| projection(key))?,
@@ -3692,7 +3759,8 @@ pub(super) fn emit_proj<C: Typing>(
         );
         // An index past the last component has no type; it falls to the plain tuple's
         // requirement below, which reports it as it does an index past a `Tuple`'s end.
-        let binder = match node_ty.peel_refinements() {
+        // The function's binder, under the type `let`s at its root.
+        let binder = match node_ty.former() {
             Type::Fun {
                 binder: FunBinder::Whole(b),
                 ..
@@ -4328,7 +4396,7 @@ pub(super) fn bind_selected_instance_function(
 /// The type `ty` states: itself, or the first bound its variable has gathered.
 fn gathered_type(solver: &mut Solver, ty: &Type) -> Option<Type> {
     use std::ops::ControlFlow;
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         Type::Infer(var) => for_each_gathered_bound(solver, var, |b| ControlFlow::Break(b.clone())),
         Type::Hole | Type::SharedHole(_) => None,
         other => Some(other.clone()),
@@ -4643,7 +4711,7 @@ fn for_each_gathered_bound<B>(
         }
         let bounds = v.bounds(solver);
         for b in bounds.lower().iter().chain(bounds.upper().iter()) {
-            match b.ty.peel_refinements() {
+            match b.ty.lets_distributed().peel_refinements() {
                 Type::Infer(next) => stack.push(std::rc::Rc::clone(next)),
                 other => {
                     if let std::ops::ControlFlow::Break(found) = f(other) {
@@ -4661,7 +4729,7 @@ fn for_each_gathered_bound<B>(
 /// states a tuple yet.
 fn first_component(solver: &mut Solver, ty: &Type) -> Option<Type> {
     use std::ops::ControlFlow;
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         Type::Tuple(elts) => elts.first().cloned(),
         Type::Infer(var) => for_each_gathered_bound(solver, var, |b| match b {
             Type::Tuple(elts) => ControlFlow::Break(elts.first().cloned()),
@@ -4690,7 +4758,7 @@ enum Head {
 /// gathered.
 fn nominal_head(solver: &mut Solver, ty: &Type) -> Head {
     use std::ops::ControlFlow;
-    match ty.peel_refinements() {
+    match ty.former() {
         Type::Nominal(decl, _) => Head::Nominal(decl.clone()),
         Type::Infer(var) => {
             let mut found: Option<std::rc::Rc<crate::ccl::nominal::NominalDecl>> = None;
@@ -4938,14 +5006,16 @@ fn compose_chain<C: Typing>(
     // (`emit_compose`).
     let ty = ctx.open_generic(ty);
     let (dom, cod) = ctx.as_function(&ty, &|| "this expression".to_string())?;
-    let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
+    // The morphism's binders, under the type `let`s its type holds.
+    let shaped = ty.lets_distributed();
+    let binders = shaped.sum_binders();
     if let Some((prev, prev_binders)) = prev_cod {
         ctx.require_sub_under(&prev, &prev_binders, &dom, &binders, &|| {
             format!("Compose[{i}]")
         })?;
     }
-    let cod = crate::ccl::subst::open_codomain_in(ctx.solver(), &ty, &cod);
-    let own = match ty.peel_refinements() {
+    let cod = crate::ccl::subst::open_codomain_in(ctx.solver(), &shaped, &cod);
+    let own = match shaped.lets_distributed().peel_refinements() {
         Type::Fun { binder, .. } => binder.whole().cloned(),
         _ => None,
     };
@@ -4980,7 +5050,7 @@ pub(super) fn emit_compose<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     assert!(elts.len() >= 2, "Compose requires at least two elements");
-    let recorded_binder = match recorded.peel_refinements() {
+    let recorded_binder = match recorded.former() {
         Type::Fun { binder, .. } => binder.whole().cloned(),
         _ => None,
     };
@@ -5002,7 +5072,7 @@ pub(super) fn emit_compose<C: Typing>(
     // annotation lowering stamps on the node, which `emit_node` applies to this
     // result. The value here is only the placeholder that stamp overwrites — it is
     // not the answer, and `emit_node` asserts that an answer exists.
-    let fun_kind = match recorded.peel_refinements() {
+    let fun_kind = match recorded.former() {
         Type::Fun { fun_kind, .. } => fun_kind.clone(),
         _ => FunKind::Compute,
     };
@@ -5058,7 +5128,7 @@ pub(super) fn emit_compose<C: Typing>(
     // the binders are the head's. The recorded kind can name others: a head read through a
     // variable that stood for it, as `Iterable::elements`'s result stands for a collection the
     // call is then removed from, was resolved with binders of its own.
-    let fun_kind = match (&fun_kind, elts[0].ty.peel_refinements()) {
+    let fun_kind = match (&fun_kind, elts[0].ty.former()) {
         (
             FunKind::Data(Some(recorded_ws)),
             Type::Fun {
@@ -5157,6 +5227,7 @@ pub(super) fn writer_tap_histories(
         return Vec::new();
     };
     let codom = crate::ccl::subst::open_codomain_in(solver, body_ty, codomain);
+    let codom = codom.lets_distributed();
     let Type::Record(fields) = codom.peel_refinements() else {
         return Vec::new();
     };
@@ -5196,6 +5267,7 @@ pub(super) fn writer_tap_histories(
                      slots, got {other}"
                 ),
             };
+            let slots_ty = slots_ty.lets_distributed();
             let Type::Tuple(slots) = slots_ty.peel_refinements() else {
                 panic!("a writer body takes the tuple of its slots and its item: {slots_ty}")
             };
@@ -5230,6 +5302,7 @@ pub(super) fn writer_tap_histories(
                     Vec::new()
                 }
                 Some((e, e_ty)) => {
+                    let body_dom = body_dom.lets_distributed();
                     let Type::Tuple(pair_parts) = body_dom.peel_refinements() else {
                         unreachable!("matched a pair above")
                     };
@@ -5321,7 +5394,7 @@ fn emit_transact_writer<C: Typing>(
             let codomain = ctx
                 .as_function(&s_ty, &|| "the transaction's source".to_string())?
                 .1;
-            match (s_ty.peel_refinements(), half(ctx, 0)) {
+            match (s_ty.former(), half(ctx, 0)) {
                 (
                     Type::Fun {
                         binder: FunBinder::Whole(e),
@@ -5335,7 +5408,7 @@ fn emit_transact_writer<C: Typing>(
         None => s_ty,
     };
     let (_d, item) = ctx.as_function(&s_ty, &|| "the transaction's source".to_string())?;
-    let item = match (s_ty.peel_refinements(), half(ctx, 1)) {
+    let item = match (s_ty.former(), half(ctx, 1)) {
         (
             Type::Fun {
                 binder: FunBinder::Whole(k),
@@ -5519,7 +5592,7 @@ pub(super) fn emit_transact<C: Typing>(
 /// The name a nested `Transact`'s `(enclosing, position)` parameter gives its enclosing value,
 /// if the position reads it, and the position's domain, reading it by that name.
 fn nested_parameter_parts(solver: &mut Solver, parameter: &Type) -> (Option<Name>, Type) {
-    match parameter.peel_refinements() {
+    match parameter.lets_distributed().peel_refinements() {
         Type::Tuple(parts) => (None, parts[1].clone()),
         Type::DepTuple(parts) => {
             let enclosing = parts[0]
@@ -5550,7 +5623,7 @@ fn projected(whole: Expr, i: usize, ty: Type) -> Expr {
 
 /// The enclosing half of a nested `Transact`'s `(enclosing, position)` parameter.
 fn enclosing_component(parameter: &Type) -> Type {
-    match parameter.peel_refinements() {
+    match parameter.lets_distributed().peel_refinements() {
         Type::Tuple(parts) => parts[0].clone(),
         // The inner positions depend on the enclosing value, an inner source filtered by the
         // outer loop's variable; the enclosing component reads nothing before it.
@@ -5613,7 +5686,8 @@ pub(super) fn projected_source_type(
 
 /// The type of the field `key` of a tuple or a record of type `ty`.
 fn field_of(ty: &Type, key: &ProjKey) -> Result<Type, (FieldKey, Type)> {
-    let found = match (ty.peel_refinements(), key) {
+    let shape = ty.lets_distributed();
+    let found = match (shape.peel_refinements(), key) {
         (Type::Tuple(fields), ProjKey::Index(i)) => fields.get(*i),
         (Type::Record(fields), ProjKey::Field(name)) => {
             fields.iter().find(|(n, _)| n == name).map(|(_, t)| t)
@@ -5649,7 +5723,6 @@ fn returned_node(e: &Expr) -> NodeId {
 mod review_tests {
     use super::*;
     use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
-    use std::rc::Rc;
 
     /// Finding 2: [`emit_bare_predicate`]'s transform is parameterized by
     /// `domain`, which is not part of the memo key. `emit_cast` passes a *fresh*
@@ -5661,7 +5734,7 @@ mod review_tests {
     fn each_occurrence_constrains_its_own_domain() {
         // `__elem > 0` — using the element binder is what makes the predicate
         // constrain the domain it is typed against.
-        let shared = Rc::new(TypedExpr::binop(
+        let shared = crate::ccl::ty::IntoHeldTerm::into_held(TypedExpr::binop(
             TypedExpr::var(Name::elem()),
             BinOpKind::Compare(CompareKind::Greater),
             TypedExpr::lit(Lit::Int(0)),

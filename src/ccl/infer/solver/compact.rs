@@ -9,6 +9,7 @@
 use crate::ccl::infer::solver::Solver;
 use crate::ccl::infer::solver::component_walk::{ComponentWalk, Exit};
 use crate::ccl::nominal::{DeclMap, NominalDecl, Variance};
+use crate::ccl::ty::{HeldTerm, IntoHeldTerm};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
@@ -91,13 +92,16 @@ pub enum AtomKey {
 
 /// A type held whole as an [`AtomKey`]: a [`Type::WitnessProjection`] or a
 /// [`Type::FamilyApp`]. It holds no inference variable, so the solver has nothing to
-/// relate inside it, and it matches only a type `==` to it up to binder names, which
-/// [`Type::without_pi_names`] strips (references are indices, so nothing else names a binder). `==`
-/// on a refinement ignores its predicate's type slots, so the atom is keyed by `Type`'s own `Hash`,
-/// which ignores them too, and not by the content hash, which reads them. Two unequal projections
-/// sharing a hash are told apart by `rank`, the order in which the run's solver first met each
-/// ([`rank_among_equal_hashes`]). Ranks are the solver's, so only atoms one solver made are
-/// compared.
+/// relate inside it, and it matches only a type equal to it up to binder names, which
+/// [`Type::without_pi_names`] strips (references are indices, so nothing else names a binder).
+///
+/// A held term reading a definition a compaction holds ([`CompactLets`]) is the term with the
+/// definition discharged: the atom hashes and compares it through the definitions it reads
+/// ([`crate::ccl::ty::TermHasher`], [`crate::ccl::ty::type_eq_reading`]), so a projection
+/// reaching a position with a definition discharged is the same atom. The hash is the
+/// held terms' own, with type slots skipped. Two unequal atoms sharing a hash are told apart by
+/// `rank`, the order in which the run's solver first met each ([`rank_among_equal_hashes`]).
+/// Ranks are the solver's, so only atoms one solver made are compared.
 #[derive(Debug, Clone)]
 pub struct ClosedAtom {
     hash: u64,
@@ -106,6 +110,9 @@ pub struct ClosedAtom {
     solver: crate::ccl::infer::solver::state::SolverId,
 }
 
+/// The definitions an atom's held terms read ([`LetRead`]).
+pub(crate) type AtomReads = Rc<[crate::ccl::ty::LetReadDefinition]>;
+
 impl ClosedAtom {
     /// The type the atom holds.
     pub(super) fn ty(&self) -> &Type {
@@ -113,6 +120,11 @@ impl ClosedAtom {
     }
 
     fn new(solver: &mut Solver, ty: &Type) -> Self {
+        Self::held(solver, ty, &[])
+    }
+
+    /// The atom holding `ty`, whose held terms read the definitions `reads`.
+    fn held(solver: &mut Solver, ty: &Type, reads: &[LetRead]) -> Self {
         debug_assert!(
             !crate::ccl::subst::type_contains_infer(ty),
             "a closed atom holds no inference variable, so the solver holds it whole: {ty}"
@@ -120,13 +132,38 @@ impl ClosedAtom {
         let unnamed = ty.without_pi_names();
         let hash = {
             use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            unnamed.hash(&mut hasher);
-            hasher.finish()
+            let mut terms = crate::ccl::ty::TermHasher::reading(
+                reads
+                    .iter()
+                    .map(|r| (r.name.clone(), Rc::clone(&r.definition), r.past)),
+            );
+            let mut state = std::collections::hash_map::DefaultHasher::new();
+            match &unnamed {
+                Type::WitnessProjection(p) => {
+                    0u8.hash(&mut state);
+                    p.position.hash(&mut state);
+                    state.write_u64(terms.held_term(&p.term));
+                }
+                Type::FamilyApp(f) => {
+                    1u8.hash(&mut state);
+                    f.param.hash(&mut state);
+                    for a in &f.args {
+                        state.write_u64(terms.term(&a.term));
+                    }
+                }
+                other => unreachable!(
+                    "only a projection or a family application is a closed atom: {other}"
+                ),
+            }
+            state.finish()
         };
+        let reads: AtomReads = reads
+            .iter()
+            .map(|r| (r.name.clone(), Rc::clone(&r.definition), r.past))
+            .collect();
         ClosedAtom {
             hash,
-            rank: rank_among_equal_hashes(solver, hash, unnamed),
+            rank: rank_among_equal_hashes(solver, hash, unnamed, reads),
             ty: Rc::new(ty.clone()),
             solver: solver.id(),
         }
@@ -143,15 +180,31 @@ impl ClosedAtom {
     }
 }
 
-/// Where `unnamed` stands among the distinct atoms `solver` has met with `hash`: the same for
-/// every atom `==` to it, and different for every other. A hash almost always has one, so this
-/// decides only between two unequal atoms whose hashes collide.
-fn rank_among_equal_hashes(solver: &mut Solver, hash: u64, unnamed: Type) -> usize {
+/// Where `unnamed`, reading `reads`, stands among the distinct atoms `solver` has met with
+/// `hash`: the same for every atom equal to it, and different for every other. A hash almost
+/// always has one, so this decides only between two unequal atoms whose hashes collide.
+fn rank_among_equal_hashes(
+    solver: &mut Solver,
+    hash: u64,
+    unnamed: Type,
+    reads: AtomReads,
+) -> usize {
+    // Two atoms reading one run's type `let` definitions under the same names read them alike
+    // ([`TypeLetNames`]), so equal spellings are equal atoms.
+    let same_reads = |r: &AtomReads| {
+        r.len() == reads.len()
+            && r.iter()
+                .zip(reads.iter())
+                .all(|(x, y)| x.0 == y.0 && Rc::ptr_eq(&x.1, &y.1) && x.2 == y.2)
+    };
+    let equal = |(t, r): &(Type, AtomReads)| {
+        (same_reads(r) && *t == unnamed) || crate::ccl::ty::type_eq_reading(t, r, &unnamed, &reads)
+    };
     let bucket = solver.closed_atoms.entry(hash).or_default();
-    match bucket.iter().position(|t| *t == unnamed) {
+    match bucket.iter().position(equal) {
         Some(rank) => rank,
         None => {
-            bucket.push(unnamed);
+            bucket.push((unnamed, reads));
             bucket.len() - 1
         }
     }
@@ -196,6 +249,18 @@ impl AtomKey {
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
             Type::WitnessProjection(_) => Some(AtomKey::Projection(ClosedAtom::new(solver, ty))),
             Type::FamilyApp(_) => Some(AtomKey::Family(ClosedAtom::new(solver, ty))),
+            _ => None,
+        }
+    }
+
+    /// [`Self::from_type`] for a holding type `ty` whose held terms read the definitions
+    /// `reads` ([`ClosedAtom::held`]).
+    fn held(solver: &mut Solver, ty: &Type, reads: &[LetRead]) -> Option<AtomKey> {
+        match ty {
+            Type::WitnessProjection(_) => {
+                Some(AtomKey::Projection(ClosedAtom::held(solver, ty, reads)))
+            }
+            Type::FamilyApp(_) => Some(AtomKey::Family(ClosedAtom::held(solver, ty, reads))),
             _ => None,
         }
     }
@@ -862,6 +927,8 @@ impl CompactType {
             nominal_conflict: _,
             met_refinements: _,
             origins: _,
+            // The type `let`s around a position wrap it; they are not content.
+            lets: _,
         } = self;
         Occupied {
             atoms: atoms.len(),
@@ -1352,6 +1419,11 @@ pub struct CompactType {
     /// Where the concrete contributions at this position were born. Identity only: it
     /// changes no answer compaction gives.
     pub origins: ContributionOrigins,
+    /// The type `let`s that stand around this position ([`TypeLets`]): a codomain's, a
+    /// dependent tuple's later component's, a family body's or a history value's, holding the
+    /// definitions the walk held there, which read the binder over the position. Not polar:
+    /// both merge directions union them.
+    pub lets: TypeLets,
 }
 
 /// Call `f` on every position directly under `ct`, with its polarity: fields and
@@ -1742,6 +1814,8 @@ impl CompactType {
             nominal_conflict: _,
             met_refinements: _,
             origins: _,
+            // The type `let`s around a position wrap it; they are not content.
+            lets: _,
         } = self;
         let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
         atoms.iter().filter(|a| !is_witness(a)).count()
@@ -1904,6 +1978,7 @@ impl CompactType {
             nominal_conflict: _,
             met_refinements: _,
             origins: _,
+            lets,
         } = self;
         // `atoms` and `refinements` hold no position, so structural equality on those is
         // already denotational — the first is a `BTreeSet` and the second a set of terms.
@@ -1929,6 +2004,7 @@ impl CompactType {
         };
         atoms == &other.atoms
             && refinements == &other.refinements
+            && lets == &other.lets
             && tuples.unwrap_or_else(|| {
                 width == &other.width
                     && match (dep_tuple, &other.dep_tuple) {
@@ -2038,6 +2114,7 @@ impl CompactType {
         // See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
         let vars = union_into_larger(lhs.vars, rhs.vars);
         let (lhs_origins, rhs_origins) = (lhs.origins, rhs.origins);
+        let (lhs_lets, rhs_lets) = (lhs.lets, rhs.lets);
         #[allow(clippy::mutable_key_type)]
         // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
         let mut atoms = lhs.atoms;
@@ -2230,6 +2307,7 @@ impl CompactType {
             nominal_conflict,
             met_refinements,
             origins: lhs_origins.union(rhs_origins),
+            lets: lhs_lets.union(rhs_lets),
         }
     }
 
@@ -2261,6 +2339,7 @@ impl CompactType {
             nominal_conflict: _,
             met_refinements: _,
             origins: _,
+            lets: _,
         } = self;
         atoms.is_empty()
             && rec.is_none()
@@ -2279,6 +2358,7 @@ impl CompactType {
     fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
         self.vars = union_into_larger(std::mem::take(&mut self.vars), identity.vars);
         self.origins = self.origins.union(identity.origins);
+        self.lets = std::mem::take(&mut self.lets).union(identity.lets);
         self
     }
     fn merge_refinements(pol: bool, lhs: RefinementSet, rhs: RefinementSet) -> RefinementSet {
@@ -2415,6 +2495,389 @@ pub struct CompactGraph {
     /// data domain ([`crate::ccl::subst::Mapping::Join`]). Non-empty is an error at
     /// coalesce time, as `rec_vars` is.
     pub join_violations: Vec<JoinViolation>,
+    /// The definitions the walk held rather than substituted, which the compacted predicates
+    /// read by name ([`CompactLets`]).
+    pub lets: Rc<CompactLets>,
+}
+
+/// The definitions of the `let` exits a compaction holds rather than substitutes
+/// ([`crate::ccl::subst::Mapping::Let`]): one per binder name, in the order held, so a
+/// definition reading another type `let`'s binder comes after it. A compacted predicate reads each by
+/// name, and coalescing writes each as a `let` around the type ([`CompactLets::over`]).
+///
+/// Compactions sharing one walk state share these ([`FixedGraph`]), since a memoized value
+/// read by a later compaction reads the names an earlier one held.
+#[derive(Clone, Debug, Default)]
+pub struct CompactLets {
+    order: Vec<CompactLet>,
+    index: HashMap<Name, usize>,
+}
+
+/// One definition a walk holds ([`CompactLets`]).
+#[derive(Clone, Debug)]
+struct CompactLet {
+    /// The name the definition is held under. A definition reading a function's binder is
+    /// closed to indices against the functions down to that one, as a refinement landing in
+    /// its codomain is ([`crate::ccl::subst::RefinementScope::close`]), so two copies of the
+    /// function, binding different names, hold it under one name.
+    name: Name,
+    /// The scopes the definition is placed in, each the binders the walk entered up to the end
+    /// of the [`Frame`] of the innermost binder the definition reads, directly or through
+    /// another type `let`'s definition, at a place the walk held it: a function's codomain, a dependent
+    /// tuple's later component, a family's body, a history's value. Coalescing places it in
+    /// each ([`TypeLets`]). A scope is named by its binders, as a value the walk memoizes
+    /// is keyed by them, so a value reused in another scope over the same binders finds its
+    /// definitions there.
+    ///
+    /// Each scope keeps the copy held there. Copies closed alike can differ in their type
+    /// slots, whose variables resolve to the binders of the scope that copy was held in
+    /// ([`TypeLetNames`]).
+    anchors: Vec<(Vec<FunBinder>, Rc<HeldTerm>)>,
+    /// The copy held somewhere it reads no binder the walk is inside of: where a function's
+    /// binder is a binder in scope rather than one the type binds, as in the type of a node in
+    /// the function's body. Such a definition is in names, so it is placed around the whole
+    /// type wherever the type reads it ([`CompactLets::over`]).
+    free: Option<Rc<HeldTerm>>,
+}
+
+/// A definition a held term reads where it lands ([`CompactLets::hold`]): the name it is held
+/// under, the copy held, and the binders between the scope it is held in and the position
+/// reading it, which its indices are raised by there.
+#[derive(Clone, Debug)]
+pub(crate) struct LetRead {
+    name: Name,
+    definition: Rc<HeldTerm>,
+    past: u32,
+}
+
+/// A type `let`'s definition where a type holds it: its binder and the copy held there.
+#[derive(Clone, Debug)]
+struct TypeLetDefinition {
+    name: Name,
+    definition: Rc<HeldTerm>,
+}
+
+impl CompactLets {
+    /// Hold `lets`, outermost first, as a forced term reads them
+    /// ([`Subst::force_refinement_holding`]), each under the name the run holds its definition
+    /// under ([`TypeLetNames`]), where the walk is inside the binders `enclosing` names and the
+    /// scopes `frames` opens over them. The renames returned are what the reading term takes.
+    fn hold(
+        &mut self,
+        solver: &mut Solver,
+        lets: Vec<(Name, Rc<HeldTerm>)>,
+        enclosing: &[FunBinder],
+        frames: &[Frame],
+    ) -> (crate::ccl::scope::Renames, Vec<LetRead>) {
+        let mut renames = crate::ccl::scope::Renames::new();
+        let mut reads = Vec::with_capacity(lets.len());
+        for (name, definition) in lets {
+            // Through a substitution rather than a rename of the term: a type slot still a
+            // variable suspends on the rename, so what it resolves to reads the new name too.
+            let definition = if renames
+                .keys()
+                .any(|n| crate::ccl::ccl_utils::is_free(n, &definition))
+            {
+                Subst::renaming(&renames).apply_expr_shared(solver, &definition)
+            } else {
+                definition
+            };
+            // The innermost binder the definition reads, as a count of the binders up to it:
+            // one it reads by name, or the end of the scope a type `let`'s definition it reads stands in.
+            let depth = crate::ccl::ccl_utils::free_names(&definition)
+                .iter()
+                .map(|n| match self.index.get(n) {
+                    Some(&i) => self.order[i]
+                        .anchors
+                        .iter()
+                        .map(|(a, _)| a)
+                        .filter(|a| enclosing.starts_with(a))
+                        .map(Vec::len)
+                        .max()
+                        .unwrap_or(0),
+                    None => enclosing
+                        .iter()
+                        .rposition(|b| b.names().any(|m| m == n))
+                        .map_or(0, |i| i + 1),
+                })
+                .max()
+                .unwrap_or(0);
+            // Or one it reads by index, already closed against the binders around this position,
+            // where the innermost binder is index 0.
+            let by_index = (0..enclosing.len())
+                .find(|&i| {
+                    crate::ccl::subst::term_references_binder_within(&definition, i as u32 + 1)
+                })
+                .map_or(0, |i| enclosing.len() - i);
+            let depth = depth.max(by_index);
+            // The scope that binder opens is where the definition stands: closed against every
+            // binder up to the scope's end, as a refinement landing there is. An index it reads
+            // counts from this position, so it counts the binders past the scope's end fewer
+            // there.
+            let frame = (depth > 0).then(|| {
+                *frames
+                    .iter()
+                    .find(|f| f.start < depth && depth <= f.end)
+                    .expect("every binder the walk enters opens a scope")
+            });
+            let definition = match frame {
+                None => definition,
+                Some(frame) => {
+                    let mut scope = RefinementScope::default();
+                    for b in &enclosing[..frame.end] {
+                        scope.enter(b.clone());
+                    }
+                    let past = (enclosing.len() - frame.end) as u32;
+                    let definition = if past > 0 && by_index > 0 {
+                        crate::ccl::subst::lowered_term(&definition, past).into_held()
+                    } else {
+                        definition
+                    };
+                    let mut quoted =
+                        crate::ccl::ty::TypeLet::new(name.clone(), definition, Type::Hole);
+                    scope.close_held(solver, &mut quoted);
+                    quoted.definition
+                }
+            };
+            let (held, definition) = solver.type_let_names.held(&name, &definition);
+            if held != name {
+                renames.insert(name, held.clone());
+            }
+            reads.push(LetRead {
+                name: held.clone(),
+                definition: Rc::clone(&definition),
+                past: frame.map_or(0, |f| (enclosing.len() - f.end) as u32),
+            });
+            let anchor = frame.map(|f| enclosing[..f.end].to_vec());
+            match self.index.get(&held) {
+                Some(&i) => {
+                    let entry = &mut self.order[i];
+                    match anchor {
+                        Some(anchor) if !entry.anchors.iter().any(|(a, _)| *a == anchor) => {
+                            entry.anchors.push((anchor, definition));
+                        }
+                        Some(_) => {}
+                        None => {
+                            entry.free.get_or_insert(definition);
+                        }
+                    }
+                }
+                None => {
+                    self.index.insert(held.clone(), self.order.len());
+                    self.order.push(CompactLet {
+                        name: held,
+                        free: anchor.is_none().then(|| Rc::clone(&definition)),
+                        anchors: anchor.map(|a| (a, definition)).into_iter().collect(),
+                    });
+                }
+            }
+        }
+        (renames, reads)
+    }
+
+    /// The definitions held in a scope over the binders `scope` names.
+    fn lets_at(&self, scope: &[FunBinder]) -> TypeLets {
+        TypeLets(
+            self.order
+                .iter()
+                .filter_map(|l| {
+                    let (_, definition) = l.anchors.iter().find(|(a, _)| a == scope)?;
+                    Some(TypeLetDefinition {
+                        name: l.name.clone(),
+                        definition: Rc::clone(definition),
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+/// A scope the walk is inside of: the binders a function, a dependent tuple, a family or a
+/// history entered over the part the walk is in, as positions in the walk's enclosing binders
+/// ([`RefinementScope::enclosing`]), from `start` up to `end`. A type `let`'s definition reading one
+/// stands in that part ([`CompactLet::anchors`]).
+#[derive(Clone, Copy, Debug)]
+struct Frame {
+    start: usize,
+    end: usize,
+}
+
+impl CompactLets {
+    /// `ty`, a type materialized from the walk, holding each definition it reads that the walk
+    /// held where it reads no enclosing function's binder ([`CompactLet::free`]), each at the
+    /// innermost position holding its reads ([`crate::ccl::ty::TypeLet::innermost`]). One read
+    /// under a function whose binder it reads was placed in that function's codomain
+    /// ([`TypeLets::wrap`]).
+    pub fn over(&self, ty: Type) -> Type {
+        let free: Vec<TypeLetDefinition> = self
+            .order
+            .iter()
+            .filter_map(|l| {
+                Some(TypeLetDefinition {
+                    name: l.name.clone(),
+                    definition: Rc::clone(l.free.as_ref()?),
+                })
+            })
+            .collect();
+        wrap_lets(free.iter(), ty)
+    }
+}
+
+/// `ty` holding each of `lets`, in the order held, that it reads, directly or through another's
+/// definition.
+fn wrap_lets<'a>(lets: impl Iterator<Item = &'a TypeLetDefinition>, ty: Type) -> Type {
+    let lets: Vec<&TypeLetDefinition> = lets.collect();
+    if lets.is_empty() {
+        return ty;
+    }
+    let position: HashMap<&Name, usize> =
+        lets.iter().enumerate().map(|(i, l)| (&l.name, i)).collect();
+    let mut needed = vec![false; lets.len()];
+    let mut reads: Vec<Name> = crate::ccl::subst::type_free_vars(&ty).into_iter().collect();
+    while let Some(n) = reads.pop() {
+        if let Some(&i) = position.get(&n)
+            && !needed[i]
+        {
+            needed[i] = true;
+            reads.extend(crate::ccl::ccl_utils::free_names(&lets[i].definition));
+        }
+    }
+    lets.iter()
+        .zip(needed)
+        .rev()
+        .filter(|(_, needed)| *needed)
+        .fold(ty, |ty, (l, _)| {
+            crate::ccl::ty::TypeLet::innermost(l.name.clone(), Rc::clone(&l.definition), ty)
+        })
+}
+
+/// The type `let`s that stand around a compacted position ([`CompactType::lets`]): the
+/// definitions a walk held in the scope a binder opens over the position, which read that binder
+/// ([`CompactLet::anchors`]). Coalescing wraps them around the type the position materializes to.
+///
+/// They are part of the position, so two positions are equal only where they bind the same
+/// names to equal definitions. A name stands for one definition in a run ([`TypeLetNames`]), and
+/// the copies under one name can differ only in their type slots, whose variables resolve to the
+/// binders of the scope each copy was held in; so definitions compare modulo type slots, as
+/// `Type`'s `==` compares a held term.
+#[derive(Clone, Debug, Default)]
+pub struct TypeLets(Vec<TypeLetDefinition>);
+
+impl PartialEq for TypeLets {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|l| {
+                other.0.iter().any(|m| {
+                    m.name == l.name
+                        && (Rc::ptr_eq(&l.definition, &m.definition)
+                            || crate::ccl::ty::eq_term_modulo_ty_slots(
+                                &l.definition,
+                                &m.definition,
+                            ))
+                })
+            })
+    }
+}
+
+impl TypeLets {
+    /// Both sides' definitions, each once.
+    fn union(mut self, other: TypeLets) -> TypeLets {
+        for l in other.0 {
+            if !self.0.iter().any(|m| m.name == l.name) {
+                self.0.push(l);
+            }
+        }
+        self
+    }
+
+    /// `part`, the materialized part of the scope these were held in, holding each of them it
+    /// reads.
+    pub(super) fn wrap(&self, part: Type) -> Type {
+        wrap_lets(self.0.iter(), part)
+    }
+}
+
+/// The name each definition a run's compactions hold is held under, and the copy a type holds.
+///
+/// One name per definition, equal definitions taking one, and no name for two definitions. Two
+/// types holding equal definitions under different binders, as two instances of one definition
+/// do, then compact alike. A type `let` binds its name in its type alone, so the name it takes
+/// changes nothing the type means ([`crate::ccl::ty::TypeLet`]'s equality is up to renaming the
+/// binder).
+///
+/// The copy is shared by equal definition terms that read the same names and witnesses
+/// ([`Self::shared`]). Definitions equal only with their type slots skipped keep copies of their
+/// own: they can differ in those slots, whose variables are one instance's and resolve to that
+/// instance's binders.
+#[derive(Default)]
+pub(crate) struct TypeLetNames {
+    by_definition: HashMap<u64, Vec<(Rc<HeldTerm>, Name)>>,
+    definitions: HashMap<Name, Rc<HeldTerm>>,
+    /// Each definition term's copy, by the term's address, which the entry keeps allocated.
+    copies: HashMap<*const HeldTerm, (Rc<HeldTerm>, Rc<HeldTerm>)>,
+    /// Each definition term copied so far, by its hash with type slots skipped
+    /// ([`Self::shared`]).
+    by_content: HashMap<u64, crate::ccl::ccl_utils::SharedTerms>,
+}
+
+impl TypeLetNames {
+    /// The name `definition`, reached as the definition of the binder `name`, is held under,
+    /// and the copy a type holding it holds ([`Self::shared`]).
+    pub(crate) fn held(&mut self, name: &Name, definition: &Rc<HeldTerm>) -> (Name, Rc<HeldTerm>) {
+        let copy = self.shared(definition);
+        let hash = crate::ccl::ty::term_hash_modulo_ty_slots(definition);
+        if let Some((_, held)) = self
+            .by_definition
+            .get(&hash)
+            .and_then(|held| held.iter().find(|(d, _)| same_definition(d, definition)))
+        {
+            return (held.clone(), copy);
+        }
+        let held = if self.definitions.contains_key(name) {
+            Name::fresh_like(name)
+        } else {
+            name.clone()
+        };
+        self.definitions.insert(held.clone(), Rc::clone(&copy));
+        self.by_definition
+            .entry(hash)
+            .or_default()
+            .push((Rc::clone(&copy), held.clone()));
+        (held, copy)
+    }
+
+    /// The copy of `definition` a type holding it holds: a term of its own rather than the
+    /// tree's, each node descending from the one it copies, made once per definition term.
+    pub(crate) fn shared(&mut self, definition: &Rc<HeldTerm>) -> Rc<HeldTerm> {
+        if let Some((_, copy)) = self.copies.get(&Rc::as_ptr(definition)) {
+            return Rc::clone(copy);
+        }
+        // A definition equal to one copied already shares its copy: copies of one definition
+        // made apart by the substitutions that carried them are equal terms.
+        let copy = match self
+            .by_content
+            .entry(crate::ccl::ty::term_hash_modulo_ty_slots(definition))
+            .or_default()
+            .share(definition, || crate::ccl::ccl_utils::term_reads(definition))
+        {
+            Some(equal) => Rc::clone(&self.copies[&Rc::as_ptr(&equal)].1),
+            None => {
+                let _f = crate::ccl::provenance::copy_frame("infer.type_let_definition");
+                crate::ccl::Duplicate::duplicate(definition.term()).into_held()
+            }
+        };
+        self.copies.insert(
+            Rc::as_ptr(definition),
+            (Rc::clone(definition), Rc::clone(&copy)),
+        );
+        copy
+    }
+}
+
+/// Whether two definitions held under one name are one: the same term, or equal as held terms
+/// are, with type slots skipped ([`crate::ccl::ty::TypeLet`]'s equality).
+fn same_definition(a: &Rc<HeldTerm>, b: &Rc<HeldTerm>) -> bool {
+    Rc::ptr_eq(a, b) || crate::ccl::eq_term_modulo_ty_slots(a, b)
 }
 
 /// A refinement naming joined binders where the join does not exist: a data function's
@@ -2550,11 +3013,13 @@ fn compact_type_reading(
     {
         let term = compact_walk(solver, ty, &mut fixed.0);
         let (rec_vars, join_violations) = fixed.0.finish_walk();
+        let lets = fixed.0.take_type_lets();
         solver.fixed_graph = Some(fixed);
         return CompactGraph {
             term,
             rec_vars,
             join_violations,
+            lets,
         };
     }
     let mut st = CompactState::new(collapse);
@@ -2570,6 +3035,7 @@ fn compact_type_reading(
         term,
         rec_vars: st.rec_vars,
         join_violations: st.join_violations,
+        lets: st.scope_lets,
     }
 }
 
@@ -3223,6 +3689,10 @@ struct CompactState {
     /// Bounds of recursive variables (surfaced as `RecursiveType` errors by
     /// `coalesce_compact`).
     rec_vars: BTreeMap<InferVarId, CompactType>,
+    /// The definitions the walk holds ([`CompactLets`]).
+    scope_lets: Rc<CompactLets>,
+    /// The scopes the walk is inside of, innermost last ([`Frame`]).
+    frames: Vec<Frame>,
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
@@ -3310,6 +3780,12 @@ impl CompactState {
         )
     }
 
+    /// The definitions this compaction held, which its value reads: a value reading one serves
+    /// only its own compaction ([`Self::impure`]), so the next compaction holds its own.
+    fn take_type_lets(&mut self) -> Rc<CompactLets> {
+        std::mem::take(&mut self.scope_lets)
+    }
+
     fn own_bound_flags(
         &mut self,
         solver: &mut Solver,
@@ -3331,6 +3807,54 @@ impl CompactState {
         flags
     }
 
+    /// Open the scope over the `binders` innermost binders the walk entered ([`Frame`]).
+    fn open_frame(&mut self, binders: usize) -> Frame {
+        let end = self.scope.enclosing().len();
+        let frame = Frame {
+            start: end - binders,
+            end,
+        };
+        self.frames.push(frame);
+        frame
+    }
+
+    /// Close the scope `frame` opened, with the definitions held in a scope over its binders.
+    fn close_frame(&mut self, frame: Frame) -> TypeLets {
+        let closed = self
+            .frames
+            .pop()
+            .expect("a scope is closed where it was opened");
+        debug_assert_eq!(closed.end, frame.end, "scopes close innermost first");
+        self.scope_lets
+            .lets_at(&self.scope.enclosing()[..frame.end])
+    }
+
+    /// Hold the definitions `r`, a refinement forced with its `let` exits held, reads
+    /// ([`CompactLets::hold`]), and `r` reading each by the name it is held under.
+    fn hold_lets_read_by_refinement(
+        &mut self,
+        solver: &mut Solver,
+        held: Vec<(Name, Rc<HeldTerm>)>,
+        r: crate::ccl::Refinement,
+    ) -> crate::ccl::Refinement {
+        if held.is_empty() {
+            return r;
+        }
+        // The value reads definitions this compaction holds ([`Self::take_type_lets`]).
+        self.impure += 1;
+        let (renames, _) = Rc::make_mut(&mut self.scope_lets).hold(
+            solver,
+            held,
+            self.scope.enclosing(),
+            &self.frames,
+        );
+        if renames.is_empty() {
+            return r;
+        }
+        // Through a substitution, as a type `let`'s definition is ([`CompactLets::hold`]).
+        Subst::renaming(&renames).force_refinement(solver, &r)
+    }
+
     fn new(collapse: bool) -> Self {
         CompactState {
             #[cfg(test)]
@@ -3345,6 +3869,8 @@ impl CompactState {
             barriers_in_process: HashSet::new(),
             barrier_recursive: HashMap::new(),
             rec_vars: BTreeMap::new(),
+            scope_lets: Rc::default(),
+            frames: Vec::new(),
             collapse,
             capability_vars: false,
             origins: false,
@@ -3452,6 +3978,7 @@ pub(super) fn barrier_resolution(
         term,
         rec_vars: st.rec_vars,
         join_violations: st.join_violations,
+        lets: st.scope_lets,
     };
     (graph, escaped)
 }
@@ -3690,7 +4217,7 @@ fn eliminated_acc(
     solver: &mut Solver,
     fun_kind: &crate::ccl::ty::FunKind,
     rest: &Subst,
-    term: &Rc<crate::ccl::TypedExpr>,
+    term: &Rc<HeldTerm>,
 ) -> Subst {
     use crate::ccl::ty::FunKind;
     match fun_kind {
@@ -3909,6 +4436,13 @@ fn compact_go_inner(
         Type::BoundedHole(_) | Type::BarrierHole(_) => {
             unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
         }
+        // A type `let` stands for its body with the definition discharged, so the body
+        // compacts under the discharge, composed ahead of what the edges walked so far give.
+        Type::Let(l) => {
+            let discharge = Subst::let_exit(l.name.clone(), Rc::clone(&l.definition));
+            let acc = Subst::then(solver, &discharge, subst_acc);
+            compact_go(solver, &l.body, pol, &acc, pos, st)
+        }
         // Atomic types contribute a single atom. A term substitution never
         // touches an atom, so `subst_acc` is irrelevant here.
         Type::Base(_)
@@ -3924,8 +4458,13 @@ fn compact_go_inner(
         Type::DepTuple(cs) => {
             let mut acc = subst_acc.clone();
             let mut components = Vec::with_capacity(cs.len());
-            for (name, t) in cs {
-                components.push(compact_go(solver, t, pol, &acc, Position::default(), st));
+            for (k, (name, t)) in cs.iter().enumerate() {
+                let frame = (k > 0).then(|| st.open_frame(k));
+                let mut component = compact_go(solver, t, pol, &acc, Position::default(), st);
+                if let Some(frame) = frame {
+                    component.lets = st.close_frame(frame);
+                }
+                components.push(component);
                 st.scope.enter(name.clone().into());
                 if let Some(b) = name {
                     acc = acc.shadow(b);
@@ -3954,7 +4493,11 @@ fn compact_go_inner(
                     acc = acc.shadow(b);
                 }
             }
-            let body = compact_go(solver, body, pol, &acc, Position::default(), st);
+            let frame = (!binders.is_empty()).then(|| st.open_frame(binders.len()));
+            let mut body = compact_go(solver, body, pol, &acc, Position::default(), st);
+            if let Some(frame) = frame {
+                body.lets = st.close_frame(frame);
+            }
             binders.iter().for_each(|_| st.scope.exit());
             CompactType {
                 family: Some(CompactFamily {
@@ -3973,10 +4516,31 @@ fn compact_go_inner(
         Type::WitnessProjection(_) | Type::FamilyApp(_) => {
             // The held terms are substituted as terms; the witness half has nothing in them
             // to act on.
-            let mut ty = subst_acc
+            // A `let` exit is held, as at a refinement: the term keeps reading the binder.
+            let acting = subst_acc
                 .without_witnesses()
-                .unwrap_or_else(|| subst_acc.clone())
-                .apply_type_in(solver, ty);
+                .unwrap_or_else(|| subst_acc.clone());
+            let mut ty = acting.without_lets().apply_projection_shared(solver, ty);
+            let mut held = Vec::new();
+            if acting.has_lets() {
+                let reads: Vec<Name> = ty
+                    .held_terms()
+                    .flat_map(|t| crate::ccl::ccl_utils::free_names(t))
+                    .collect();
+                let enclosing = st.scope.enclosing().to_vec();
+                let frames = st.frames.clone();
+                st.impure += 1;
+                let renames;
+                (renames, held) = Rc::make_mut(&mut st.scope_lets).hold(
+                    solver,
+                    acting.lets_read_by(reads),
+                    &enclosing,
+                    &frames,
+                );
+                if !renames.is_empty() {
+                    ty = Subst::renaming(&renames).apply_projection_shared(solver, &ty);
+                }
+            }
             // A projection a bound's holder side reads back is that holder's binder
             // (`crate::ccl::subst::Elim::ReadBack`), landing as a reference does.
             if let Type::WitnessRef(_) = &ty {
@@ -3984,10 +4548,12 @@ fn compact_go_inner(
             }
             // Landing closes, as a refinement's does: references to the walk's enclosing
             // binders become indices.
-            for held in ty.held_terms_mut() {
-                st.scope.close_held(solver, held);
+            for term in ty.held_terms_mut() {
+                st.scope.close_held(solver, term);
             }
-            let atom = AtomKey::from_type(solver, &ty).unwrap_or_else(|| {
+            // The atom reads the definitions it holds through, so a projection reaching the
+            // position with a definition discharged is the same atom ([`ClosedAtom::held`]).
+            let atom = AtomKey::held(solver, &ty, &held).unwrap_or_else(|| {
                 unreachable!("a substitution keeps a holding type's form or reads it back: {ty}")
             });
             CompactType::from_atom(atom)
@@ -4079,11 +4645,16 @@ fn compact_go_inner(
                     }
                     continue;
                 }
-                let r = if at_key {
-                    subst_acc.in_data_domain().force_refinement(solver, r)
+                // A `let` exit is held: the predicate keeps reading the binder, and the walk
+                // holds its definition for coalescing to write around the type ([`CompactLets`]).
+                let (r, held) = if at_key {
+                    subst_acc
+                        .in_data_domain()
+                        .force_refinement_holding(solver, r)
                 } else {
-                    subst_acc.force_refinement(solver, r)
+                    subst_acc.force_refinement_holding(solver, r)
                 };
+                let r = st.hold_lets_read_by_refinement(solver, held, r);
                 // References to the walk's enclosing binders become indices
                 // before the refinement is compared or stored.
                 let r = st.scope.close(solver, &r);
@@ -4134,7 +4705,9 @@ fn compact_go_inner(
             // Entering the codomain crosses this function — named or not, it
             // deepens what a refinement landing below closes against.
             st.scope.enter(binder.clone());
-            let cod = compact_go(solver, c, pol, &cod_acc, Position::default(), st);
+            let frame = st.open_frame(1);
+            let mut cod = compact_go(solver, c, pol, &cod_acc, Position::default(), st);
+            cod.lets = st.close_frame(frame);
             st.scope.exit();
             debug_assert!(
                 binder
@@ -4311,7 +4884,9 @@ fn compact_go_inner(
                 .names()
                 .fold(subst_acc.clone(), |acc, b| acc.shadow(b));
             st.scope.enter(binder.clone());
-            let value = compact_go(solver, value, pol, &value_acc, Position::default(), st);
+            let frame = st.open_frame(1);
+            let mut value = compact_go(solver, value, pol, &value_acc, Position::default(), st);
+            value.lets = st.close_frame(frame);
             st.scope.exit();
             CompactType {
                 history_slot: Some(CompactHistory {
@@ -4766,6 +5341,8 @@ fn expand_variable(
             nominal_conflict: _,
             met_refinements: _,
             origins: _,
+            // The type `let`s around a position wrap it; they are not content.
+            lets: _,
         } = &bound;
         // A variant shape counts as concrete only at a **positive**
         // position, where it is the value's own tags — read off the lower
@@ -5379,7 +5956,7 @@ mod tests {
             0,
             &crate::ccl::infer_var::Telescope::empty(),
         );
-        let collection = Rc::new(TypedExpr::var("xs"));
+        let collection = IntoHeldTerm::into_held(TypedExpr::var("xs"));
         let edge = Subst::kind_elim(&kind, &collection);
         let (root, nodes) = super::super::test_helpers::diamond_bound_graph(
             solver,
@@ -5435,7 +6012,7 @@ mod tests {
             Position::default(),
             &mut st,
         );
-        let through = Subst::eliminating(Rc::new(TypedExpr::var("xs")));
+        let through = Subst::eliminating(IntoHeldTerm::into_held(TypedExpr::var("xs")));
         let eliminated = compact_go(
             solver,
             &shared,
@@ -6129,6 +6706,7 @@ mod tests {
             term,
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         }
     }
 

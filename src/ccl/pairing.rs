@@ -39,6 +39,8 @@ pub(crate) enum PartAt {
     FamilyDomain(usize),
     /// A family's body, under its binders.
     FamilyBody,
+    /// A type `let`'s body, under its binder.
+    LetBody,
 }
 
 /// One position two types share.
@@ -263,6 +265,24 @@ pub(crate) fn paired_parts<'a>(left: &'a Type, right: &'a Type) -> Option<Pairin
             }
             pair(PartAt::FamilyBody, lb, rb, names(lbs.len()));
         }
+        // Two `let`s share their bodies, under binders corresponding to each other, where they
+        // bind equal definitions; a `let` against any other type shares no position.
+        Type::Let(l) => {
+            let Type::Let(r) = right else {
+                return None;
+            };
+            if !(Rc::ptr_eq(&l.definition, &r.definition)
+                || crate::ccl::ty::eq_term_modulo_ty_slots(&l.definition, &r.definition))
+            {
+                return None;
+            }
+            pair(
+                PartAt::LetBody,
+                &l.body,
+                &r.body,
+                vec![(Some(&l.name), Some(&r.name))],
+            );
+        }
         Type::Refinement(..)
         | Type::Poly(_)
         | Type::Base(_)
@@ -338,6 +358,7 @@ fn part_mut<'t>(ty: &'t mut Type, at: &PartAt) -> &'t mut Type {
         (Type::Split { output, .. }, PartAt::SplitOutput) => output,
         (Type::Family { binders, .. }, PartAt::FamilyDomain(k)) => &mut binders[*k].1,
         (Type::Family { body, .. }, PartAt::FamilyBody) => body,
+        (Type::Let(l), PartAt::LetBody) => &mut Rc::make_mut(l).body,
         (ty, at) => unreachable!("`paired_parts` reported {at:?} of {ty}, which it does not hold"),
     }
 }

@@ -129,7 +129,7 @@ fn a_cast_target_does_not_carry_its_value_s_refinements() {
             *casts += 1;
             let refs_of = |t: &Type| -> Vec<Refinement> {
                 t.domain()
-                    .map(|d| d.refinements().to_vec())
+                    .map(|d| d.standalone_refinements())
                     .unwrap_or_default()
             };
             let (target_refs, value_refs) = (refs_of(target), refs_of(&value.ty));

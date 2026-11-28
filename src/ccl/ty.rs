@@ -1700,7 +1700,10 @@ impl From<Option<crate::ccl::Name>> for FunBinder {
 /// closes it to an index. [`crate::ccl::subst::type_contains_infer`] is the cheap
 /// per-type check for the `Infer` case, and `check_fully_typed` the
 /// whole-program one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// **A type `let` is sharing.** `==` and the hash read `let 𝑥 = 𝑒 in 𝑇` as `𝑇` with `𝑒`
+/// discharged at each read of `𝑥` ([`type_eq_go`]), and are otherwise structural.
+#[derive(Debug, Clone)]
 pub enum Type {
     /// A primitive base type.
     Base(BaseType),
@@ -2059,6 +2062,15 @@ pub enum Type {
     /// two values is what makes the sides differ, `Cell(Int@1)` and `Cell(Int@2)` joining
     /// to the input both accept and the output `Int`.
     Split { input: Box<Type>, output: Box<Type> },
+    /// **A type `let`**, `let 𝑥 = 𝑒 in 𝑇`: exactly the values of `𝑇[𝑥 ↦ 𝑒]`, with the
+    /// definition held once rather than written at every occurrence of `𝑥`
+    /// (`src/ccl/design/type-inference.md`, "A type `let`"). A transparent `let`'s
+    /// scope exit makes one; a program never writes one.
+    ///
+    /// `𝑥` is bound in `𝑇` only, including the terms `𝑇` holds. The definition is a held term
+    /// ([`HeldTerm`]) standing where the `let` stands, so it reads the binders in scope there
+    /// and not `𝑥`.
+    Let(Rc<TypeLet>),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
 }
@@ -2406,10 +2418,14 @@ impl TraitRequirement {
         names: &[crate::ccl::Name],
     ) -> TraitRequirement {
         debug_assert_eq!(names.len(), self.binders.len(), "one name per binder");
-        let terms: Vec<Rc<TypedExpr>> = names
+        let terms: Vec<Rc<HeldTerm>> = names
             .iter()
             .zip(&self.binders)
-            .map(|(n, (_, t))| Rc::new(crate::ccl::Expr::var(n.clone()).with_ty(t.clone())))
+            .map(|(n, (_, t))| {
+                crate::ccl::Expr::var(n.clone())
+                    .with_ty(t.clone())
+                    .into_held()
+            })
             .collect();
         let binders = names
             .iter()
@@ -2425,7 +2441,7 @@ impl TraitRequirement {
     /// This requirement at the terms `terms`, one per binder, which it no longer binds: an
     /// application `V(t)` reaching an obligation reads the assumption
     /// `forall (k: K) Iterable(V(k))` at `t` ([`crate::ccl::subst::discharge_binders`]).
-    pub fn discharged(&self, solver: &mut Solver, terms: &[Rc<TypedExpr>]) -> TraitRequirement {
+    pub fn discharged(&self, solver: &mut Solver, terms: &[Rc<HeldTerm>]) -> TraitRequirement {
         let names: Vec<crate::ccl::Name> = self.binders.iter().map(|(n, _)| n.clone()).collect();
         let mut at = |t: &Type| crate::ccl::subst::discharge_binders(solver, &names, t, terms);
         TraitRequirement {
@@ -2462,7 +2478,7 @@ impl TraitRequirement {
         if stated.param != contribution.param || stated.args.len() != contribution.args.len() {
             return None;
         }
-        let mut terms: Vec<Option<Rc<TypedExpr>>> = vec![None; self.binders.len()];
+        let mut terms: Vec<Option<Rc<HeldTerm>>> = vec![None; self.binders.len()];
         for (arg, given) in stated.args.iter().zip(&contribution.args) {
             if let TypedExprNode::Var(n) = &arg.term.node
                 && let Some(i) = self.binders.iter().position(|(b, _)| b == n)
@@ -3288,6 +3304,21 @@ impl Type {
     /// The Σ binders this type carries — `Some` exactly when it is a sum. Outermost
     /// first; every binder scopes over the domain (and its refinements), never the
     /// codomain, which is the witness-independent residue.
+    /// The binders of the sum this type denotes under its refinements and type `let`s, each
+    /// candidate holding the `let`s it reads ([`Type::lets_distributed`]); none for any other
+    /// type.
+    pub fn sum_binders(&self) -> Vec<Witness> {
+        match self {
+            Type::Let(_) => self
+                .lets_distributed()
+                .peel_refinements()
+                .sum()
+                .map(<[Witness]>::to_vec)
+                .unwrap_or_default(),
+            _ => self.peel_refinements().sum().unwrap_or(&[]).to_vec(),
+        }
+    }
+
     pub fn sum(&self) -> Option<&[Witness]> {
         match self {
             Type::Fun {
@@ -3893,6 +3924,15 @@ fn fmt_type(
                 .collect();
             write!(f, "{}({})", decl.spelled(), args.join(", "))
         }
+        // A type `let` renders as written, its definition once: substituting it would read the
+        // body's variables, and rendering reads no solver state it is not given.
+        Type::Let(l) => write!(
+            f,
+            "let {} = {} in {}",
+            l.name,
+            symbolic::symbolic_under(&l.definition, binders, ctx),
+            at(ctx, &l.body, binders)
+        ),
         // No program writes one, so it has no CHL spelling; this names both sides.
         Type::Split { input, output } => {
             write!(
@@ -4123,7 +4163,7 @@ impl Type {
         index: usize,
         project: impl Fn(usize, &Type) -> TypedExpr,
     ) -> Option<Type> {
-        match self.peel_refinements() {
+        match self.lets_distributed().peel_refinements() {
             Type::Tuple(ts) => ts.get(index).cloned(),
             Type::DepTuple(cs) => {
                 cs.get(index)?;
@@ -4445,8 +4485,7 @@ impl Type {
     /// ([`Type::fun_over`] for any [`FunBinder`]; [`FunBinder::unread`]).
     pub fn fun_binding(binder: FunBinder, domain: Self, codomain: Self, fun_kind: FunKind) -> Self {
         let binder = if crate::ccl::subst::binder_reads(&binder, &codomain)
-            || (binder.parameter_count().is_some()
-                && matches!(domain.peel_refinements(), Type::DepTuple(_)))
+            || (binder.parameter_count().is_some() && matches!(domain.former(), Type::DepTuple(_)))
         {
             binder
         } else {
@@ -4581,7 +4620,8 @@ impl Type {
     /// A refined function (`{Fun | p}`) still carries a kind, and a match on the
     /// bare type drops it, so every reader that wants the kind wants this.
     pub fn fun_kind(&self) -> Option<&FunKind> {
-        match self.peel_refinements() {
+        // A function's kind is its shape's, under the type `let`s around it.
+        match self.former() {
             Type::Fun { fun_kind, .. } => Some(fun_kind),
             Type::Poly(p) if p.is_generalized() => p.body.fun_kind(),
             _ => None,
@@ -4695,6 +4735,8 @@ impl Type {
                 history_kind: HistoryKind::Append,
                 ..
             } => Type::data_fun(domain, codomain),
+            // A function under type `let`s is the function it holds.
+            Type::Let(l) => Self::fun_like_in(solver, &l.body, domain, codomain),
             _ => Type::fun(domain, codomain),
         }
     }
@@ -4765,9 +4807,52 @@ impl Type {
         if refinements.is_empty() {
             return base;
         }
+        // **A predicate's own `let`s are the type's.** A transparent `let` at a predicate's root
+        // binds a definition that reads no element, which is a type `let` around the refined
+        // type ([`TypeLet::refinement_under`] is the other direction), so it stands there.
+        if refinements.iter().any(|r| root_let(&r.predicate).is_some()) {
+            let _f = crate::ccl::provenance::copy_frame("ty.lift_predicate_let");
+            let mut lets: Vec<(crate::ccl::Name, Rc<HeldTerm>)> = Vec::new();
+            let mut bare = RefinementSet::new();
+            for r in refinements.iter() {
+                let mut predicate: &TypedExpr = &r.predicate;
+                while let Some((name, definition, body)) = root_let(predicate) {
+                    if !lets.iter().any(|(n, _)| n == name) {
+                        lets.push((
+                            name.clone(),
+                            Rc::new(HeldTerm::new(crate::ccl::Duplicate::duplicate(definition))),
+                        ));
+                    }
+                    predicate = body;
+                }
+                bare.insert(if std::ptr::eq(predicate, r.predicate.term()) {
+                    r.clone()
+                } else {
+                    Refinement::born(Rc::new(crate::ccl::Duplicate::duplicate(predicate)))
+                });
+            }
+            return lets
+                .into_iter()
+                .rev()
+                .fold(Type::refined(base, bare), |ty, (name, definition)| {
+                    TypeLet::innermost(name, definition, ty)
+                });
+        }
         match base {
             Type::Refinement(inner, existing) => {
                 Type::Refinement(inner, existing.union(&refinements))
+            }
+            // A type `let` over the base stays at the position holding the reads of its binder,
+            // which is the refinement's: the refinements join the ones under it. A refinement
+            // added here reads no binder of the `let`, which is bound in the base alone.
+            Type::Let(l) => {
+                let TypeLet {
+                    name,
+                    definition,
+                    body,
+                    ..
+                } = Rc::unwrap_or_clone(l);
+                TypeLet::wrap(name, definition, Type::refined(body, refinements))
             }
             bare => Type::Refinement(Box::new(bare), refinements),
         }
@@ -4782,11 +4867,151 @@ impl Type {
     /// The refinements carried at this position — empty for an unrefined type, so a
     /// caller can compare or filter what two positions demand without
     /// case-splitting on whether either is refined.
+    ///
+    /// A type `let` over refinements has none of its own at its root: those under it read its
+    /// binder, and a caller asking for this position's refinements wants them, which
+    /// [`Self::standalone_refinements`] gives. Asserted, so no caller drops them silently.
+    #[track_caller]
     pub fn refinements(&self) -> &[Refinement] {
+        match self {
+            Type::Refinement(_, refinements) => refinements.as_slice(),
+            Type::Let(_) => {
+                debug_assert!(
+                    !matches!(TypeLet::peel(self).1, Type::Refinement(..)),
+                    "refinements read at a type `let`, which holds them: \
+                     `standalone_refinements` gives them with the definitions they read"
+                );
+                &[]
+            }
+            _ => &[],
+        }
+    }
+
+    /// The refinements at this node itself, for a walk over a type's structure: a type `let`
+    /// holds none at its own node, its body being its child.
+    pub fn own_refinements(&self) -> &[Refinement] {
         match self {
             Type::Refinement(_, refinements) => refinements.as_slice(),
             _ => &[],
         }
+    }
+
+    /// This type with the type `let`s at its root moved into each part that reads them
+    /// ([`TypeLet::innermost_each`]): a function's, a product's, a variant's, a nominal type's, a
+    /// history's, a split's, a family's, or a refinement's base, so its shape
+    /// stands at the root and a part taken out of it stands alone. A `let` the refinements read stays around
+    /// them, and a definition reading a binder by index stays where it is, since moved under the
+    /// function's binder its indices would count one more.
+    pub fn lets_distributed(&self) -> Cow<'_, Type> {
+        let (lets, under) = TypeLet::peel(self);
+        if lets.is_empty() || lets.iter().any(|l| reads_an_index(&l.definition)) {
+            return Cow::Borrowed(self);
+        }
+        fn go(lets: &[&TypeLet], ty: &Type) -> Type {
+            match ty {
+                Type::Refinement(base, refinements) => {
+                    let read = refinements
+                        .iter()
+                        .flat_map(crate::ccl::subst::refinement_free_vars)
+                        .any(|n| lets.iter().any(|l| l.name == n));
+                    if read {
+                        TypeLet::innermost_each(lets, ty.clone())
+                    } else {
+                        Type::Refinement(Box::new(go(lets, base)), refinements.clone())
+                    }
+                }
+                Type::Fun {
+                    binder,
+                    fun_kind,
+                    domain,
+                    codomain,
+                    capabilities,
+                } => {
+                    // A sum's candidates stand where its domain does, outside its binders.
+                    let mut fun_kind = fun_kind.clone();
+                    for w in fun_kind.witnesses_mut() {
+                        for t in w.types_mut() {
+                            *t = TypeLet::innermost_each(lets, std::mem::replace(t, Type::Hole));
+                        }
+                    }
+                    Type::Fun {
+                        binder: binder.clone(),
+                        fun_kind,
+                        domain: Box::new(TypeLet::innermost_each(lets, (**domain).clone())),
+                        codomain: Box::new(TypeLet::innermost_each(lets, (**codomain).clone())),
+                        capabilities: capabilities.clone(),
+                    }
+                }
+                Type::Tuple(components) => Type::Tuple(
+                    components
+                        .iter()
+                        .map(|c| TypeLet::innermost_each(lets, c.clone()))
+                        .collect(),
+                ),
+                Type::Record(fields) => Type::Record(
+                    fields
+                        .iter()
+                        .map(|(label, c)| (label.clone(), TypeLet::innermost_each(lets, c.clone())))
+                        .collect(),
+                ),
+                // A definition reads no component's binder, so it stands in a component as it
+                // does around the tuple.
+                Type::DepTuple(components) => Type::DepTuple(
+                    components
+                        .iter()
+                        .map(|(n, c)| (n.clone(), TypeLet::innermost_each(lets, c.clone())))
+                        .collect(),
+                ),
+                Type::Variant(arms, openness) => Type::Variant(
+                    arms.iter()
+                        .map(|(tag, c)| (tag.clone(), TypeLet::innermost_each(lets, c.clone())))
+                        .collect(),
+                    *openness,
+                ),
+                Type::Nominal(decl, args) => Type::Nominal(
+                    Rc::clone(decl),
+                    args.iter()
+                        .map(|a| TypeLet::innermost_each(lets, a.clone()))
+                        .collect(),
+                ),
+                Type::History {
+                    function,
+                    history_kind,
+                } => Type::History {
+                    function: Box::new(go(lets, function)),
+                    history_kind: *history_kind,
+                },
+                Type::Split { input, output } => Type::Split {
+                    input: Box::new(TypeLet::innermost_each(lets, (**input).clone())),
+                    output: Box::new(TypeLet::innermost_each(lets, (**output).clone())),
+                },
+                // A definition reads no binder of the family, so it stands in the body as it
+                // does around the family.
+                Type::Family { binders, body } => Type::Family {
+                    binders: binders
+                        .iter()
+                        .map(|(n, d)| (n.clone(), TypeLet::innermost_each(lets, d.clone())))
+                        .collect(),
+                    body: Box::new(TypeLet::innermost_each(lets, (**body).clone())),
+                },
+                other => TypeLet::innermost_each(lets, other.clone()),
+            }
+        }
+        Cow::Owned(go(&lets, under))
+    }
+
+    /// The refinements at this position, under the type `let`s at its root, each standing
+    /// alone with the definitions it reads ([`TypeLet::refinement_under`]).
+    pub fn standalone_refinements(&self) -> Vec<Refinement> {
+        let (lets, under) = TypeLet::peel(self);
+        let refinements = match under {
+            Type::Refinement(_, refinements) => refinements.as_slice(),
+            _ => &[],
+        };
+        refinements
+            .iter()
+            .map(|r| TypeLet::refinement_under(&lets, r))
+            .collect()
     }
     /// This type with each witness in `renaming`'s domain replaced by the one it maps to —
     /// **binders included**, so a sum whose binder is renamed is α-converted rather than
@@ -4858,7 +5083,7 @@ impl Type {
     /// edge: a collection reaching `?a` and `?a` flowing into `?b` puts that collection below
     /// `?b`'s kind as well, without either edge having to know what the variables are.
     pub fn fun_kind_of(&self) -> Option<FunKind> {
-        match self.peel_refinements() {
+        match self.former() {
             Type::Fun { fun_kind, .. } => Some(fun_kind.clone()),
             Type::Infer(v) => Some(FunKind::Var(Rc::clone(v.fun_kind()))),
             _ => None,
@@ -4917,11 +5142,32 @@ impl Type {
         self.holds_type(&|ty| matches!(ty, Type::Nominal(..)))
     }
 
+    /// The type under the type `let`s and the refinements at this type's root: the former it
+    /// is built by (a function, a product, a base, …), for a caller that tests which one. Its
+    /// parts may read the `let`s' binders, so a caller taking a part out of it takes it from
+    /// [`Self::lets_distributed`] instead.
+    pub fn former(&self) -> &Type {
+        TypeLet::peel(self).1.peel_refinements()
+    }
+
     pub fn peel_refinements(&self) -> &Type {
         match self {
             // One layer suffices: `Type::refined` flattens, so a refinement's
             // base is never itself refined.
             Type::Refinement(inner, _) => inner,
+            // A type `let` decorates the shape under it as a refinement does: where the bare
+            // shape reads none of the `let`s' binders (their reads are in the refinements' own
+            // predicates), it is the shape, with no binding to keep.
+            Type::Let(_) => {
+                let (lets, under) = TypeLet::peel(self);
+                let bare = under.peel_refinements();
+                let reads = crate::ccl::subst::type_free_vars(bare);
+                if lets.iter().any(|l| reads.contains(&l.name)) {
+                    self
+                } else {
+                    bare
+                }
+            }
             other => other,
         }
     }
@@ -4965,6 +5211,12 @@ impl Type {
     /// value type.
     pub fn as_place(&self) -> Option<crate::ccl::place::PlaceType<'_>> {
         use crate::ccl::place::{PlaceKind, PlaceType};
+        // The place is read in this type's own parts, so none stands under a type `let`.
+        debug_assert!(
+            !matches!(self.peel_refinements(), Type::Let(_))
+                || !matches!(self.former(), Type::History { .. }),
+            "a place type under a type `let`: {self}"
+        );
         match self.peel_refinements() {
             Type::History {
                 history_kind: HistoryKind::Overwrite,
@@ -4974,7 +5226,7 @@ impl Type {
                     .history_parts()
                     .expect("an overwrite history holds a value");
                 Some(PlaceType {
-                    kind: if matches!(domain.peel_refinements(), Type::Txn) {
+                    kind: if matches!(domain.former(), Type::Txn) {
                         PlaceKind::Transactional
                     } else {
                         PlaceKind::Mutable
@@ -5033,7 +5285,7 @@ impl Type {
     /// shape, so it peels first, and a filtered collection is a collection.
     pub fn is_collection(&self) -> bool {
         matches!(
-            self.peel_refinements(),
+            self.former(),
             Type::Fun {
                 fun_kind: FunKind::Data(..),
                 ..
@@ -5157,6 +5409,8 @@ impl Type {
             // A generalized type's structure is its body's, its parameters standing for any type
             // (`src/ccl/design/type-parameters.md`, "Generalized types").
             Type::Poly(p) if p.is_generalized() => p.body.domain(),
+            // A type `let`'s structure is its body's, each part under the `let`.
+            Type::Let(l) => l.body.domain().map(|d| l.over(d)),
             _ => None,
         }
     }
@@ -5169,6 +5423,7 @@ impl Type {
         match self {
             Type::Fun { codomain, .. } => Some(codomain.as_ref().clone()),
             Type::Poly(p) if p.is_generalized() => p.body.codomain(),
+            Type::Let(l) => l.body.codomain().map(|c| l.over(c)),
             _ => None,
         }
     }
@@ -5214,6 +5469,13 @@ impl Type {
         match self {
             Type::Refinement(inner, _) => inner.witness_kind(),
             Type::Fun { fun_kind, .. } => fun_kind.witnesses().first().map(Witness::type_kind),
+            // Read with the type `let`s in the candidates that read them.
+            Type::Let(_) => match self.lets_distributed() {
+                Cow::Owned(distributed) if !matches!(distributed, Type::Let(_)) => {
+                    distributed.witness_kind()
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -5409,6 +5671,12 @@ impl Type {
                 input: Box::new(input.without_pi_names()),
                 output: Box::new(output.without_pi_names()),
             },
+            // Dropping names moves no read, so the `let` stays where it stands.
+            Type::Let(l) => Type::Let(Rc::new(TypeLet::new(
+                l.name.clone(),
+                Rc::clone(&l.definition),
+                l.body.without_pi_names(),
+            ))),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -5479,7 +5747,7 @@ impl Type {
     /// [`TypedExpr`], so its slots are an expression walk's business. A caller that needs
     /// them recurses itself, which `collect_tree_ids` and `predicate_id_collisions`
     /// (`crate::ccl::context`) both do.
-    pub fn walk_held_terms<'a>(&'a self, f: &mut impl FnMut(&'a Rc<TypedExpr>)) {
+    pub fn walk_held_terms<'a>(&'a self, f: &mut impl FnMut(&'a Rc<HeldTerm>)) {
         match self {
             Type::Refinement(_, refinements) => {
                 for r in refinements.iter() {
@@ -5492,25 +5760,28 @@ impl Type {
     }
 
     /// The terms this type holds outside a refinement, at its own node and not its children's:
-    /// a witness projection's sum and a family's arguments. A substitution, a binder walk or a
-    /// hash treats each as it treats a refinement's predicate, except that it binds no element.
-    pub fn held_terms(&self) -> impl Iterator<Item = &Rc<TypedExpr>> {
+    /// a witness projection's sum, a family's arguments and a type `let`'s definition. A
+    /// substitution, a binder walk or a hash treats each as it treats a refinement's predicate,
+    /// except that it binds no element.
+    pub fn held_terms(&self) -> impl Iterator<Item = &Rc<HeldTerm>> {
         let (projected, arguments) = match self {
             Type::WitnessProjection(p) => (Some(&p.term), None),
+            Type::Let(l) => (Some(&l.definition), None),
             Type::FamilyApp(app) => (None, Some(app.args.iter().map(|a| &a.term))),
             _ => (None, None),
         };
         projected.into_iter().chain(arguments.into_iter().flatten())
     }
 
-    /// [`held_terms`](Self::held_terms), each as the [`HeldTerm`] holding it, for a
+    /// [`held_terms`](Self::held_terms), each as the [`TermHolder`] holding it, for a
     /// rewrite that re-points it.
-    pub fn held_terms_mut(&mut self) -> impl Iterator<Item = &mut dyn HeldTerm> {
+    pub fn held_terms_mut(&mut self) -> impl Iterator<Item = &mut dyn TermHolder> {
         let (projected, arguments) = match self {
-            Type::WitnessProjection(p) => (Some(p as &mut dyn HeldTerm), None),
+            Type::WitnessProjection(p) => (Some(p as &mut dyn TermHolder), None),
+            Type::Let(l) => (Some(Rc::make_mut(l) as &mut dyn TermHolder), None),
             Type::FamilyApp(app) => (
                 None,
-                Some(app.args.iter_mut().map(|a| a as &mut dyn HeldTerm)),
+                Some(app.args.iter_mut().map(|a| a as &mut dyn TermHolder)),
             ),
             _ => (None, None),
         };
@@ -5600,6 +5871,9 @@ impl Type {
                     f(t);
                 }
             }
+            // The body is a child under the binder; the definition is a held term
+            // ([`Self::held_terms`]).
+            Type::Let(l) => f(&l.body),
         }
     }
 
@@ -5674,6 +5948,7 @@ impl Type {
                     f(t);
                 }
             }
+            Type::Let(l) => f(&mut Rc::make_mut(l).body),
         }
     }
 
@@ -5757,43 +6032,286 @@ pub struct Refinement {
     /// [`crate::ccl::ccl_utils::PredMemo`], which preserve the sharing across a
     /// pass. Use [`Refinement::born`] only for a genuinely *new* predicate.
     /// Guarded by `tests/it/predicate_sharing.rs`.
-    pub predicate: Rc<TypedExpr>,
-    /// The predicate's normal form, what equality and hashing compare
-    /// ([`crate::ccl::ccl_utils::normal_form`]), kept with the predicate it was computed for.
-    /// Private, so a refinement is built through [`Refinement::born`].
-    normal: NormalFormCache,
+    pub predicate: Rc<HeldTerm>,
 }
 
-/// A [`Refinement`]'s normal form, computed the first time the refinement is compared or
-/// hashed. It holds the predicate `Rc` it was computed for, and a refinement whose predicate
-/// was re-pointed since computes it again; and whether the normal form is the same in every
-/// run ([`crate::ccl::ccl_utils::normal_form_detached`]).
-#[derive(Clone, Default)]
-struct NormalFormCache(RefCell<Option<CachedNormal>>);
+/// A term a type holds: a refinement's predicate, the sum a [`WitnessProjection`] projects, a
+/// [`FamilyApp`]'s argument, or a [`TypeLet`]'s definition. It lives in the allocation the type
+/// slots holding it share ([`TermHolder`]), with the forms equality and hashing compare it in: its
+/// normal form, computed once for every slot holding the allocation, and its reads through the
+/// definitions of the scopes it is read in ([`HeldTerm::read_through`]). A held term is immutable,
+/// so nothing computed for it goes stale.
+pub struct HeldTerm {
+    term: TypedExpr,
+    normal: std::cell::OnceCell<CachedNormal>,
+    reads: RefCell<Vec<ReadThrough>>,
+}
 
+/// A held term's normal form ([`crate::ccl::ccl_utils::normal_form`]), whether it is the same in
+/// every run ([`crate::ccl::ccl_utils::normal_form_detached`]), and the binders its reduction took
+/// apart reads of ([`ccl_utils::normal_form_taking_apart`]).
 #[derive(Clone)]
 struct CachedNormal {
-    of: Rc<TypedExpr>,
     normal: Rc<TypedExpr>,
     in_every_run: bool,
+    taken_apart: Rc<[crate::ccl::Name]>,
 }
 
-impl NormalFormCache {
-    /// `term`'s normal form, and whether it is the same in every run.
-    fn get(&self, term: &Rc<TypedExpr>) -> (Rc<TypedExpr>, bool) {
-        if let Some(cached) = &*self.0.borrow()
-            && Rc::ptr_eq(&cached.of, term)
-        {
-            return (Rc::clone(&cached.normal), cached.in_every_run);
+/// A held term read through the definitions of one scope ([`HeldTerm::read_through`]), raised by
+/// `by`, with each binder the read looked up and the definition the scope gave for it.
+struct ReadThrough {
+    by: u32,
+    lookups: Vec<Lookup>,
+    read: Rc<TypedExpr>,
+}
+
+/// A binder a read through definitions looked up, and the type `let` definition the scope gave
+/// for it with the binders it is raised by, or none. The definition's `Rc` keeps its allocation,
+/// so no other definition takes its address while the read is kept.
+type Lookup = (crate::ccl::Name, Option<(Rc<HeldTerm>, u32)>);
+
+/// What the scope a held term is read in gives for a binder ([`HeldTerm::read_through`]).
+pub(crate) enum Defined<'a> {
+    /// A type `let`'s definition, read `by` binders below the `let`.
+    Let(Rc<HeldTerm>, u32),
+    /// A definition the caller supplies ([`Definitions`]). No allocation holds it, so a read
+    /// through it is not kept.
+    Supplied(&'a TypedExpr),
+}
+
+/// The scope a held term is read in: what it gives for each binder ([`Defined`]).
+pub(crate) type ReadScope<'s, 'a> = dyn FnMut(&crate::ccl::Name) -> Option<Defined<'a>> + 's;
+
+/// The lookups a read through definitions made, and whether every answer is a type `let`'s
+/// definition or none, so the read can be kept by them.
+struct Lookups {
+    made: Vec<Lookup>,
+    keepable: bool,
+}
+
+impl Lookups {
+    fn new() -> Self {
+        Lookups {
+            made: Vec::new(),
+            keepable: true,
         }
-        let (normal, in_every_run) = ccl_utils::normal_form_detached(term);
-        let normal = Rc::new(normal);
-        *self.0.borrow_mut() = Some(CachedNormal {
-            of: Rc::clone(term),
-            normal: Rc::clone(&normal),
-            in_every_run,
-        });
-        (normal, in_every_run)
+    }
+
+    /// What `scope` gives for `n`, recorded.
+    fn ask<'a>(
+        &mut self,
+        scope: &mut ReadScope<'_, 'a>,
+        n: &crate::ccl::Name,
+    ) -> Option<Defined<'a>> {
+        let answer = scope(n);
+        let recorded = match &answer {
+            None => None,
+            Some(Defined::Let(d, by)) => Some((Rc::clone(d), *by)),
+            Some(Defined::Supplied(_)) => {
+                self.keepable = false;
+                return answer;
+            }
+        };
+        if !self.made.iter().any(|(m, _)| m == n) {
+            self.made.push((n.clone(), recorded));
+        }
+        answer
+    }
+
+    /// Whether `scope` gives for `n` what `was` records.
+    fn gives(&mut self, scope: &mut ReadScope<'_, '_>, (n, was): &Lookup) -> bool {
+        match (self.ask(scope, n), was) {
+            (None, None) => true,
+            (Some(Defined::Let(d, by)), Some((e, at))) => Rc::ptr_eq(&d, e) && by == *at,
+            _ => false,
+        }
+    }
+
+    fn absorb(&mut self, other: Lookups) {
+        self.keepable &= other.keepable;
+        for l in other.made {
+            if !self.made.iter().any(|(m, _)| *m == l.0) {
+                self.made.push(l);
+            }
+        }
+    }
+}
+
+impl HeldTerm {
+    pub fn new(term: TypedExpr) -> Self {
+        HeldTerm {
+            term,
+            normal: std::cell::OnceCell::new(),
+            reads: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The held term.
+    pub fn term(&self) -> &TypedExpr {
+        &self.term
+    }
+
+    fn cached(&self) -> &CachedNormal {
+        self.normal.get_or_init(|| {
+            let (normal, in_every_run, taken_apart) =
+                ccl_utils::normal_form_taking_apart(&self.term);
+            CachedNormal {
+                normal: Rc::new(normal),
+                in_every_run,
+                taken_apart: taken_apart.into(),
+            }
+        })
+    }
+
+    /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
+    pub(crate) fn normal(&self) -> Rc<TypedExpr> {
+        Rc::clone(&self.cached().normal)
+    }
+
+    /// [`Self::normal`], with the binders its reduction took apart reads of
+    /// ([`ccl_utils::normal_form_taking_apart`]).
+    pub(crate) fn normal_taking_apart(&self) -> (Rc<TypedExpr>, Rc<[crate::ccl::Name]>) {
+        let cached = self.cached();
+        (Rc::clone(&cached.normal), Rc::clone(&cached.taken_apart))
+    }
+
+    /// [`Self::normal`] where it is the same in every run, so a reader of its type slots may take
+    /// it in any.
+    pub(crate) fn normal_in_every_run(&self) -> Option<Rc<TypedExpr>> {
+        let cached = self.cached();
+        cached.in_every_run.then(|| Rc::clone(&cached.normal))
+    }
+
+    /// The term as a read `by` binders below its position reads it in `scope`: raised by `by`,
+    /// in normal form, and with each free read of a binder `scope` defines discharged where a
+    /// reduction takes the read apart, and reduced there ([`ccl_utils::normal_form_through`]).
+    ///
+    /// The read is kept with the lookups it made, and a scope that gives the same definitions for
+    /// them reads the term alike, so it reuses the read.
+    pub(crate) fn read_through(&self, by: u32, scope: &mut ReadScope<'_, '_>) -> Rc<TypedExpr> {
+        self.read_recording(by, scope, &mut Lookups::new())
+    }
+
+    fn read_recording<'a>(
+        &self,
+        by: u32,
+        scope: &mut ReadScope<'_, 'a>,
+        outer: &mut Lookups,
+    ) -> Rc<TypedExpr> {
+        let cached = self.cached();
+        // Raising a normal form leaves it normal: a reduction reads no index.
+        let raised = || {
+            if by > 0 && reads_an_index(&cached.normal) {
+                Rc::new(crate::ccl::subst::raised_term(&cached.normal, by))
+            } else {
+                Rc::clone(&cached.normal)
+            }
+        };
+        let mut defined = false;
+        for n in cached.taken_apart.iter() {
+            defined |= outer.ask(scope, n).is_some();
+        }
+        if !defined {
+            return raised();
+        }
+        let kept = self
+            .reads
+            .borrow()
+            .iter()
+            .find(|r| r.by == by && r.lookups.iter().all(|l| outer.gives(scope, l)))
+            .map(|r| Rc::clone(&r.read));
+        if let Some(read) = kept {
+            return read;
+        }
+        let mut own = Lookups::new();
+        let read = Rc::new(ccl_utils::normal_form_through(&raised(), &mut |n| {
+            Some(read_defined(own.ask(scope, n)?, scope, &mut own))
+        }));
+        if own.keepable {
+            self.reads.borrow_mut().push(ReadThrough {
+                by,
+                lookups: own.made.clone(),
+                read: Rc::clone(&read),
+            });
+        }
+        outer.absorb(own);
+        read
+    }
+}
+
+/// The definition `defined` as a read of its binder reads it in `scope`
+/// ([`HeldTerm::read_through`]).
+fn read_defined<'a>(
+    defined: Defined<'a>,
+    scope: &mut ReadScope<'_, 'a>,
+    lookups: &mut Lookups,
+) -> Rc<TypedExpr> {
+    match defined {
+        Defined::Let(d, by) => d.read_recording(by, scope, lookups),
+        Defined::Supplied(t) => {
+            let (normal, _, taken_apart) = ccl_utils::normal_form_taking_apart(t);
+            let mut defined = false;
+            for n in &taken_apart {
+                defined |= lookups.ask(scope, n).is_some();
+            }
+            if !defined {
+                return Rc::new(normal);
+            }
+            Rc::new(ccl_utils::normal_form_through(&normal, &mut |n| {
+                Some(read_defined(lookups.ask(scope, n)?, scope, lookups))
+            }))
+        }
+    }
+}
+
+impl std::ops::Deref for HeldTerm {
+    type Target = TypedExpr;
+    fn deref(&self) -> &TypedExpr {
+        &self.term
+    }
+}
+
+impl fmt::Debug for HeldTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.term.fmt(f)
+    }
+}
+
+impl PartialEq for HeldTerm {
+    fn eq(&self, other: &Self) -> bool {
+        self.term == other.term
+    }
+}
+
+/// A term as the allocation a held term lives in ([`HeldTerm`]).
+pub trait IntoHeldTerm {
+    fn into_held(self) -> Rc<HeldTerm>;
+}
+
+impl IntoHeldTerm for Rc<HeldTerm> {
+    fn into_held(self) -> Rc<HeldTerm> {
+        self
+    }
+}
+
+impl IntoHeldTerm for TypedExpr {
+    fn into_held(self) -> Rc<HeldTerm> {
+        Rc::new(HeldTerm::new(self))
+    }
+}
+
+impl IntoHeldTerm for Box<TypedExpr> {
+    fn into_held(self) -> Rc<HeldTerm> {
+        Rc::new(HeldTerm::new(*self))
+    }
+}
+
+impl IntoHeldTerm for Rc<TypedExpr> {
+    /// The term moved out of its `Rc`, or copied with its ids where something else holds it.
+    fn into_held(self) -> Rc<HeldTerm> {
+        Rc::new(HeldTerm::new(Rc::try_unwrap(self).unwrap_or_else(|t| {
+            crate::ccl::Duplicate::clone_preserving_ids(&*t)
+        })))
     }
 }
 
@@ -5808,14 +6326,13 @@ impl fmt::Debug for Refinement {
 impl Refinement {
     /// The predicate's normal form ([`crate::ccl::ccl_utils::normal_form`]).
     pub(crate) fn normal(&self) -> Rc<TypedExpr> {
-        self.normal.get(&self.predicate).0
+        self.predicate.normal()
     }
 
     /// [`Self::normal`] where it is the same in every run, so a reader of its type slots may take
     /// it in any.
     pub(crate) fn normal_in_every_run(&self) -> Option<Rc<TypedExpr>> {
-        let (normal, in_every_run) = self.normal.get(&self.predicate);
-        in_every_run.then_some(normal)
+        self.predicate.normal_in_every_run()
     }
 }
 
@@ -5829,31 +6346,34 @@ impl Refinement {
 #[derive(Clone)]
 pub struct WitnessProjection {
     /// The sum the witness is projected from.
-    pub term: Rc<TypedExpr>,
+    pub term: Rc<HeldTerm>,
     /// Which of the sum's binders, outermost first.
     pub position: usize,
-    /// The term's normal form, what equality and hashing compare. Private, so a projection is
-    /// built through [`WitnessProjection::new`].
-    normal: NormalFormCache,
 }
 
 impl WitnessProjection {
-    pub fn new(term: Rc<TypedExpr>, position: usize) -> Self {
+    pub fn new(term: impl IntoHeldTerm, position: usize) -> Self {
         WitnessProjection {
-            term,
+            term: term.into_held(),
             position,
-            normal: NormalFormCache::default(),
         }
     }
 
     /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
     pub(crate) fn normal(&self) -> Rc<TypedExpr> {
-        self.normal.get(&self.term).0
+        self.term.normal()
     }
 
-    /// The witness this projects, as the term's own type binds it.
-    pub fn witness(&self) -> Option<&Witness> {
-        self.term.ty.peel_refinements().sum()?.get(self.position)
+    /// The witness this projects, as the term's own type binds it, its candidates under the
+    /// type `let`s that type holds ([`Type::lets_distributed`]).
+    pub fn witness(&self) -> Option<Witness> {
+        self.term
+            .ty
+            .lets_distributed()
+            .peel_refinements()
+            .sum()?
+            .get(self.position)
+            .cloned()
     }
 }
 
@@ -5874,7 +6394,7 @@ pub fn witness_references(ty: &Type) -> std::collections::BTreeSet<WitnessId> {
 /// candidate a determined witness has, which is what the projection is whatever term it reads.
 /// Every projection a pass builds from a sum it holds is spelled here, so a determined one has
 /// one spelling.
-pub fn projected_witness(term: &Rc<TypedExpr>, position: usize, witness: &Witness) -> Type {
+pub fn projected_witness(term: &Rc<HeldTerm>, position: usize, witness: &Witness) -> Type {
     witness.sole_candidate().unwrap_or_else(|| {
         Type::WitnessProjection(WitnessProjection::new(Rc::clone(term), position))
     })
@@ -5883,8 +6403,11 @@ pub fn projected_witness(term: &Rc<TypedExpr>, position: usize, witness: &Witnes
 /// The type `unbox(𝑡)` has for a term `𝑡` of the sum type `sum_ty`: the sum's body with each
 /// witness it binds replaced by its projection through `𝑡` (`src/ccl/design/collections.md`,
 /// "Projecting a sum's witness"). `None` when `sum_ty` binds no witness.
-pub fn unboxed_type_in(solver: &mut Solver, sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
-    let witnesses = sum_ty.peel_refinements().sum()?.to_vec();
+pub fn unboxed_type_in(solver: &mut Solver, sum_ty: &Type, term: &Rc<HeldTerm>) -> Option<Type> {
+    let witnesses = sum_ty.sum_binders();
+    if witnesses.is_empty() {
+        return None;
+    }
     Some(
         witnesses
             .iter()
@@ -5898,7 +6421,7 @@ pub fn unboxed_type_in(solver: &mut Solver, sum_ty: &Type, term: &Rc<TypedExpr>)
 
 /// [`unboxed_type_in`] outside every typing run, through
 /// [`Solver::none`](crate::ccl::infer::solver::Solver::none).
-pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
+pub fn unboxed_type(sum_ty: &Type, term: &Rc<HeldTerm>) -> Option<Type> {
     unboxed_type_in(&mut Solver::none(), sum_ty, term)
 }
 
@@ -5908,7 +6431,9 @@ pub fn unboxed_type(sum_ty: &Type, term: &Rc<TypedExpr>) -> Option<Type> {
 /// it is minted under.
 pub fn unbox_type_in(solver: &mut Solver, sum_ty: &Type) -> Option<Type> {
     let boxed = crate::ccl::Name::fresh("__boxed");
-    let term = Rc::new(TypedExpr::var(boxed.clone()).with_ty(sum_ty.clone()));
+    let term = TypedExpr::var(boxed.clone())
+        .with_ty(sum_ty.clone())
+        .into_held();
     let body = unboxed_type_in(solver, sum_ty, &term)?;
     Some(Type::pi_in(solver, boxed, sum_ty.clone(), body))
 }
@@ -5962,7 +6487,7 @@ impl Eq for WitnessProjection {}
 impl std::hash::Hash for WitnessProjection {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.position.hash(state);
-        hash_term_modulo_ty_slots(&self.normal(), state, &mut Vec::new());
+        hash_term_modulo_ty_slots(&self.normal(), state);
     }
 }
 
@@ -5975,24 +6500,24 @@ impl fmt::Debug for WitnessProjection {
     }
 }
 
-/// A term a type holds: a refinement's predicate, the sum a [`WitnessProjection`] projects, or a
-/// [`FamilyApp`]'s argument.
+/// What holds a held term ([`HeldTerm`]): a refinement, a [`WitnessProjection`], a [`FamilyApp`]'s
+/// argument, or a [`TypeLet`].
 ///
 /// A held term rides every type slot its type reaches, shared by `Rc`, so a pass rewriting the
 /// terms a type holds rebuilds it once and re-points every occurrence at the rebuild
 /// ([`crate::ccl::ccl_utils::PredMemo`]).
-pub trait HeldTerm {
+pub trait TermHolder {
     /// The held term.
-    fn held(&self) -> &Rc<TypedExpr>;
+    fn held(&self) -> &Rc<HeldTerm>;
     /// Install `to` as the held term.
-    fn replace_held(&mut self, to: Rc<TypedExpr>);
+    fn replace_held(&mut self, to: Rc<HeldTerm>);
 }
 
-impl HeldTerm for Refinement {
-    fn held(&self) -> &Rc<TypedExpr> {
+impl TermHolder for Refinement {
+    fn held(&self) -> &Rc<HeldTerm> {
         &self.predicate
     }
-    fn replace_held(&mut self, to: Rc<TypedExpr>) {
+    fn replace_held(&mut self, to: Rc<HeldTerm>) {
         // The rewrite half of the boundary `Refinement::born` guards: a pass that
         // substitutes into a predicate can put a whole function body there, and
         // this is where such a term would be installed. Checked only where the
@@ -6005,11 +6530,11 @@ impl HeldTerm for Refinement {
     }
 }
 
-impl HeldTerm for WitnessProjection {
-    fn held(&self) -> &Rc<TypedExpr> {
+impl TermHolder for WitnessProjection {
+    fn held(&self) -> &Rc<HeldTerm> {
         &self.term
     }
-    fn replace_held(&mut self, to: Rc<TypedExpr>) {
+    fn replace_held(&mut self, to: Rc<HeldTerm>) {
         self.term = to;
     }
 }
@@ -6028,11 +6553,11 @@ pub struct FamilyApp {
 /// One argument of a [`FamilyApp`].
 #[derive(Clone)]
 pub struct FamilyArg {
-    pub term: Rc<TypedExpr>,
+    pub term: Rc<HeldTerm>,
 }
 
 impl FamilyApp {
-    pub fn new(param: Rc<TypeParam>, args: Vec<Rc<TypedExpr>>) -> Self {
+    pub fn new(param: Rc<TypeParam>, args: Vec<impl IntoHeldTerm>) -> Self {
         debug_assert_eq!(
             args.len(),
             param.arity,
@@ -6043,7 +6568,12 @@ impl FamilyApp {
         );
         FamilyApp {
             param,
-            args: args.into_iter().map(|term| FamilyArg { term }).collect(),
+            args: args
+                .into_iter()
+                .map(|term| FamilyArg {
+                    term: term.into_held(),
+                })
+                .collect(),
         }
     }
 }
@@ -6064,7 +6594,7 @@ impl std::hash::Hash for FamilyApp {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.param.hash(state);
         for a in &self.args {
-            hash_term_modulo_ty_slots(&a.term, state, &mut Vec::new());
+            hash_term_modulo_ty_slots(&a.term, state);
         }
     }
 }
@@ -6081,12 +6611,491 @@ impl fmt::Debug for FamilyApp {
     }
 }
 
-impl HeldTerm for FamilyArg {
-    fn held(&self) -> &Rc<TypedExpr> {
+impl TermHolder for FamilyArg {
+    fn held(&self) -> &Rc<HeldTerm> {
         &self.term
     }
-    fn replace_held(&mut self, to: Rc<TypedExpr>) {
+    fn replace_held(&mut self, to: Rc<HeldTerm>) {
         self.term = to;
+    }
+}
+
+/// A type `let` ([`Type::Let`]): its binder, the binder's definition and the type the
+/// binder scopes over.
+///
+/// Two are equal when their definitions' normal forms are equal, as two predicates are, and
+/// their bodies are equal once one binder is renamed to the other: each copy of a `let` binds a
+/// name of its own. The hash reads the definition alone, which equal `let`s share.
+#[derive(Clone)]
+pub struct TypeLet {
+    pub name: crate::ccl::Name,
+    pub definition: Rc<HeldTerm>,
+    pub body: Type,
+}
+
+impl TypeLet {
+    pub fn new(name: crate::ccl::Name, definition: Rc<HeldTerm>, body: Type) -> Self {
+        TypeLet {
+            name,
+            definition,
+            body,
+        }
+    }
+
+    /// The definition's normal form ([`crate::ccl::ccl_utils::normal_form`]).
+    pub(crate) fn normal(&self) -> Rc<TypedExpr> {
+        self.definition.normal()
+    }
+
+    /// `let name = definition in body` in normal form: `body` itself where it does not read
+    /// `name`, since a `let` whose binder its body does not read holds nothing.
+    pub fn wrap(name: crate::ccl::Name, definition: Rc<HeldTerm>, body: Type) -> Type {
+        if ccl_utils::is_free_in_type(&name, &body) {
+            Type::Let(Rc::new(TypeLet::new(name, definition, body)))
+        } else {
+            body
+        }
+    }
+
+    /// This `let` over `body`, in normal form: placed at the innermost position holding every
+    /// read of its binder, and gone where `body` reads none ([`Self::innermost`]).
+    pub fn over(&self, body: Type) -> Type {
+        TypeLet::innermost(self.name.clone(), Rc::clone(&self.definition), body)
+    }
+
+    /// `let name = definition in body` at the innermost position of `body` holding every read
+    /// of `name`, so the reads share one binder; `body` itself where it reads none.
+    ///
+    /// A position whose own held terms read `name` (a predicate, a projection's term, a family's
+    /// arguments, another `let`'s definition) holds the `let` around it. Otherwise a `let` read
+    /// in one child only moves into that child. It moves under a binder that the indices of a
+    /// closed type count (a codomain, a later dependent component, a family's body) only when
+    /// the definition reads no index, since its indices count the binders it stands under.
+    pub fn innermost(name: crate::ccl::Name, definition: Rc<HeldTerm>, body: Type) -> Type {
+        let reads = |ty: &Type| ccl_utils::is_free_in_type(&name, ty);
+        if !reads(&body) {
+            return body;
+        }
+        let own = body
+            .own_refinements()
+            .iter()
+            .map(|r| &r.predicate)
+            .chain(body.held_terms())
+            .any(|t| ccl_utils::is_free(&name, t));
+        if !own {
+            let deepened = children_under_indexed_binders(&body);
+            let under = |i: usize| deepened.iter().find(|(c, _)| *c == i).map(|(_, b)| b);
+            let mut readers = Vec::new();
+            let mut i = 0;
+            body.walk_children(|c| {
+                if reads(c) {
+                    readers.push(i);
+                }
+                i += 1;
+            });
+            if let [only] = readers[..]
+                && (under(only).is_none() || !reads_an_index(&definition))
+            {
+                // Moved under binders, the definition reads the ones it names by index, as a
+                // stored type spells a reference to a binder it is under.
+                let definition = match under(only) {
+                    Some(binders)
+                        if binders
+                            .iter()
+                            .flat_map(FunBinder::names)
+                            .any(|b| ccl_utils::is_free(b, &definition)) =>
+                    {
+                        let mut scope = crate::ccl::subst::RefinementScope::default();
+                        for b in binders {
+                            scope.enter(b.clone());
+                        }
+                        let mut quoted =
+                            TypeLet::new(name.clone(), Rc::clone(&definition), Type::Hole);
+                        scope.close_held(&mut Solver::none(), &mut quoted);
+                        quoted.definition
+                    }
+                    _ => definition,
+                };
+                let mut body = body;
+                let mut i = 0;
+                body.walk_children_mut(|c| {
+                    if i == only {
+                        let child = std::mem::replace(c, Type::Hole);
+                        *c = TypeLet::innermost(name.clone(), Rc::clone(&definition), child);
+                    }
+                    i += 1;
+                });
+                return body;
+            }
+        }
+        Type::Let(Rc::new(TypeLet::new(name, definition, body)))
+    }
+
+    /// `refinement`, read under `lets` (outermost first, as [`Self::peel`] gives them), standing
+    /// alone: its predicate under a term `let` for each definition it reads, directly or through
+    /// another's definition. The definitions read no element, so they stand where the predicate
+    /// does. [`Type::refined`] lifts them back out of a predicate it is given, so a pass that
+    /// takes a refinement out of a type and puts it into another leaves the type form.
+    pub fn refinement_under(lets: &[&TypeLet], refinement: &Refinement) -> Refinement {
+        let needed = TypeLet::read_by(lets, ccl_utils::free_names(&refinement.predicate));
+        if !needed.contains(&true) {
+            return refinement.clone();
+        }
+        let _g = crate::ccl::provenance::enter(
+            refinement.predicate.node_id(),
+            "ty.refinement_under_lets",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        let predicate = crate::ccl::Duplicate::duplicate(refinement.predicate.term());
+        Refinement::born(Rc::new(TypeLet::term_under(lets, &needed, predicate)))
+    }
+
+    /// Which of `lets` (outermost first) a term reading `reads` reads, directly or through
+    /// another's definition, as one flag per `let`.
+    pub fn read_by(
+        lets: &[&TypeLet],
+        reads: impl IntoIterator<Item = crate::ccl::Name>,
+    ) -> Vec<bool> {
+        let mut needed = vec![false; lets.len()];
+        let mut reads: Vec<crate::ccl::Name> = reads.into_iter().collect();
+        while let Some(n) = reads.pop() {
+            if let Some(i) = lets.iter().rposition(|l| l.name == n)
+                && !needed[i]
+            {
+                needed[i] = true;
+                reads.extend(ccl_utils::free_names(&lets[i].definition));
+            }
+        }
+        needed
+    }
+
+    /// `term` under a term `let` for each of `lets` (outermost first) that `needed` flags
+    /// ([`Self::read_by`]), outermost first. The definitions read no element, so they stand
+    /// wherever a term reading them does. Mints the `let`s and copies the definitions, so the
+    /// caller holds a recording open.
+    pub fn term_under(lets: &[&TypeLet], needed: &[bool], term: TypedExpr) -> TypedExpr {
+        let mut term = term;
+        for (l, _) in lets.iter().zip(needed).rev().filter(|(_, n)| **n) {
+            debug_assert!(
+                crate::ccl::subst::free_elem_indices(&l.definition).is_empty(),
+                "a type `let`'s definition reads no refinement's element"
+            );
+            let binding = crate::ccl::TypedBinding {
+                name: l.name.clone(),
+                occurrence: crate::ccl::Occurrence::mint(),
+                ty: l.definition.ty.clone(),
+                user_annotation: None,
+                transparency: crate::ccl::BindingTransparency::Transparent,
+                site: None,
+                parameter_mode: Default::default(),
+            };
+            term = TypedExpr::let_in(
+                binding,
+                crate::ccl::Duplicate::duplicate(&*l.definition),
+                term,
+            );
+        }
+        term
+    }
+
+    /// `ty` under the type `let`s at its root, outermost first, and the type they hold.
+    pub fn peel(ty: &Type) -> (Vec<&TypeLet>, &Type) {
+        let mut lets = Vec::new();
+        let mut at = ty;
+        while let Type::Let(l) = at {
+            lets.push(&**l);
+            at = &l.body;
+        }
+        (lets, at)
+    }
+
+    /// `part`, a part of a type [`Self::peel`] took `lets` off, back under each of them it
+    /// reads ([`Self::over`]).
+    pub fn rewrap(lets: &[&TypeLet], part: Type) -> Type {
+        lets.iter().rev().fold(part, |part, l| l.over(part))
+    }
+
+    /// `part`, a part of a type [`Self::peel`] took `lets` off, with each of them it reads
+    /// placed at the innermost position holding its reads ([`Self::innermost`]), so a part of
+    /// `part` taken apart in turn takes the `let`s it reads with it.
+    pub fn innermost_each(lets: &[&TypeLet], part: Type) -> Type {
+        if lets.is_empty() {
+            return part;
+        }
+        // Only the `let`s `part` reads, directly or through another's definition, stand in it,
+        // so its reads are walked once to find them.
+        let needed = TypeLet::read_by(lets, crate::ccl::subst::type_free_vars(&part));
+        lets.iter()
+            .zip(needed)
+            .rev()
+            .filter(|(_, needed)| *needed)
+            .fold(part, |part, (l, _)| {
+                TypeLet::innermost(l.name.clone(), Rc::clone(&l.definition), part)
+            })
+    }
+
+    /// The body with the definition written at each read, where the definition is a term no
+    /// larger than a read of the binder: a variable or a literal (the rule
+    /// [`crate::ccl::subst::Subst::let_exit`] states). A pass that rewrites a definition into
+    /// one keeps the normal form with this. The definition is discharged as
+    /// [`Self::discharged`] discharges it. `None` where nothing is discharged.
+    pub fn inline_atomic(&self) -> Option<Type> {
+        let atomic = matches!(
+            atomic_definition(&self.definition),
+            Some(AtomicRoot::Index | AtomicRoot::Name | AtomicRoot::Literal)
+        );
+        if !atomic || crate::ccl::subst::type_contains_infer(&self.body) {
+            return None;
+        }
+        Some(self.discharged())
+    }
+
+    /// The body with the definition written at each read of the binder, raised from where the
+    /// `let` stands to the read by the binders between, which its indices count. Each copy is
+    /// a duplicate.
+    pub fn discharged(&self) -> Type {
+        let _g = crate::ccl::provenance::enter(
+            self.definition.node_id(),
+            "ty.let_discharged",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        discharge_root_let(&mut Solver::none(), self, crate::ccl::Ids::Fresh)
+    }
+
+    /// The body with this `let`'s binder renamed to `to`.
+    pub fn body_as(&self, to: &crate::ccl::Name) -> Type {
+        if *to == self.name {
+            return self.body.clone();
+        }
+        let mut body = self.body.clone();
+        let renames: crate::ccl::scope::Renames =
+            std::iter::once((self.name.clone(), to.clone())).collect();
+        crate::ccl::scope::rename_names_in_type(&mut body, &renames, crate::ccl::Ids::Kept);
+        body
+    }
+}
+
+impl Type {
+    /// The type under the type `let`s at this type's root, to rewrite in place
+    /// ([`TypeLet::peel`]).
+    pub fn under_lets_mut(&mut self) -> &mut Type {
+        match self {
+            Type::Let(l) => Rc::make_mut(l).body.under_lets_mut(),
+            other => other,
+        }
+    }
+}
+
+/// The body of the `let` `l` with its definition discharged at each read of its binder, raised
+/// from where the `let` stands to the read by the binders between, which its indices count.
+/// Every other `let` stays, its definition reading `l`'s discharged. The copies take `ids`.
+fn discharge_root_let(solver: &mut Solver, l: &TypeLet, ids: crate::ccl::Ids) -> Type {
+    type Discharged = Vec<(crate::ccl::Name, Rc<HeldTerm>, u32)>;
+    /// What a term at `depth` takes: each discharged definition it reads, raised from where its
+    /// `let` stands to here.
+    fn held(
+        lets: &Discharged,
+        term: &TypedExpr,
+        depth: u32,
+        ids: crate::ccl::Ids,
+    ) -> Option<crate::ccl::subst::Subst> {
+        let reads = ccl_utils::free_names(term);
+        let entries: std::collections::HashMap<crate::ccl::Name, TypedExpr> = lets
+            .iter()
+            .rev()
+            .filter(|(n, _, _)| reads.contains(n))
+            .map(|(n, d, at)| {
+                let raised = crate::ccl::subst::raised_term_copying(d, depth - at, ids);
+                (n.clone(), raised)
+            })
+            .collect();
+        (!entries.is_empty()).then(|| crate::ccl::subst::Subst::discharging(&entries, ids))
+    }
+    fn go(
+        solver: &mut Solver,
+        ty: &Type,
+        lets: &mut Discharged,
+        depth: u32,
+        ids: crate::ccl::Ids,
+    ) -> Type {
+        if let Type::Let(l) = ty {
+            let definition = match held(lets, &l.definition, depth, ids) {
+                Some(s) => Rc::new(HeldTerm::new(s.apply_expr_in(solver, &l.definition))),
+                None => Rc::clone(&l.definition),
+            };
+            let body = go(solver, &l.body, lets, depth, ids);
+            return TypeLet::wrap(l.name.clone(), definition, body);
+        }
+        let mut out = ty.clone();
+        match &mut out {
+            Type::Refinement(_, refinements) => refinements.rewrite_each(|_, r| {
+                if let Some(s) = held(lets, &r.predicate, depth, ids) {
+                    *r = s.force_refinement(solver, r);
+                }
+            }),
+            _ => {
+                for quoted in out.held_terms_mut() {
+                    if let Some(s) = held(lets, quoted.held(), depth, ids) {
+                        let rewritten =
+                            Rc::new(HeldTerm::new(s.apply_expr_in(solver, quoted.held())));
+                        quoted.replace_held(rewritten);
+                    }
+                }
+            }
+        }
+        let deepened = children_under_indexed_binders(&out);
+        let mut i = 0;
+        out.walk_children_mut(|c| {
+            let by = deepened
+                .iter()
+                .find(|(j, _)| *j == i)
+                .map_or(0, |(_, binders)| binders.len() as u32);
+            *c = go(solver, c, lets, depth + by, ids);
+            i += 1;
+        });
+        out
+    }
+    let mut lets = vec![(l.name.clone(), Rc::clone(&l.definition), 0)];
+    go(solver, &l.body, &mut lets, 0, ids)
+}
+
+/// Whether `term` reads a binder of an enclosing function type by index ([`Name::PiBound`]),
+/// in its term or in a type slot. [`ccl_utils::free_names`] leaves such a reference out: it is
+/// bound by the type, not free in it.
+///
+/// [`Name::PiBound`]: crate::ccl::Name::PiBound
+pub(crate) fn reads_an_index(term: &TypedExpr) -> bool {
+    let mut found = matches!(&term.node, TypedExprNode::Var(n) if n.pi_bound_index().is_some());
+    term.walk_type_slots(|t| {
+        found |= !found && crate::ccl::subst::references_binder_within(t, u32::MAX);
+    });
+    term.walk_children(|c| found |= !found && reads_an_index(c));
+    found
+}
+
+/// The transparent `let` at `predicate`'s root, as its binder, definition and body
+/// ([`Type::refined`]); `None` where the root is no such `let`, where its definition reads an
+/// element, which only the refinement binds, or where it holds a `defer`.
+fn root_let(predicate: &TypedExpr) -> Option<(&crate::ccl::Name, &TypedExpr, &TypedExpr)> {
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &predicate.node
+    else {
+        return None;
+    };
+    // A `defer` declares a handle rather than defining a value, and a type holds only values.
+    if binding.transparency != crate::ccl::BindingTransparency::Transparent
+        || !crate::ccl::subst::free_elem_indices(bound_expr).is_empty()
+        || crate::ccl::channelize::holds_defer(bound_expr)
+    {
+        return None;
+    }
+    Some((&binding.name, bound_expr, body))
+}
+
+/// What a definition no larger than a read of its binder starts from: a literal, or the
+/// variable a path of projections reads (`x`, `x.0`, `x.name.1`), named in a scope, referenced
+/// by index, or a refinement's element.
+pub(crate) enum AtomicRoot {
+    Literal,
+    Name,
+    Index,
+    Element,
+}
+
+/// The root of `definition` where it is a literal or a path of projections of a variable,
+/// which a `let` holds nothing by binding ([`TypeLet::inline_atomic`],
+/// [`crate::ccl::subst::Subst::let_exit`]): it names a value rather than computing one.
+pub(crate) fn atomic_definition(definition: &TypedExpr) -> Option<AtomicRoot> {
+    match &definition.node {
+        TypedExprNode::Lit(_) => Some(AtomicRoot::Literal),
+        TypedExprNode::Var(n) if n.pi_bound_index().is_some() => Some(AtomicRoot::Index),
+        TypedExprNode::Var(n) if n.elem_index().is_some() => Some(AtomicRoot::Element),
+        TypedExprNode::Var(_) => Some(AtomicRoot::Name),
+        TypedExprNode::Apply { function, argument }
+            if matches!(function.node, TypedExprNode::Proj(_)) =>
+        {
+            match atomic_definition(argument)? {
+                AtomicRoot::Literal => None,
+                root => Some(root),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The positions, in [`Type::walk_children`]'s order, of `ty`'s children that stand under a
+/// binder a closed type's indices count, each with those binders, outermost first: a function's
+/// codomain, a dependent tuple's components after the first, a family's body.
+fn children_under_indexed_binders(ty: &Type) -> Vec<(usize, Vec<FunBinder>)> {
+    let mut count = 0;
+    ty.walk_children(|_| count += 1);
+    match ty {
+        Type::Fun { binder, .. } => vec![(count - 1, vec![binder.clone()])],
+        Type::DepTuple(components) => (1..count)
+            .map(|k| {
+                (
+                    k,
+                    components[..k]
+                        .iter()
+                        .map(|(n, _)| n.clone().into())
+                        .collect(),
+                )
+            })
+            .collect(),
+        Type::Family { binders, .. } if !binders.is_empty() => {
+            vec![(
+                count - 1,
+                binders.iter().map(|(n, _)| n.clone().into()).collect(),
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+impl PartialEq for TypeLet {
+    fn eq(&self, other: &Self) -> bool {
+        (Rc::ptr_eq(&self.definition, &other.definition)
+            || eq_term_modulo_ty_slots(&self.normal(), &other.normal()))
+            && self.body == other.body_as(&self.name)
+    }
+}
+
+impl Eq for TypeLet {}
+
+/// A hash of `e` that equal terms share when compared with type slots skipped
+/// ([`eq_term_modulo_ty_slots`]).
+pub(crate) fn term_hash_modulo_ty_slots(e: &TypedExpr) -> u64 {
+    use std::hash::Hasher;
+    let mut state = std::collections::hash_map::DefaultHasher::new();
+    hash_term_modulo_ty_slots(e, &mut state);
+    state.finish()
+}
+
+impl std::hash::Hash for TypeLet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        hash_term_modulo_ty_slots(&self.normal(), state);
+    }
+}
+
+impl fmt::Debug for TypeLet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TypeLet")
+            .field("name", &self.name)
+            .field("definition", &self.definition)
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+impl TermHolder for TypeLet {
+    fn held(&self) -> &Rc<HeldTerm> {
+        &self.definition
+    }
+    fn replace_held(&mut self, to: Rc<HeldTerm>) {
+        self.definition = to;
     }
 }
 
@@ -6099,7 +7108,7 @@ impl HeldTerm for FamilyArg {
 /// [`Refinement`]'s structural `PartialEq`, and costs nothing to compute.
 /// Only meaningful while the `Rc` is alive — hold it no longer than a
 /// traversal over a tree that owns the `Rc`s (a freed address can be reused).
-pub type PredicateId = *const TypedExpr;
+pub type PredicateId = *const HeldTerm;
 
 /// The single reserved binder every [`Refinement`] implicitly introduces. It
 /// is free in a refinement's predicate and ranges over the refined base type.
@@ -6187,6 +7196,43 @@ impl RefinementTemplate {
     }
 }
 
+/// The statement shape `e` holds, if any: a node a term a type holds cannot hold
+/// ([`debug_assert_predicate_shape`]).
+pub(crate) fn statement_shape(e: &TypedExpr) -> Option<&'static str> {
+    use TypedExprNode as N;
+    let here = match &e.node {
+        N::MutDecl { .. } => Some("MutDecl"),
+        N::MutWrite { .. } => Some("MutWrite"),
+        N::For { .. } => Some("For"),
+        N::Begin { .. } => Some("Begin"),
+        N::LetRec { .. } => Some("LetRec"),
+        N::Transact { .. } => Some("Transact"),
+        N::LetType { .. } => Some("LetType"),
+        N::Run { .. } => Some("Run"),
+        _ => None,
+    };
+    if here.is_some() {
+        return here;
+    }
+    // A cast's `target` is a type, so `walk_children` does not reach it, while
+    // `eq_term_modulo_ty_slots` does compare that slot. A statement shape nested one refinement
+    // deep is the same violation as one at the top, so the guard has to reach as deep as the
+    // comparison it backs.
+    if let N::Cast { target, .. } = &e.node
+        && let Some(set) = ccl_utils::cast_target_refinement(target)
+        && let Some(found) = set.iter().find_map(|r| statement_shape(&r.predicate))
+    {
+        return Some(found);
+    }
+    let mut found = None;
+    e.walk_children(|c| {
+        if found.is_none() {
+            found = statement_shape(c);
+        }
+    });
+    found
+}
+
 /// A refinement predicate is a **boolean expression over
 /// [`crate::ccl::REFINEMENT_BINDER`]**: it holds no `MutDecl`, `MutWrite`, `For`,
 /// `Begin`, `LetRec`, `Transact` or `LetType`.
@@ -6200,41 +7246,7 @@ impl RefinementTemplate {
 pub(crate) fn debug_assert_predicate_shape(predicate: &TypedExpr) {
     #[cfg(debug_assertions)]
     {
-        fn offending(e: &TypedExpr) -> Option<&'static str> {
-            use TypedExprNode as N;
-            let here = match &e.node {
-                N::MutDecl { .. } => Some("MutDecl"),
-                N::MutWrite { .. } => Some("MutWrite"),
-                N::For { .. } => Some("For"),
-                N::Begin { .. } => Some("Begin"),
-                N::LetRec { .. } => Some("LetRec"),
-                N::Transact { .. } => Some("Transact"),
-                N::LetType { .. } => Some("LetType"),
-                N::Run { .. } => Some("Run"),
-                _ => None,
-            };
-            if here.is_some() {
-                return here;
-            }
-            // A cast's `target` is a type, so `walk_children` does not reach it, while
-            // `eq_term_modulo_ty_slots` does compare that slot. A statement shape nested
-            // one refinement deep is the same violation as one at the top, so the guard
-            // has to reach as deep as the comparison it backs.
-            if let N::Cast { target, .. } = &e.node
-                && let Some(set) = ccl_utils::cast_target_refinement(target)
-                && let Some(found) = set.iter().find_map(|r| offending(&r.predicate))
-            {
-                return Some(found);
-            }
-            let mut found = None;
-            e.walk_children(|c| {
-                if found.is_none() {
-                    found = offending(c);
-                }
-            });
-            found
-        }
-        if let Some(shape) = offending(predicate) {
+        if let Some(shape) = statement_shape(predicate) {
             panic!(
                 "a refinement predicate holds a `{shape}`, which is a statement shape \
                  rather than a boolean expression over the element binder: {}",
@@ -6255,33 +7267,47 @@ impl Refinement {
     /// separates it from a filter the program wrote: a pass that compiles refinements into
     /// terms has to leave this one alone.
     pub fn is_collection_membership(&self) -> bool {
-        self.membership_collection().is_some()
+        // A refinement standing alone holds the definitions it reads as `let`s at its
+        // predicate's root ([`TypeLet::refinement_under`]), which leave it a membership.
+        let mut at: &TypedExpr = &self.predicate;
+        while let TypedExprNode::Let { body, .. } = &at.node {
+            at = body;
+        }
+        membership_collection_of(at).is_some()
     }
 
     /// The collection `𝑚` of a [membership](Self::is_collection_membership) refinement
     /// `__elem ▷ (𝑚 ▷ collection_contains)`, whose keys are the ones present. `None` for any
     /// other refinement.
     pub fn membership_collection(&self) -> Option<&TypedExpr> {
-        let TypedExprNode::Apply { argument, function } = &self.predicate.node else {
-            return None;
-        };
-        if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
-            return None;
-        }
-        let TypedExprNode::Apply {
-            argument: collection,
-            function: characteristic,
-        } = &function.node
-        else {
-            return None;
-        };
-        matches!(
-            &characteristic.node,
-            TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
-        )
-        .then_some(collection)
+        membership_collection_of(&self.predicate)
     }
+}
 
+/// The collection `𝑚` of a membership predicate `__elem ▷ (𝑚 ▷ collection_contains)`
+/// ([`Refinement::membership_collection`]); `None` for any other predicate.
+fn membership_collection_of(predicate: &TypedExpr) -> Option<&TypedExpr> {
+    let TypedExprNode::Apply { argument, function } = &predicate.node else {
+        return None;
+    };
+    if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
+        return None;
+    }
+    let TypedExprNode::Apply {
+        argument: collection,
+        function: characteristic,
+    } = &function.node
+    else {
+        return None;
+    };
+    matches!(
+        &characteristic.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
+    )
+    .then_some(collection)
+}
+
+impl Refinement {
     /// Construct a refinement over a **genuinely new** predicate term — one this
     /// call site is *creating*, with no prior refinement identity to preserve
     /// (a freshly-emitted filter, a synthesized loop-join condition, a compiled
@@ -6290,12 +7316,10 @@ impl Refinement {
     /// predicate, which must instead flow through
     /// [`crate::ccl::ccl_utils::PredMemo`] to keep occurrences that shared one
     /// `Rc` sharing one `Rc` (see the note on [`Refinement::predicate`]).
-    pub fn born(predicate: Rc<TypedExpr>) -> Self {
+    pub fn born(predicate: impl IntoHeldTerm) -> Self {
+        let predicate = predicate.into_held();
         debug_assert_predicate_shape(&predicate);
-        Refinement {
-            predicate,
-            normal: NormalFormCache::default(),
-        }
+        Refinement { predicate }
     }
 
     /// Construct a refinement **deliberately sharing** an existing predicate
@@ -6308,8 +7332,11 @@ impl Refinement {
     /// "this predicate did not exist before", this says "this predicate already
     /// exists and I mean to alias it". Together they are the only two spellings —
     /// a `Refinement { predicate }` literal states neither.
-    pub fn sharing(predicate: &Rc<TypedExpr>) -> Self {
-        Refinement::born(Rc::clone(predicate))
+    pub fn sharing(predicate: &Rc<HeldTerm>) -> Self {
+        debug_assert_predicate_shape(predicate);
+        Refinement {
+            predicate: Rc::clone(predicate),
+        }
     }
 
     /// The [`PredicateId`] of this refinement's predicate term.
@@ -6428,13 +7455,756 @@ impl Ord for Refinement {
 /// in this order. Two nominal declarations order by
 /// [`NominalDecl::term_order`](crate::ccl::nominal::NominalDecl::term_order).
 pub fn cmp_term_modulo_ty_slots(a: &TypedExpr, b: &TypedExpr) -> std::cmp::Ordering {
-    cmp_term_modulo_ty_slots_go(a, b, &mut Vec::new())
+    cmp_term_modulo_ty_slots_go(a, b, &mut TermEq::default())
 }
 
 /// Whether `a` and `b` are structurally equal with their type slots skipped:
 /// [`cmp_term_modulo_ty_slots`] answers `Equal`.
 pub fn eq_term_modulo_ty_slots(a: &TypedExpr, b: &TypedExpr) -> bool {
     cmp_term_modulo_ty_slots(a, b).is_eq()
+}
+
+/// What a free read of a binder stands for in a comparison under definitions
+/// ([`eq_term_under_definitions`]): the binder's definition, or `None` for a binder it leaves as
+/// read.
+pub(crate) type Definitions<'d> = dyn Fn(&crate::ccl::Name) -> Option<&'d TypedExpr> + 'd;
+
+/// Whether `a` and `b` are equal under `definitions`: [`eq_term_modulo_ty_slots`], with a free
+/// read of a binder `definitions` defines comparing as its definition, so a term reading the
+/// binder and the same term with the definition discharged compare equal. The definitions read no
+/// binder the compared terms introduce.
+///
+/// Two reads of distinct binders compare their definitions once per pair of binders, so a
+/// comparison costs at most the size of the terms compared plus that of each pair of
+/// definitions, however many reads share a definition.
+pub(crate) fn eq_term_under_definitions<'d>(
+    a: &TypedExpr,
+    b: &TypedExpr,
+    definitions: &'d Definitions<'d>,
+) -> bool {
+    cmp_term_modulo_ty_slots_go(
+        a,
+        b,
+        &mut TermEq {
+            definitions: Some(definitions),
+            ..TermEq::default()
+        },
+    )
+    .is_eq()
+}
+
+/// Whether `a` and `b` are equal under `definitions`: alpha-equivalent ([`BinderNames::Alpha`]),
+/// with each free read of a binder `definitions` defines standing for its definition
+/// ([`type_eq_go`]).
+pub(crate) fn type_eq_under_definitions<'d>(
+    a: &'d Type,
+    b: &'d Type,
+    definitions: &'d Definitions<'d>,
+) -> bool {
+    type_eq_go(
+        a,
+        b,
+        &mut TermEq {
+            names: BinderNames::Alpha,
+            definitions: Some(definitions),
+            ..TermEq::default()
+        },
+    )
+}
+
+/// Whether `a` and `b` are alpha-equivalent: equal with each binder one names differently from
+/// the other paired with the other's ([`type_eq_under_definitions`], defining no binder).
+pub(crate) fn alpha_eq(a: &Type, b: &Type) -> bool {
+    type_eq_under_definitions(a, b, &|_| None)
+}
+
+/// A definition a held term reads ([`type_eq_reading`]): its binder, the definition, and the
+/// binders it is raised by.
+pub(crate) type LetReadDefinition = (crate::ccl::Name, Rc<HeldTerm>, u32);
+
+/// Whether `a` and `b` are alpha-equivalent, where each side's held terms read the definitions
+/// its reads give, each by its binder, the definition and the binders it is raised by there
+/// ([`TermHasher::reading`] hashes them alike).
+pub(crate) fn type_eq_reading(
+    a: &Type,
+    a_reads: &[LetReadDefinition],
+    b: &Type,
+    b_reads: &[LetReadDefinition],
+) -> bool {
+    fn lets(
+        reads: &[LetReadDefinition],
+        depth: u32,
+    ) -> Vec<(crate::ccl::Name, &Rc<HeldTerm>, u32)> {
+        reads
+            .iter()
+            .map(|(n, d, by)| (n.clone(), d, depth - by))
+            .collect()
+    }
+    let none = |_: &crate::ccl::Name| None;
+    let depth = |reads: &[LetReadDefinition]| reads.iter().map(|(_, _, by)| *by).max().unwrap_or(0);
+    let (left_depth, right_depth) = (depth(a_reads), depth(b_reads));
+    type_eq_go(
+        a,
+        b,
+        &mut TermEq {
+            names: BinderNames::Alpha,
+            definitions: Some(&none),
+            left_lets: lets(a_reads, left_depth),
+            right_lets: lets(b_reads, right_depth),
+            left_depth,
+            right_depth,
+            ..TermEq::default()
+        },
+    )
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        let none = |_: &crate::ccl::Name| None;
+        let mut cx = TermEq {
+            definitions: Some(&none),
+            ..TermEq::default()
+        };
+        let equal = type_eq_go(self, other, &mut cx);
+        // Equal types hash alike. Types equal as spelled do by construction, so the check runs
+        // where the comparison read a definition to equate two spellings.
+        #[cfg(debug_assertions)]
+        if equal && cx.read_through {
+            let hash = |t: &Type| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                t.hash(&mut h);
+                h.finish()
+            };
+            assert_eq!(
+                hash(self),
+                hash(other),
+                "types equal through a definition hash apart:\n  {self}\n  {other}"
+            );
+        }
+        equal
+    }
+}
+
+impl Eq for Type {}
+
+impl std::hash::Hash for Type {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        type_hash_go(self, &mut TermHasher::default(), state);
+    }
+}
+
+/// How a comparison takes the names two types give the binders around a part they share.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BinderNames {
+    /// Spelled alike, as `Type`'s `==` and hash take them: a binder pairs with no other.
+    #[default]
+    Exact,
+    /// Each side's name for a binder pairs with the other's: alpha-equivalence.
+    Alpha,
+}
+
+/// The comparison of two types, for `Type`'s `==` and [`type_eq_under_definitions`] alike.
+///
+/// A type `let` stands for its body with its definition read at each read of its binder. A
+/// refinement is a set of predicates, each compared by its normal form. A held term's free read
+/// of a defined binder compares as the definition ([`TermEq`]). The positions two types share
+/// are those [`crate::ccl::pairing::paired_parts`] pairs, with the binders around them taken as
+/// `cx.names` says. [`type_hash_go`] hashes what [`BinderNames::Exact`] compares.
+fn type_eq_go<'d>(a: &'d Type, b: &'d Type, cx: &mut TermEq<'d>) -> bool {
+    use Type as T;
+    if let T::Let(l) = a {
+        cx.left_lets
+            .push((l.name.clone(), &l.definition, cx.left_depth));
+        let equal = type_eq_go(&l.body, b, cx);
+        cx.left_lets.pop();
+        return equal;
+    }
+    if let T::Let(l) = b {
+        cx.right_lets
+            .push((l.name.clone(), &l.definition, cx.right_depth));
+        let equal = type_eq_go(a, &l.body, cx);
+        cx.right_lets.pop();
+        return equal;
+    }
+    match (a, b) {
+        (T::Refinement(x, xs), T::Refinement(y, ys)) => {
+            // A set: each member of either is one of the other's.
+            type_eq_go(x, y, cx)
+                && xs
+                    .iter()
+                    .all(|r| ys.iter().any(|q| refinement_eq_go(r, q, cx)))
+                && ys
+                    .iter()
+                    .all(|q| xs.iter().any(|r| refinement_eq_go(r, q, cx)))
+        }
+        (T::Refinement(..), _) | (_, T::Refinement(..)) => false,
+        (T::WitnessProjection(x), T::WitnessProjection(y)) => {
+            x.position == y.position
+                && ((Rc::ptr_eq(&x.term, &y.term) && cx.reads_alike()) || {
+                    let xn = cx.held_read(&x.term, true);
+                    let yn = cx.held_read(&y.term, false);
+                    cmp_term_modulo_ty_slots_go(&xn, &yn, cx).is_eq()
+                })
+        }
+        (T::FamilyApp(x), T::FamilyApp(y)) => {
+            x.param == y.param
+                && x.args.len() == y.args.len()
+                && x.args
+                    .iter()
+                    .zip(&y.args)
+                    .all(|(p, q)| cmp_term_modulo_ty_slots_go(&p.term, &q.term, cx).is_eq())
+        }
+        (T::BoundedHole(x), T::BoundedHole(y)) => type_eq_go(x, y, cx),
+        _ => match crate::ccl::pairing::paired_parts(a, b) {
+            Some(pairing) => {
+                pairing.exact
+                    && (cx.names == BinderNames::Alpha || spelled_alike(a, b))
+                    && pairing.parts.iter().all(|part| part_eq(a, b, part, cx))
+            }
+            None => leaf_eq(a, b),
+        },
+    }
+}
+
+/// Whether the part `part` of `a` and `b` is one part ([`type_eq_go`]), under the binders each
+/// puts around it. A witness is one by its identity ([`Witness`]'s `==`), so the types one
+/// witness ranges over on both sides are no part to compare, and exact names compare a funkind
+/// by its witnesses' identity alone ([`spelled_alike`]).
+fn part_eq<'d>(
+    a: &'d Type,
+    b: &'d Type,
+    part: &crate::ccl::pairing::Paired<'d>,
+    cx: &mut TermEq<'d>,
+) -> bool {
+    use crate::ccl::pairing::PartAt;
+    if let PartAt::Candidate { witness, .. } = part.at
+        && (cx.names == BinderNames::Exact || same_witness(a, b, witness))
+    {
+        return true;
+    }
+    let paired = cx.pairs.len();
+    if cx.names == BinderNames::Alpha {
+        for (l, r) in &part.binders {
+            if let (Some(l), Some(r)) = (l, r) {
+                cx.pairs.push(((*l).clone(), (*r).clone()));
+            }
+        }
+    }
+    let (crossed_left, crossed_right) = (
+        indexed_binders_over(a, &part.at),
+        indexed_binders_over(b, &part.at),
+    );
+    cx.left_depth += crossed_left;
+    cx.right_depth += crossed_right;
+    let equal = type_eq_go(part.left, part.right, cx);
+    cx.left_depth -= crossed_left;
+    cx.right_depth -= crossed_right;
+    cx.pairs.truncate(paired);
+    equal
+}
+
+/// Whether the functions `a` and `b` hold one witness at position `w` of their Σ binders.
+fn same_witness(a: &Type, b: &Type, w: usize) -> bool {
+    match (a, b) {
+        (Type::Fun { fun_kind: x, .. }, Type::Fun { fun_kind: y, .. }) => x
+            .witnesses()
+            .get(w)
+            .is_some_and(|v| y.witnesses().get(w) == Some(v)),
+        _ => false,
+    }
+}
+
+/// Whether two types [`crate::ccl::pairing::paired_parts`] pairs spell alike what
+/// [`BinderNames::Exact`] compares beside their parts: one variant, binders named alike, one
+/// funkind, and fields and tags in one order, as [`type_hash_go`] hashes them.
+fn spelled_alike(a: &Type, b: &Type) -> bool {
+    use Type as T;
+    match (a, b) {
+        (
+            T::Fun {
+                binder: b1,
+                fun_kind: k1,
+                ..
+            },
+            T::Fun {
+                binder: b2,
+                fun_kind: k2,
+                ..
+            },
+        ) => b1 == b2 && k1 == k2,
+        (T::DepTuple(x), T::DepTuple(y)) => x.iter().zip(y).all(|((n, _), (m, _))| n == m),
+        (T::Family { binders: x, .. }, T::Family { binders: y, .. }) => {
+            x.iter().zip(y).all(|((n, _), (m, _))| n == m)
+        }
+        (T::Record(x), T::Record(y)) => x.iter().zip(y).all(|((l, _), (m, _))| l == m),
+        (T::Variant(x, _), T::Variant(y, _)) => x.iter().zip(y).all(|((l, _), (m, _))| l == m),
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
+}
+
+/// Whether two types [`crate::ccl::pairing::paired_parts`] pairs nothing of are equal: two
+/// leaves stating one thing. A generalized type is closed, reading no `let` either side is
+/// under, so it compares as it stands.
+fn leaf_eq(a: &Type, b: &Type) -> bool {
+    use Type as T;
+    match a {
+        T::Base(x) => matches!(b, T::Base(y) if x == y),
+        T::UIntRange(x) => matches!(b, T::UIntRange(y) if x == y),
+        T::Hole => matches!(b, T::Hole),
+        T::Txn => matches!(b, T::Txn),
+        T::SharedHole(x) => matches!(b, T::SharedHole(y) if x == y),
+        T::BarrierHole(x) => matches!(b, T::BarrierHole(y) if x == y),
+        T::Infer(x) => matches!(b, T::Infer(y) if x == y),
+        T::Undetermined(x) => matches!(b, T::Undetermined(y) if x == y),
+        T::DataSource(x) => matches!(b, T::DataSource(y) if x == y),
+        T::ChanDom(x, l) => matches!(b, T::ChanDom(y, m) if x == y && l == m),
+        T::WitnessRef(x) => matches!(b, T::WitnessRef(y) if x == y),
+        T::Param(x) => matches!(b, T::Param(y) if x == y),
+        T::Poly(x) => matches!(b, T::Poly(y) if x == y),
+        // Types of corresponding shapes pair, and the walk takes the rest before pairing.
+        T::Fun { .. }
+        | T::Tuple(_)
+        | T::OpenTuple(_)
+        | T::DepTuple(_)
+        | T::Record(_)
+        | T::Variant(..)
+        | T::Nominal(..)
+        | T::History { .. }
+        | T::Split { .. }
+        | T::Family { .. }
+        | T::Let(_)
+        | T::Refinement(..)
+        | T::BoundedHole(_)
+        | T::WitnessProjection(_)
+        | T::FamilyApp(_) => false,
+    }
+}
+
+/// `Type`'s hash, over the parts [`type_eq_go`] compares with [`BinderNames::Exact`]: a type `let` hashes as its
+/// body, and a held term reading its binder as the term with the definition discharged
+/// ([`TermHasher`]).
+fn type_hash_go<H: std::hash::Hasher>(t: &Type, hx: &mut TermHasher, state: &mut H) {
+    use Type as T;
+    use std::hash::Hash;
+    fn under<H: std::hash::Hasher>(t: &Type, n: u32, hx: &mut TermHasher, state: &mut H) {
+        hx.descend(n);
+        type_hash_go(t, hx, state);
+        hx.ascend(n);
+    }
+    if let T::Let(l) = t {
+        hx.enter_let(l);
+        type_hash_go(&l.body, hx, state);
+        hx.exit_let();
+        return;
+    }
+    std::mem::discriminant(t).hash(state);
+    match t {
+        T::Fun {
+            binder,
+            fun_kind,
+            domain,
+            codomain,
+            capabilities,
+        } => {
+            binder.hash(state);
+            fun_kind.hash(state);
+            capabilities.hash(state);
+            type_hash_go(domain, hx, state);
+            under(codomain, 1, hx, state);
+        }
+        T::Tuple(x) | T::OpenTuple(x) | T::Nominal(_, x) => {
+            if let T::Nominal(d, _) = t {
+                d.hash(state);
+            }
+            x.len().hash(state);
+            for s in x {
+                type_hash_go(s, hx, state);
+            }
+        }
+        T::DepTuple(x) => {
+            x.len().hash(state);
+            for (k, (n, s)) in x.iter().enumerate() {
+                n.hash(state);
+                under(s, k as u32, hx, state);
+            }
+        }
+        T::Record(x) => {
+            x.len().hash(state);
+            for (l, s) in x {
+                l.hash(state);
+                type_hash_go(s, hx, state);
+            }
+        }
+        T::Variant(x, o) => {
+            o.hash(state);
+            x.len().hash(state);
+            for (l, s) in x {
+                l.hash(state);
+                type_hash_go(s, hx, state);
+            }
+        }
+        T::Refinement(x, xs) => {
+            type_hash_go(x, hx, state);
+            // A set, so each distinct member hash once, in any order.
+            let mut members: Vec<u64> = xs.iter().map(|r| hx.held_term(&r.predicate)).collect();
+            members.sort_unstable();
+            members.dedup();
+            members.len().hash(state);
+            members
+                .iter()
+                .fold(0u64, |acc, h| acc.wrapping_add(*h))
+                .hash(state);
+        }
+        T::BoundedHole(x) => type_hash_go(x, hx, state),
+        T::History {
+            function,
+            history_kind,
+        } => {
+            history_kind.hash(state);
+            type_hash_go(function, hx, state);
+        }
+        T::WitnessProjection(p) => {
+            p.position.hash(state);
+            state.write_u64(hx.held_term(&p.term));
+        }
+        T::FamilyApp(f) => {
+            f.param.hash(state);
+            for a in &f.args {
+                state.write_u64(hx.term(&a.term));
+            }
+        }
+        T::Family { binders, body } => {
+            binders.len().hash(state);
+            for (n, d) in binders {
+                n.hash(state);
+                type_hash_go(d, hx, state);
+            }
+            under(body, binders.len() as u32, hx, state);
+        }
+        T::Split { input, output } => {
+            type_hash_go(input, hx, state);
+            type_hash_go(output, hx, state);
+        }
+        T::Base(x) => x.hash(state),
+        T::UIntRange(x) => x.hash(state),
+        T::Hole | T::Txn => {}
+        T::SharedHole(x) => x.hash(state),
+        T::BarrierHole(x) => x.hash(state),
+        T::Infer(x) => x.hash(state),
+        T::Undetermined(x) => x.hash(state),
+        T::DataSource(x) => x.hash(state),
+        T::ChanDom(x, l) => {
+            x.hash(state);
+            l.hash(state);
+        }
+        T::WitnessRef(x) => x.hash(state),
+        T::Param(x) => x.hash(state),
+        T::Poly(x) => x.hash(state),
+        T::Let(_) => unreachable!("a type `let` hashes as its body"),
+    }
+}
+
+/// A type `let`'s binder and definition, as a substitution's `let` exit holds them
+/// ([`crate::ccl::subst::Subst::force_refinement_holding`]).
+pub(crate) type TypeLetExit = (crate::ccl::Name, Rc<HeldTerm>);
+
+/// Whether `x`, read under the type `let`s `x_lets`, and `y`, read under `y_lets`, are one
+/// refinement: each side's read of a binder its `let`s define compares as the definition
+/// ([`refinement_eq_go`]). The `let`s stand where the refinements do, outermost first.
+pub(crate) fn refinement_eq_under_lets(
+    x: &Refinement,
+    x_lets: &[TypeLetExit],
+    y: &Refinement,
+    y_lets: &[TypeLetExit],
+) -> bool {
+    if x_lets.is_empty() && y_lets.is_empty() {
+        return x == y;
+    }
+    let none = |_: &crate::ccl::Name| None;
+    let mut cx = TermEq {
+        definitions: Some(&none),
+        ..TermEq::default()
+    };
+    cx.left_lets = x_lets.iter().map(|(n, d)| (n.clone(), d, 0)).collect();
+    cx.right_lets = y_lets.iter().map(|(n, d)| (n.clone(), d, 0)).collect();
+    refinement_eq_go(x, y, &mut cx)
+}
+
+/// [`type_eq_under_definitions`] for two refinements.
+pub(crate) fn refinement_eq_under_definitions<'d>(
+    x: &Refinement,
+    y: &Refinement,
+    definitions: &'d Definitions<'d>,
+) -> bool {
+    refinement_eq_go(
+        x,
+        y,
+        &mut TermEq {
+            names: BinderNames::Alpha,
+            definitions: Some(definitions),
+            ..TermEq::default()
+        },
+    )
+}
+
+fn refinement_eq_go(x: &Refinement, y: &Refinement, cx: &mut TermEq<'_>) -> bool {
+    (Rc::ptr_eq(&x.predicate, &y.predicate) && cx.reads_alike()) || {
+        let xn = cx.held_read(&x.predicate, true);
+        let yn = cx.held_read(&y.predicate, false);
+        cmp_term_modulo_ty_slots_go(&xn, &yn, cx).is_eq()
+    }
+}
+
+/// The binders of `ty` an index counts at its part `at` ([`children_under_indexed_binders`]).
+fn indexed_binders_over(ty: &Type, at: &crate::ccl::pairing::PartAt) -> u32 {
+    use crate::ccl::pairing::PartAt;
+    match (ty, at) {
+        (Type::Fun { .. }, PartAt::Codomain) => 1,
+        (Type::DepTuple(_), PartAt::Component(k)) => *k as u32,
+        (Type::Family { binders, .. }, PartAt::FamilyBody) => binders.len() as u32,
+        _ => 0,
+    }
+}
+
+/// What an [`eq_term_modulo_ty_slots`] comparison carries down.
+#[derive(Default)]
+struct TermEq<'d> {
+    /// How a type comparison takes the binders around a shared part ([`type_eq_go`]).
+    names: BinderNames,
+    /// The binders the two sides have introduced ([`cmp_paired_refs`]).
+    pairs: Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    /// What a free read stands for ([`eq_term_under_definitions`]).
+    definitions: Option<&'d Definitions<'d>>,
+    /// The type `let`s each side's type walk is under, innermost last
+    /// ([`type_eq_under_definitions`]). They come before `definitions`: a copy of a part whose
+    /// `let`s a substitution rewrote binds a binder `definitions` defines otherwise.
+    /// Each with the binders its indices count around the `let`.
+    left_lets: Vec<(crate::ccl::Name, &'d Rc<HeldTerm>, u32)>,
+    right_lets: Vec<(crate::ccl::Name, &'d Rc<HeldTerm>, u32)>,
+    /// The binders an index counts around the position each side's type walk has reached.
+    left_depth: u32,
+    right_depth: u32,
+    /// The pairs of definitions compared so far, each raised as it was, by outcome.
+    compared: std::collections::HashMap<(*const TypedExpr, *const TypedExpr, u32, u32), bool>,
+    /// Each supplied definition as a read compares it ([`TermEq::read_definition`]), by the
+    /// definition and its side. A type `let`'s definition keeps its reads itself
+    /// ([`HeldTerm::read_through`]).
+    read: std::collections::HashMap<(*const TypedExpr, bool), Rc<TypedExpr>>,
+    /// Whether the comparison found two parts equal by reading a definition, where their
+    /// spellings differ. Only then can a hash that follows the spelling disagree, which
+    /// `Type`'s `==` checks in a debug build.
+    read_through: bool,
+}
+
+/// A definition a comparison reads: a type `let`'s, or one the caller supplies
+/// ([`TermEq::definitions`]).
+#[derive(Clone, Copy)]
+enum DefinitionTerm<'d> {
+    Let(&'d Rc<HeldTerm>),
+    Supplied(&'d TypedExpr),
+}
+
+impl<'d> DefinitionTerm<'d> {
+    fn term(self) -> &'d TypedExpr {
+        match self {
+            DefinitionTerm::Let(d) => d.term(),
+            DefinitionTerm::Supplied(d) => d,
+        }
+    }
+}
+
+/// A free read's definition in a comparison ([`TermEq::definition_of`]): the definition, and the
+/// binders an index counts between its `let` and the read.
+struct ReadDefinition<'d> {
+    definition: DefinitionTerm<'d>,
+    by: u32,
+    /// How many of its side's `let`s stand outside the definition's own: the ones it can read.
+    /// `None` for a definition the caller supplies ([`TermEq::definitions`]).
+    context: Option<usize>,
+}
+
+impl<'d> TermEq<'d> {
+    /// Whether the `let`s outside a definition on the left, the first `left` of them, and those
+    /// outside one on the right are the same `let`s: one name each, bound to one definition at
+    /// one depth. A definition the caller supplies reads the caller's definitions alone, which
+    /// are one on both sides.
+    fn same_context(&self, left: Option<usize>, right: Option<usize>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(l), Some(r)) => {
+                l == r
+                    && self.left_lets[..l]
+                        .iter()
+                        .zip(&self.right_lets[..r])
+                        .all(|((m, d, a), (n, e, b))| m == n && Rc::ptr_eq(d, e) && a == b)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether one term reads alike on both sides: the `let`s each side is under are the same
+    /// ([`Self::same_context`]), and each binder the sides introduced has one name on both.
+    fn reads_alike(&self) -> bool {
+        self.same_context(Some(self.left_lets.len()), Some(self.right_lets.len()))
+            && self.pairs.iter().all(|(l, r)| l == r)
+    }
+
+    /// The definition of `e` when it is a free read of a defined binder. `left` says which side
+    /// of the pairing `e` is on.
+    fn definition_of(&self, e: &TypedExpr, left: bool) -> Option<ReadDefinition<'d>> {
+        let TypedExprNode::Var(n) = &e.node else {
+            return None;
+        };
+        self.definition_of_name(n, left)
+    }
+
+    /// [`Self::definition_of`] for a free read of `n`.
+    fn definition_of_name(&self, n: &crate::ccl::Name, left: bool) -> Option<ReadDefinition<'d>> {
+        let bound = self
+            .pairs
+            .iter()
+            .any(|(l, r)| if left { l == n } else { r == n });
+        if bound {
+            return None;
+        }
+        let (lets, depth) = if left {
+            (&self.left_lets, self.left_depth)
+        } else {
+            (&self.right_lets, self.right_depth)
+        };
+        match lets.iter().rposition(|(l, _, _)| l == n) {
+            Some(i) => {
+                let (_, d, at) = lets[i];
+                Some(ReadDefinition {
+                    definition: DefinitionTerm::Let(d),
+                    by: depth - at,
+                    context: Some(i),
+                })
+            }
+            None => self.definitions?(n).map(|d| ReadDefinition {
+                definition: DefinitionTerm::Supplied(d),
+                by: 0,
+                context: None,
+            }),
+        }
+    }
+
+    /// What side `left` gives for a free read of `n`, as a held term read through its
+    /// definitions asks ([`HeldTerm::read_through`]).
+    fn defined(&self, n: &crate::ccl::Name, left: bool) -> Option<Defined<'d>> {
+        self.definition_of_name(n, left)
+            .map(|d| match d.definition {
+                DefinitionTerm::Let(h) => Defined::Let(Rc::clone(h), d.by),
+                DefinitionTerm::Supplied(t) => Defined::Supplied(t),
+            })
+    }
+
+    /// Whether `d`, standing `by` binders above `other`, equals `other` (`d_left` says which
+    /// side `d` is on). Its indices count the binders between, so it is raised by them. It
+    /// compares in normal form, as the terms reading it do.
+    fn definition_eq(&mut self, d: &ReadDefinition<'d>, other: &TypedExpr, d_left: bool) -> bool {
+        let d = self.read_definition(d, d_left);
+        if d_left {
+            cmp_term_modulo_ty_slots_go(&d, other, self).is_eq()
+        } else {
+            cmp_term_modulo_ty_slots_go(other, &d, self).is_eq()
+        }
+    }
+
+    /// Whether `a` and `b` are equal once a free read of a defined binder on either side is
+    /// its definition, when either side is one; `None` when neither is.
+    fn eq_through_definitions(&mut self, a: &TypedExpr, b: &TypedExpr) -> Option<bool> {
+        self.definitions?;
+        let (da, db) = (self.definition_of(a, true), self.definition_of(b, false));
+        // One binder read free on both sides is one value. A binder both sides define compares
+        // by its definitions, each read where its own `let` stands: one shared definition term
+        // can read a binder one side defines and the other reads free.
+        if let (TypedExprNode::Var(x), TypedExprNode::Var(y)) = (&a.node, &b.node)
+            && cmp_paired_refs(&self.pairs, x, y).is_eq()
+            && da.is_none()
+            && db.is_none()
+        {
+            return Some(true);
+        }
+        let equal = match (da, db) {
+            (None, None) => None,
+            (Some(d), None) => Some(self.definition_eq(&d, b, true)),
+            (None, Some(d)) => Some(self.definition_eq(&d, a, false)),
+            // One definition read at one depth under the same `let`s on both sides is one
+            // value: everything it can read is defined alike.
+            (Some(da), Some(db))
+                if std::ptr::eq(da.definition.term(), db.definition.term())
+                    && da.by == db.by
+                    && self.same_context(da.context, db.context) =>
+            {
+                Some(true)
+            }
+            (Some(da), Some(db)) => {
+                let key = (
+                    std::ptr::from_ref(da.definition.term()),
+                    std::ptr::from_ref(db.definition.term()),
+                    da.by,
+                    db.by,
+                );
+                if let Some(&known) = self.compared.get(&key) {
+                    return Some(known);
+                }
+                // Definitions read no binder either side introduces, so the outcome holds under
+                // any pairing.
+                let pairs = std::mem::take(&mut self.pairs);
+                let (ra, rb) = (
+                    self.read_definition(&da, true),
+                    self.read_definition(&db, false),
+                );
+                let equal = cmp_term_modulo_ty_slots_go(&ra, &rb, self).is_eq();
+                self.pairs = pairs;
+                self.compared.insert(key, equal);
+                Some(equal)
+            }
+        };
+        self.read_through |= equal == Some(true);
+        equal
+    }
+}
+
+impl<'d> TermEq<'d> {
+    /// The definition `d` as a read standing `by` binders below its `let` on side `left`
+    /// compares it: raised by those binders, which its indices count, and in normal form, the
+    /// form the terms reading it compare in, read through side `left`'s definitions
+    /// ([`HeldTerm::read_through`]).
+    fn read_definition(&mut self, d: &ReadDefinition<'d>, left: bool) -> Rc<TypedExpr> {
+        let this = &*self;
+        let mut scope = |n: &crate::ccl::Name| this.defined(n, left);
+        match d.definition {
+            DefinitionTerm::Let(h) => h.read_through(d.by, &mut scope),
+            DefinitionTerm::Supplied(t) => {
+                let key = (std::ptr::from_ref(t), left);
+                if let Some(read) = self.read.get(&key) {
+                    return Rc::clone(read);
+                }
+                let read = read_defined(Defined::Supplied(t), &mut scope, &mut Lookups::new());
+                self.read.insert(key, Rc::clone(&read));
+                read
+            }
+        }
+    }
+
+    /// The held term `held` as side `left` compares it: its normal form, read through side
+    /// `left`'s definitions where a reduction takes a read of one apart
+    /// ([`HeldTerm::read_through`]).
+    fn held_read(&mut self, held: &HeldTerm, left: bool) -> Rc<TypedExpr> {
+        let (normal, taken_apart) = held.normal_taking_apart();
+        if !taken_apart
+            .iter()
+            .any(|n| self.definition_of_name(n, left).is_some())
+        {
+            return normal;
+        }
+        self.read_through = true;
+        let this = &*self;
+        held.read_through(0, &mut |n| this.defined(n, left))
+    }
 }
 
 /// Binders the two sides of a [`cmp_term_modulo_ty_slots`] comparison have
@@ -6468,16 +8238,12 @@ fn first_unequal(mut orders: impl Iterator<Item = std::cmp::Ordering>) -> std::c
 }
 
 /// Compare `xs` and `ys` pairwise, a shorter list before a longer one.
-fn cmp_term_lists(
-    xs: &[TypedExpr],
-    ys: &[TypedExpr],
-    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
-) -> std::cmp::Ordering {
+fn cmp_term_lists(xs: &[TypedExpr], ys: &[TypedExpr], cx: &mut TermEq<'_>) -> std::cmp::Ordering {
     xs.len().cmp(&ys.len()).then_with(|| {
         first_unequal(
             xs.iter()
                 .zip(ys)
-                .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, pairs)),
+                .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, cx)),
         )
     })
 }
@@ -6486,32 +8252,32 @@ fn cmp_term_lists(
 fn cmp_optional_terms(
     x: Option<&TypedExpr>,
     y: Option<&TypedExpr>,
-    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    cx: &mut TermEq<'_>,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     match (x, y) {
         (None, None) => Equal,
         (None, Some(_)) => Less,
         (Some(_), None) => Greater,
-        (Some(x), Some(y)) => cmp_term_modulo_ty_slots_go(x, y, pairs),
+        (Some(x), Some(y)) => cmp_term_modulo_ty_slots_go(x, y, cx),
     }
 }
 
 /// Compare `children` pairwise with `(l, r)` paired over them, restoring `pairs` before
 /// returning: the binder scopes over these children and nothing after them.
 fn cmp_under_binder(
-    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    cx: &mut TermEq<'_>,
     l: &crate::ccl::Name,
     r: &crate::ccl::Name,
     children: &[(&TypedExpr, &TypedExpr)],
 ) -> std::cmp::Ordering {
-    pairs.push((l.clone(), r.clone()));
+    cx.pairs.push((l.clone(), r.clone()));
     let order = first_unequal(
         children
             .iter()
-            .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, pairs)),
+            .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, cx)),
     );
-    pairs.pop();
+    cx.pairs.pop();
     order
 }
 
@@ -6528,11 +8294,7 @@ fn cmp_under_binder(
 /// normal form, as every predicate does (`src/ccl/design/type-inference.md`, "Predicates are
 /// compared by normal form"). The mutual recursion terminates on tree shape: predicates are
 /// acyclic `Rc<TypedExpr>`s, so a cast target cannot contain the term comparing it.
-fn cmp_cast_target_predicates(
-    t1: &Type,
-    t2: &Type,
-    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
-) -> std::cmp::Ordering {
+fn cmp_cast_target_predicates(t1: &Type, t2: &Type, cx: &mut TermEq<'_>) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     match (
         ccl_utils::cast_target_refinement(t1),
@@ -6542,25 +8304,33 @@ fn cmp_cast_target_predicates(
         (None, Some(_)) => Less,
         (Some(_), None) => Greater,
         (Some(s1), Some(s2)) => s1.len().cmp(&s2.len()).then_with(|| {
-            let sorted =
-                |set: &RefinementSet, mut own: Vec<(crate::ccl::Name, crate::ccl::Name)>| {
-                    let mut normals: Vec<Rc<TypedExpr>> =
-                        set.iter().map(Refinement::normal).collect();
-                    normals.sort_by(|x, y| cmp_term_modulo_ty_slots_go(x, y, &mut own));
-                    normals
+            let sorted = |set: &RefinementSet, pairs: Vec<(crate::ccl::Name, crate::ccl::Name)>| {
+                let mut normals: Vec<Rc<TypedExpr>> = set.iter().map(Refinement::normal).collect();
+                let mut own = TermEq {
+                    pairs,
+                    ..TermEq::default()
                 };
+                normals.sort_by(|x, y| cmp_term_modulo_ty_slots_go(x, y, &mut own));
+                normals
+            };
             let left = sorted(
                 &s1,
-                pairs.iter().map(|(l, _)| (l.clone(), l.clone())).collect(),
+                cx.pairs
+                    .iter()
+                    .map(|(l, _)| (l.clone(), l.clone()))
+                    .collect(),
             );
             let right = sorted(
                 &s2,
-                pairs.iter().map(|(_, r)| (r.clone(), r.clone())).collect(),
+                cx.pairs
+                    .iter()
+                    .map(|(_, r)| (r.clone(), r.clone()))
+                    .collect(),
             );
             first_unequal(
                 left.iter()
                     .zip(&right)
-                    .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, pairs)),
+                    .map(|(x, y)| cmp_term_modulo_ty_slots_go(x, y, cx)),
             )
         }),
     }
@@ -6815,14 +8585,28 @@ fn cmp_pattern_heads(
 fn cmp_term_modulo_ty_slots_go(
     a: &TypedExpr,
     b: &TypedExpr,
-    pairs: &mut Vec<(crate::ccl::Name, crate::ccl::Name)>,
+    cx: &mut TermEq<'_>,
 ) -> std::cmp::Ordering {
+    // A comparison reading definitions decides equality alone, which is all its callers ask
+    // ([`eq_term_under_definitions`]): two terms that differ once a read is its definition
+    // order as the plain terms do, or one way where those are alike.
+    if let Some(equal) = cx.eq_through_definitions(a, b) {
+        if equal {
+            return Equal;
+        }
+        let plain = cmp_term_modulo_ty_slots(a, b);
+        return if plain.is_eq() {
+            std::cmp::Ordering::Less
+        } else {
+            plain
+        };
+    }
     use TypedExprNode as N;
     use std::cmp::Ordering::Equal;
     match (&a.node, &b.node) {
         (N::Lit(x), N::Lit(y)) => x.cmp(y),
-        (N::Var(x), N::Var(y)) => cmp_paired_refs(pairs, x, y),
-        (N::Borrow(x), N::Borrow(y)) => cmp_term_modulo_ty_slots_go(x, y, pairs),
+        (N::Var(x), N::Var(y)) => cmp_paired_refs(&cx.pairs, x, y),
+        (N::Borrow(x), N::Borrow(y)) => cmp_term_modulo_ty_slots_go(x, y, cx),
         (N::Builtin(x), N::Builtin(y)) => cmp_builtins(x, y),
         (
             N::TraitFn {
@@ -6855,8 +8639,8 @@ fn cmp_term_modulo_ty_slots_go(
                 function: f2,
                 argument: a2,
             },
-        ) => cmp_term_modulo_ty_slots_go(f1, f2, pairs)
-            .then_with(|| cmp_term_modulo_ty_slots_go(a1, a2, pairs)),
+        ) => cmp_term_modulo_ty_slots_go(f1, f2, cx)
+            .then_with(|| cmp_term_modulo_ty_slots_go(a1, a2, cx)),
         (
             N::Cast {
                 value: v1,
@@ -6866,8 +8650,8 @@ fn cmp_term_modulo_ty_slots_go(
                 value: v2,
                 target: t2,
             },
-        ) => cmp_term_modulo_ty_slots_go(v1, v2, pairs)
-            .then_with(|| cmp_cast_target_predicates(t1, t2, pairs)),
+        ) => cmp_term_modulo_ty_slots_go(v1, v2, cx)
+            .then_with(|| cmp_cast_target_predicates(t1, t2, cx)),
         (
             N::BinOp {
                 left: l1,
@@ -6883,11 +8667,11 @@ fn cmp_term_modulo_ty_slots_go(
             },
         ) => o1
             .cmp(o2)
-            .then_with(|| cmp_term_modulo_ty_slots_go(l1, l2, pairs))
-            .then_with(|| cmp_term_modulo_ty_slots_go(r1, r2, pairs)),
+            .then_with(|| cmp_term_modulo_ty_slots_go(l1, l2, cx))
+            .then_with(|| cmp_term_modulo_ty_slots_go(r1, r2, cx)),
         (N::UnaryOp(k1, e1, _), N::UnaryOp(k2, e2, _)) => k1
             .cmp(k2)
-            .then_with(|| cmp_term_modulo_ty_slots_go(e1, e2, pairs)),
+            .then_with(|| cmp_term_modulo_ty_slots_go(e1, e2, cx)),
         (
             N::Lambda {
                 params: p1,
@@ -6901,14 +8685,14 @@ fn cmp_term_modulo_ty_slots_go(
             // them in order and compare the bodies under the pairing, so the bodies'
             // references to them match by position.
         ) => p1.len().cmp(&p2.len()).then_with(|| {
-            let base = pairs.len();
-            pairs.extend(
+            let base = cx.pairs.len();
+            cx.pairs.extend(
                 p1.iter()
                     .zip(p2)
                     .map(|(a, b)| (a.name.clone(), b.name.clone())),
             );
-            let order = cmp_term_modulo_ty_slots_go(b1, b2, pairs);
-            pairs.truncate(base);
+            let order = cmp_term_modulo_ty_slots_go(b1, b2, cx);
+            cx.pairs.truncate(base);
             order
         }),
         (
@@ -6922,7 +8706,7 @@ fn cmp_term_modulo_ty_slots_go(
             },
         ) => k1
             .cmp(k2)
-            .then_with(|| cmp_term_modulo_ty_slots_go(i1, i2, pairs)),
+            .then_with(|| cmp_term_modulo_ty_slots_go(i1, i2, cx)),
         // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
         // `body`.
         (
@@ -6948,8 +8732,8 @@ fn cmp_term_modulo_ty_slots_go(
                 init: e2,
                 body: b2,
             },
-        ) => cmp_term_modulo_ty_slots_go(e1, e2, pairs)
-            .then_with(|| cmp_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])),
+        ) => cmp_term_modulo_ty_slots_go(e1, e2, cx)
+            .then_with(|| cmp_under_binder(cx, &bd1.name, &bd2.name, &[(b1, b2)])),
         (
             N::For {
                 position: p1,
@@ -6965,10 +8749,10 @@ fn cmp_term_modulo_ty_slots_go(
             },
             // The source is evaluated outside the loop; the position and target are bound over
             // the body.
-        ) => cmp_term_modulo_ty_slots_go(it1, it2, pairs).then_with(|| {
-            pairs.push(((**p1).clone(), (**p2).clone()));
-            let order = cmp_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)]);
-            pairs.pop();
+        ) => cmp_term_modulo_ty_slots_go(it1, it2, cx).then_with(|| {
+            cx.pairs.push(((**p1).clone(), (**p2).clone()));
+            let order = cmp_under_binder(cx, &t1.name, &t2.name, &[(b1, b2)]);
+            cx.pairs.pop();
             order
         }),
         (
@@ -6986,9 +8770,9 @@ fn cmp_term_modulo_ty_slots_go(
             },
             // The written name is a *use* of the binder the introduction made, so it
             // resolves through the pairing exactly as a `Feed`/`Define` name does.
-        ) => cmp_paired_refs(pairs, n1, n2)
-            .then_with(|| cmp_optional_terms(k1.as_deref(), k2.as_deref(), pairs))
-            .then_with(|| cmp_term_modulo_ty_slots_go(v1, v2, pairs)),
+        ) => cmp_paired_refs(&cx.pairs, n1, n2)
+            .then_with(|| cmp_optional_terms(k1.as_deref(), k2.as_deref(), cx))
+            .then_with(|| cmp_term_modulo_ty_slots_go(v1, v2, cx)),
         (
             N::Begin {
                 body: b1,
@@ -7000,14 +8784,14 @@ fn cmp_term_modulo_ty_slots_go(
             },
         ) => c1
             .cmp(c2)
-            .then_with(|| cmp_term_modulo_ty_slots_go(b1, b2, pairs)),
+            .then_with(|| cmp_term_modulo_ty_slots_go(b1, b2, cx)),
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Arguments(x), N::Arguments(y))
         | (N::Compose(x), N::Compose(y))
         | (N::Copair(x), N::Copair(y))
         | (N::DisjointJoin(x), N::DisjointJoin(y))
-        | (N::Realized { legs: x, .. }, N::Realized { legs: y, .. }) => cmp_term_lists(x, y, pairs),
+        | (N::Realized { legs: x, .. }, N::Realized { legs: y, .. }) => cmp_term_lists(x, y, cx),
         (
             N::Case {
                 scrutinee: s1,
@@ -7019,7 +8803,7 @@ fn cmp_term_modulo_ty_slots_go(
                 branches: br2,
                 refuted: r2,
             },
-        ) => cmp_optional_terms(s1.as_deref(), s2.as_deref(), pairs)
+        ) => cmp_optional_terms(s1.as_deref(), s2.as_deref(), cx)
             .then_with(|| r1.cmp(r2))
             .then_with(|| br1.len().cmp(&br2.len()))
             .then_with(|| {
@@ -7030,22 +8814,20 @@ fn cmp_term_modulo_ty_slots_go(
                         // both, so both compare under the pairing.
                         (Some(p), Some(q)) => cmp_pattern_heads(&p.head, &q.head).then_with(|| {
                             cmp_under_binder(
-                                pairs,
+                                cx,
                                 &p.binding.name,
                                 &q.binding.name,
                                 &[(&x.guard, &y.guard), (&x.body, &y.body)],
                             )
                         }),
-                        (None, None) => cmp_term_modulo_ty_slots_go(&x.guard, &y.guard, pairs)
-                            .then_with(|| cmp_term_modulo_ty_slots_go(&x.body, &y.body, pairs)),
+                        (None, None) => cmp_term_modulo_ty_slots_go(&x.guard, &y.guard, cx)
+                            .then_with(|| cmp_term_modulo_ty_slots_go(&x.body, &y.body, cx)),
                         (None, Some(_)) => Less,
                         (Some(_), None) => Greater,
                     }
                 }))
             }),
-        (N::Raise { value: v1 }, N::Raise { value: v2 }) => {
-            cmp_term_modulo_ty_slots_go(v1, v2, pairs)
-        }
+        (N::Raise { value: v1 }, N::Raise { value: v2 }) => cmp_term_modulo_ty_slots_go(v1, v2, cx),
         // Each clause binds its exception in its body; which type it catches is a type slot.
         (
             N::Try {
@@ -7056,16 +8838,11 @@ fn cmp_term_modulo_ty_slots_go(
                 body: b2,
                 handlers: h2,
             },
-        ) => cmp_term_modulo_ty_slots_go(b1, b2, pairs)
+        ) => cmp_term_modulo_ty_slots_go(b1, b2, cx)
             .then_with(|| h1.len().cmp(&h2.len()))
             .then_with(|| {
                 first_unequal(h1.iter().zip(h2).map(|(x, y)| {
-                    cmp_under_binder(
-                        pairs,
-                        &x.binding.name,
-                        &y.binding.name,
-                        &[(&x.body, &y.body)],
-                    )
+                    cmp_under_binder(cx, &x.binding.name, &y.binding.name, &[(&x.body, &y.body)])
                 }))
             }),
         (
@@ -7081,7 +8858,7 @@ fn cmp_term_modulo_ty_slots_go(
             },
         ) => t1
             .cmp(t2)
-            .then_with(|| cmp_term_modulo_ty_slots_go(p1, p2, pairs)),
+            .then_with(|| cmp_term_modulo_ty_slots_go(p1, p2, cx)),
         (
             N::NominalCtor {
                 decl: d1,
@@ -7096,7 +8873,7 @@ fn cmp_term_modulo_ty_slots_go(
         ) => d1
             .term_order(d2)
             .then_with(|| c1.cmp(c2))
-            .then_with(|| cmp_term_modulo_ty_slots_go(p1, p2, pairs)),
+            .then_with(|| cmp_term_modulo_ty_slots_go(p1, p2, cx)),
         (
             N::Method {
                 name: m1,
@@ -7119,19 +8896,19 @@ fn cmp_term_modulo_ty_slots_go(
                     x.decl
                         .term_order(&y.decl)
                         .then_with(|| x.params.cmp(&y.params))
-                        .then_with(|| cmp_term_modulo_ty_slots_go(&x.function, &y.function, pairs))
+                        .then_with(|| cmp_term_modulo_ty_slots_go(&x.function, &y.function, cx))
                 }))
             }),
         (N::Record(f1), N::Record(f2)) => f1.len().cmp(&f2.len()).then_with(|| {
             first_unequal(f1.iter().zip(f2).map(|(x, y)| {
                 x.label
                     .cmp(&y.label)
-                    .then_with(|| cmp_term_modulo_ty_slots_go(&x.value, &y.value, pairs))
+                    .then_with(|| cmp_term_modulo_ty_slots_go(&x.value, &y.value, cx))
             }))
         }),
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
-            cmp_term_modulo_ty_slots_go(e1, e2, pairs)
-                .then_with(|| cmp_term_modulo_ty_slots_go(b1, b2, pairs))
+            cmp_term_modulo_ty_slots_go(e1, e2, cx)
+                .then_with(|| cmp_term_modulo_ty_slots_go(b1, b2, cx))
         }
         (
             N::Feed {
@@ -7161,7 +8938,7 @@ fn cmp_term_modulo_ty_slots_go(
             // A `Feed`/`Define` name is a *use* of the binder that introduced
             // the place (`ccl::scope`), so it resolves like any reference.
         ) => {
-            cmp_paired_refs(pairs, n1, n2).then_with(|| cmp_term_modulo_ty_slots_go(v1, v2, pairs))
+            cmp_paired_refs(&cx.pairs, n1, n2).then_with(|| cmp_term_modulo_ty_slots_go(v1, v2, cx))
         }
         _ => {
             // Two nodes of one shape that reach here are a shape with no arm, which has no
@@ -7192,140 +8969,272 @@ fn cmp_term_modulo_ty_slots_go(
 /// it always terminates and adds no extra borrows).
 ///
 /// A reference to a binder the term itself introduces hashes as that
-/// binder's **position**, not its name, which is what makes the hash
-/// α-invariant alongside `eq`. `scope` carries the binders in scope, innermost
-/// last, exactly as [`eq_term_modulo_ty_slots`] carries its pairing; a binder's
-/// own name is never hashed, so hash stays coarser than `eq` and the
-/// `Eq`/`Hash` contract holds.
+/// binder's **position**, counted from the innermost binder, not its name, which is what makes
+/// the hash α-invariant alongside `eq`. A binder's own name is never hashed, so hash stays
+/// coarser than `eq` and the `Eq`/`Hash` contract holds.
 ///
 /// The generic walk covers the two shapes `eq` has no arm for, hashing their children
 /// in the enclosing scope. That direction is the safe one: `eq` answering `false` makes
 /// it finer, and a hash coarser than `eq` is what the contract asks for.
-fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
-    e: &TypedExpr,
-    state: &mut H,
-    scope: &mut Vec<crate::ccl::Name>,
-) {
-    use std::hash::Hash;
-    std::mem::discriminant(&e.node).hash(state);
-    match &e.node {
-        TypedExprNode::Lit(Lit::Int(n)) => n.hash(state),
-        TypedExprNode::Lit(Lit::String(s)) => s.hash(state),
-        TypedExprNode::Lit(Lit::Bool(b)) => b.hash(state),
-        TypedExprNode::Lit(Lit::Unit) => {}
-        // A bound reference hashes by position (innermost match, so shadowing
-        // resolves as it does in `eq`); a free one by name.
-        TypedExprNode::Var(name) => match scope.iter().rposition(|b| b == name) {
-            Some(level) => level.hash(state),
-            None => name.hash(state),
-        },
-        TypedExprNode::Builtin(b) => b.hash(state),
-        TypedExprNode::BinOp { op, .. } => op.hash(state),
-        TypedExprNode::UnaryOp(kind, ..) => kind.hash(state),
-        TypedExprNode::Aggregate { kind, .. } => kind.hash(state),
-        TypedExprNode::VariantCtor { tag, .. } => tag.hash(state),
-        TypedExprNode::NominalCtor { decl, ctor, .. } => {
-            decl.hash(state);
-            ctor.hash(state);
+fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H) {
+    state.write_u64(TermHasher::default().term(e));
+}
+
+/// The hash of a term ([`hash_term_modulo_ty_slots`]) where a free read of a binder a type `let`
+/// defines hashes as that definition, so a term reading the binder and the term with the
+/// definition discharged hash alike, as [`eq_term_under_definitions`] compares them alike.
+///
+/// Each node's hash is built from its children's, so a definition's hash stands in for the
+/// subtree it would be discharged as. A definition hashes in normal form, the form the terms
+/// reading it are compared in, raised by the binders between its `let` and the read, which its
+/// indices count ([`definition_read`]). Each definition hashes once per number of binders it is
+/// raised by.
+#[derive(Default)]
+pub(crate) struct TermHasher {
+    /// The type `let`s around the position hashed, innermost last: each binder, its
+    /// definition, and the binders its indices count around the `let`.
+    lets: Vec<LetDefinitionRead>,
+    /// The binders an index counts around the position hashed.
+    depth: u32,
+    /// Each definition's hash, by the definition and the binders it is raised by.
+    hashed: std::collections::HashMap<(*const HeldTerm, u32), u64>,
+}
+
+/// A type `let` a [`TermHasher`] is under.
+struct LetDefinitionRead {
+    name: crate::ccl::Name,
+    definition: Rc<HeldTerm>,
+    at: u32,
+}
+
+impl TermHasher {
+    /// A hasher at a position reading the definitions `reads`, each by its binder, the
+    /// definition, and the binders it is raised by there.
+    pub(crate) fn reading(reads: impl Iterator<Item = LetReadDefinition>) -> Self {
+        let reads: Vec<_> = reads.collect();
+        let depth = reads.iter().map(|(_, _, by)| *by).max().unwrap_or(0);
+        TermHasher {
+            lets: reads
+                .into_iter()
+                .map(|(name, definition, by)| LetDefinitionRead {
+                    name,
+                    definition,
+                    at: depth - by,
+                })
+                .collect(),
+            depth,
+            ..TermHasher::default()
         }
-        // The candidates' functions are children, hashed below. Their declarations and
-        // parameter counts, which `eq` also compares, are left out: candidates that differ only
-        // there hash alike, which a hash may do.
-        TypedExprNode::Method { name, args, .. } => {
-            name.hash(state);
-            args.hash(state);
-        }
-        TypedExprNode::TraitFn {
-            trait_, function, ..
-        } => {
-            trait_.hash(state);
-            function.hash(state);
-        }
-        TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
-        TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),
-        _ => {}
     }
-    // The binding arms `eq` handles, threading the same scope over the same
-    // children. Every other node's children sit in the node's own scope, so the
-    // generic walk covers them.
-    match &e.node {
-        TypedExprNode::Lambda { params, body } => {
-            params.len().hash(state);
-            let base = scope.len();
-            scope.extend(params.iter().map(|p| p.name.clone()));
-            hash_term_modulo_ty_slots(body, state, scope);
-            scope.truncate(base);
+
+    /// The hash of `e`, standing at the position this hasher has reached.
+    pub(crate) fn term(&mut self, e: &TypedExpr) -> u64 {
+        self.node(e, &mut Vec::new(), 0)
+    }
+
+    /// The hash of the held term `held`, read through the definitions of the type `let`s this
+    /// hasher is under ([`HeldTerm::read_through`]), as [`eq_term_under_definitions`] compares
+    /// it.
+    pub(crate) fn held_term(&mut self, held: &HeldTerm) -> u64 {
+        let this = &*self;
+        let read = held.read_through(0, &mut |n| this.defined(n));
+        self.term(&read)
+    }
+
+    /// Enter the type `let` `l`.
+    pub(crate) fn enter_let(&mut self, l: &TypeLet) {
+        self.lets.push(LetDefinitionRead {
+            name: l.name.clone(),
+            definition: Rc::clone(&l.definition),
+            at: self.depth,
+        });
+    }
+
+    /// Leave the innermost type `let`.
+    pub(crate) fn exit_let(&mut self) {
+        self.lets.pop();
+    }
+
+    /// Cross `n` binders an index counts.
+    pub(crate) fn descend(&mut self, n: u32) {
+        self.depth += n;
+    }
+
+    /// Come back up `n` binders an index counts.
+    pub(crate) fn ascend(&mut self, n: u32) {
+        self.depth -= n;
+    }
+
+    /// The innermost type `let` binding `n`, with the binders between it and this position.
+    fn held(&self, n: &crate::ccl::Name) -> Option<(usize, u32)> {
+        let i = self.lets.iter().rposition(|l| l.name == *n)?;
+        Some((i, self.depth - self.lets[i].at))
+    }
+
+    /// What this hasher's type `let`s give for a free read of `n`, as a held term read through
+    /// them asks ([`HeldTerm::read_through`]).
+    fn defined(&self, n: &crate::ccl::Name) -> Option<Defined<'static>> {
+        let (i, by) = self.held(n)?;
+        Some(Defined::Let(Rc::clone(&self.lets[i].definition), by))
+    }
+
+    /// The hash of the definition of the type `let` `i`, read `by` binders below it.
+    fn definition(&mut self, i: usize, by: u32) -> u64 {
+        let key = (Rc::as_ptr(&self.lets[i].definition), by);
+        if let Some(&h) = self.hashed.get(&key) {
+            return h;
         }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            hash_term_modulo_ty_slots(bound_expr, state, scope);
-            hash_under_binder(state, scope, &binding.name, &[body]);
+        let definition = Rc::clone(&self.lets[i].definition);
+        let (normal, taken_apart) = definition.normal_taking_apart();
+        // A definition reads no binder the term reading it introduces. Where no reduction takes
+        // a type `let`'s binder apart in it, its normal form is the read's, with its indices raised as
+        // it hashes.
+        let h = if taken_apart.iter().any(|n| self.held(n).is_some()) {
+            let this = &*self;
+            let read = definition.read_through(by, &mut |n| this.defined(n));
+            self.node(&read, &mut Vec::new(), 0)
+        } else {
+            self.node(&normal, &mut Vec::new(), by)
+        };
+        self.hashed.insert(key, h);
+        h
+    }
+
+    /// `e`'s hash, where `scope` holds the binders `e`'s term introduced around it, innermost
+    /// last, and `raise` is what `e`'s indices are raised by.
+    fn node(&mut self, e: &TypedExpr, scope: &mut Vec<crate::ccl::Name>, raise: u32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        if let TypedExprNode::Var(n) = &e.node
+            && !scope.contains(n)
+            && let Some((i, by)) = self.held(n)
+        {
+            return self.definition(i, by);
         }
-        // A mutable variable introduction and a loop bind over their bodies, and `eq`
-        // pairs those binders. Without the same scoping here a reference under one
-        // hashes by name where `eq` matched it by position, so two terms `eq` equates
-        // hash apart — the direction that breaks the `Eq`/`Hash` contract.
-        TypedExprNode::MutDecl {
-            binding,
-            init,
-            body,
-        } => {
-            hash_term_modulo_ty_slots(init, state, scope);
-            hash_under_binder(state, scope, &binding.name, &[body]);
-        }
-        TypedExprNode::For {
-            position,
-            target,
-            iter,
-            body,
-        } => {
-            hash_term_modulo_ty_slots(iter, state, scope);
-            scope.push((**position).clone());
-            hash_under_binder(state, scope, &target.name, &[body]);
-            scope.pop();
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-            ..
-        } => {
-            if let Some(s) = scrutinee {
-                hash_term_modulo_ty_slots(s, state, scope);
-            }
-            for b in branches {
-                match &b.pattern {
-                    Some(p) => {
-                        hash_under_binder(state, scope, &p.binding.name, &[&b.guard, &b.body]);
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        std::mem::discriminant(&e.node).hash(&mut state);
+        match &e.node {
+            TypedExprNode::Lit(Lit::Int(n)) => n.hash(&mut state),
+            TypedExprNode::Lit(Lit::String(s)) => s.hash(&mut state),
+            TypedExprNode::Lit(Lit::Bool(b)) => b.hash(&mut state),
+            TypedExprNode::Lit(Lit::Unit) => {}
+            // A bound reference hashes by position (innermost match, so shadowing
+            // resolves as it does in `eq`); a free one by name, and an index raised.
+            TypedExprNode::Var(name) => match scope.iter().rposition(|b| b == name) {
+                Some(level) => (0u8, scope.len() - level).hash(&mut state),
+                None => match name {
+                    crate::ccl::Name::PiBound(r) => {
+                        (1u8, r.index + raise, r.component).hash(&mut state);
                     }
-                    None => {
-                        hash_term_modulo_ty_slots(&b.guard, state, scope);
-                        hash_term_modulo_ty_slots(&b.body, state, scope);
+                    _ => (2u8, name).hash(&mut state),
+                },
+            },
+            TypedExprNode::Builtin(b) => b.hash(&mut state),
+            TypedExprNode::BinOp { op, .. } => op.hash(&mut state),
+            TypedExprNode::UnaryOp(kind, ..) => kind.hash(&mut state),
+            TypedExprNode::Aggregate { kind, .. } => kind.hash(&mut state),
+            TypedExprNode::VariantCtor { tag, .. } => tag.hash(&mut state),
+            TypedExprNode::NominalCtor { decl, ctor, .. } => {
+                decl.hash(&mut state);
+                ctor.hash(&mut state);
+            }
+            // The candidates' functions are children, hashed below. Their declarations and
+            // parameter counts, which `eq` also compares, are left out: candidates that differ only
+            // there hash alike, which a hash may do.
+            TypedExprNode::Method { name, args, .. } => {
+                name.hash(&mut state);
+                args.hash(&mut state);
+            }
+            TypedExprNode::TraitFn {
+                trait_, function, ..
+            } => {
+                trait_.hash(&mut state);
+                function.hash(&mut state);
+            }
+            TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(&mut state),
+            TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(&mut state),
+            _ => {}
+        }
+        // The binding arms `eq` handles, threading the same scope over the same
+        // children. Every other node's children sit in the node's own scope, so the
+        // generic walk covers them.
+        if let TypedExprNode::Lambda { params, .. } = &e.node {
+            params.len().hash(&mut state);
+        }
+        let mut child = |this: &mut Self, c: &TypedExpr, scope: &mut Vec<crate::ccl::Name>| {
+            let h = this.node(c, scope, raise);
+            state.write_u64(h);
+        };
+        match &e.node {
+            TypedExprNode::Lambda { params, body } => {
+                let base = scope.len();
+                scope.extend(params.iter().map(|p| p.name.clone()));
+                child(self, body, scope);
+                scope.truncate(base);
+            }
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                child(self, bound_expr, scope);
+                scope.push(binding.name.clone());
+                child(self, body, scope);
+                scope.pop();
+            }
+            // A mutable variable introduction and a loop bind over their bodies, and `eq`
+            // pairs those binders. Without the same scoping here a reference under one
+            // hashes by name where `eq` matched it by position, so two terms `eq` equates
+            // hash apart — the direction that breaks the `Eq`/`Hash` contract.
+            TypedExprNode::MutDecl {
+                binding,
+                init,
+                body,
+            } => {
+                child(self, init, scope);
+                scope.push(binding.name.clone());
+                child(self, body, scope);
+                scope.pop();
+            }
+            TypedExprNode::For {
+                position,
+                target,
+                iter,
+                body,
+            } => {
+                child(self, iter, scope);
+                scope.push((**position).clone());
+                scope.push(target.name.clone());
+                child(self, body, scope);
+                scope.pop();
+                scope.pop();
+            }
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+                ..
+            } => {
+                if let Some(s) = scrutinee {
+                    child(self, s, scope);
+                }
+                for b in branches {
+                    match &b.pattern {
+                        Some(p) => {
+                            scope.push(p.binding.name.clone());
+                            child(self, &b.guard, scope);
+                            child(self, &b.body, scope);
+                            scope.pop();
+                        }
+                        None => {
+                            child(self, &b.guard, scope);
+                            child(self, &b.body, scope);
+                        }
                     }
                 }
             }
+            _ => e.walk_children(|c| child(self, c, scope)),
         }
-        _ => e.walk_children(|child| hash_term_modulo_ty_slots(child, state, scope)),
+        state.finish()
     }
-}
-
-/// Hash `children` with `binder` in scope, restoring `scope` afterwards — the
-/// hashing counterpart of [`cmp_under_binder`]. The binder's own name is not
-/// hashed: `eq` compares it by position too, so hashing it would make the hash
-/// finer than `eq` for no gain.
-fn hash_under_binder<H: std::hash::Hasher>(
-    state: &mut H,
-    scope: &mut Vec<crate::ccl::Name>,
-    binder: &crate::ccl::Name,
-    children: &[&TypedExpr],
-) {
-    scope.push(binder.clone());
-    for c in children {
-        hash_term_modulo_ty_slots(c, state, scope);
-    }
-    scope.pop();
 }
 
 impl std::hash::Hash for Refinement {
@@ -7338,7 +9247,7 @@ impl std::hash::Hash for Refinement {
     /// which keeps the `Eq`/`Hash` contract. The predicate is immutable, so a
     /// `Type` used as a `ConstrainCache` key never re-hashes differently.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_term_modulo_ty_slots(&self.normal(), state, &mut Vec::new());
+        hash_term_modulo_ty_slots(&self.normal(), state);
     }
 }
 
@@ -8065,7 +9974,7 @@ mod tests {
     fn term_hash(e: &TypedExpr) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        hash_term_modulo_ty_slots(e, &mut h, &mut Vec::new());
+        hash_term_modulo_ty_slots(e, &mut h);
         h.finish()
     }
 
@@ -8191,6 +10100,125 @@ mod tests {
         assert!(!eq_term_modulo_ty_slots(&a, &build("total", "x", "ys")));
     }
 
+    /// A term reading a type `let`'s binder and the term with the definition discharged hash alike, as
+    /// they compare alike ([`TermHasher`]), with the definition raised by the binders between its
+    /// `let` and the read.
+    #[test]
+    fn a_read_of_a_type_let_binder_hashes_as_its_definition() {
+        let add = BinOpKind::Arithmetic(crate::ccl::ops::ArithmeticKind::Add);
+        let mul = BinOpKind::Arithmetic(crate::ccl::ops::ArithmeticKind::Mul);
+        let x = Name::raw("x");
+        // Hashes are taken in normal form, as a held term's are.
+        let normal = |e: &TypedExpr| ccl_utils::normal_form(e);
+        let plain = |e: &TypedExpr| TermHasher::default().term(e);
+        // `x = 𝑖₀ + y`, read one binder below its `let` as `x * 3`.
+        let definition = TypedExpr::binop(
+            TypedExpr::var(Name::pi_bound_bare(0)),
+            add,
+            TypedExpr::var(Name::raw("y")),
+        );
+        let held = TypeLet::new(
+            x.clone(),
+            IntoHeldTerm::into_held(definition.duplicate()),
+            Type::Hole,
+        );
+        let reading = normal(&TypedExpr::binop(
+            TypedExpr::var(x.clone()),
+            mul,
+            TypedExpr::lit(Lit::Int(3)),
+        ));
+        let discharged = normal(&TypedExpr::binop(
+            TypedExpr::binop(
+                TypedExpr::var(Name::pi_bound_bare(1)),
+                add,
+                TypedExpr::var(Name::raw("y")),
+            ),
+            mul,
+            TypedExpr::lit(Lit::Int(3)),
+        ));
+        let mut below = TermHasher::default();
+        below.enter_let(&held);
+        below.descend(1);
+        assert_eq!(
+            below.term(&reading),
+            plain(&discharged),
+            "a read of a type `let`'s binder hashes as its definition, raised"
+        );
+        // Read at the `let` itself, the definition is not raised, and the written-in term
+        // reading the index one further out is another term.
+        let mut at_let = TermHasher::default();
+        at_let.enter_let(&held);
+        assert_ne!(at_let.term(&reading), plain(&discharged));
+        // A free read no `let` defines still hashes by name.
+        assert_ne!(plain(&reading), plain(&discharged));
+    }
+
+    /// A read a reduction takes apart compares and hashes as the reduction of the definition
+    /// discharged: `x.0` under `let x = (g, 2)` is `g`, which a normal form reading `x` does not
+    /// reduce to on its own ([`ccl_utils::normal_form_through`]).
+    #[test]
+    fn a_definition_a_reduction_takes_apart_reads_as_reduced() {
+        let x = Name::raw("x");
+        let pair = TypedExpr::tuple(vec![
+            TypedExpr::var(Name::raw("g")),
+            TypedExpr::lit(Lit::Int(2)),
+        ]);
+        let first = |e: TypedExpr| {
+            TypedExpr::apply(
+                e,
+                TypedExpr::throwaway(TypedExprNode::Proj(ProjKey::Index(0))).with_ty(Type::Hole),
+            )
+        };
+        let projection =
+            |e: TypedExpr| Type::WitnessProjection(WitnessProjection::new(Rc::new(e), 0));
+        let held = Type::Let(Rc::new(TypeLet::new(
+            x.clone(),
+            IntoHeldTerm::into_held(pair),
+            projection(first(TypedExpr::var(x.clone()))),
+        )));
+        let reduced = projection(TypedExpr::var(Name::raw("g")));
+        assert!(
+            held == reduced,
+            "`let x = (g, 2) in σ(x.0)` is `σ(g)`:\n  {held}\n  {reduced}"
+        );
+        let hash = |t: &Type| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            t.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&held), hash(&reduced), "equal types hash alike");
+        // The read stays a read where nothing takes it apart.
+        let kept = projection(TypedExpr::var(Name::raw("h")));
+        assert!(held != kept);
+    }
+
+    /// A definition read through another `let`'s binder compares as the definition with that
+    /// binder's definition read in: `let c = 7 in let a = (c, 2) in σ(a)` is
+    /// `let a = (7, 2) in σ(a)`.
+    #[test]
+    fn a_definition_reading_an_outer_let_compares_through_it() {
+        let (c, a) = (Name::raw("c"), Name::raw("a"));
+        let pair = |first: TypedExpr| TypedExpr::tuple(vec![first, TypedExpr::lit(Lit::Int(2))]);
+        let projection =
+            |e: TypedExpr| Type::WitnessProjection(WitnessProjection::new(Rc::new(e), 0));
+        let inner = |first: TypedExpr| {
+            Type::Let(Rc::new(TypeLet::new(
+                a.clone(),
+                IntoHeldTerm::into_held(pair(first)),
+                projection(TypedExpr::var(a.clone())),
+            )))
+        };
+        let held = Type::Let(Rc::new(TypeLet::new(
+            c.clone(),
+            IntoHeldTerm::into_held(TypedExpr::lit(Lit::Int(7))),
+            inner(TypedExpr::var(c.clone())),
+        )));
+        let written = inner(TypedExpr::lit(Lit::Int(7)));
+        assert!(held == written, "{held}\n  {written}");
+        assert!(written == held, "{written}\n  {held}");
+    }
+
     /// The keyed write and the `Begin` transaction block, the two arms
     /// [`alpha_variant_terms_compare_and_hash_alike`] does not reach. A keyed write is the
     /// shape `transact_phase` normalizes away, so it exists in exactly the window this walk
@@ -8281,8 +10309,7 @@ mod tests {
             domain: Box::new(Type::refined_one(
                 Type::Hole,
                 Refinement {
-                    predicate: offending,
-                    normal: NormalFormCache::default(),
+                    predicate: offending.into_held(),
                 },
             )),
             codomain: Box::new(Type::Hole),

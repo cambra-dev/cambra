@@ -12,7 +12,9 @@ use super::join::try_hash_join_rewrite;
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::provenance;
 
-use super::predicates::{compile_refinement_predicates, fn_of_bare_predicate};
+use super::predicates::{
+    PredicateContext, compile_refinement_predicates, fn_of_bare_predicate, refinements_under_lets,
+};
 use super::*;
 use crate::ccl::Duplicate;
 
@@ -68,7 +70,7 @@ use crate::ccl::Duplicate;
 pub(crate) fn insert_iterate_markers(
     expr: &mut Expr,
     ctx: &mut PlanningCtx,
-    memo: &PredMemo<Type>,
+    memo: &PredMemo<PredicateContext>,
 ) -> Result<(), String> {
     insert_iterate_recurse(expr, ctx, memo)?;
     // In addition to any deeper iteration sites materialised by the
@@ -106,7 +108,7 @@ pub(crate) fn insert_iterate_markers(
 pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
     ctx: &mut PlanningCtx,
-    memo: &PredMemo<Type>,
+    memo: &PredMemo<PredicateContext>,
 ) -> Result<(), String> {
     // A list literal's elements are **values**: op-conversion evaluates each with
     // `expr_to_value` and compiles none of them, so nothing inside one is an iteration
@@ -168,7 +170,7 @@ pub(super) fn insert_iterate_recurse(
     // runtime sweeps, which is what makes a node an iteration site rather than a
     // morphism waiting for an input.
     let is_collection = matches!(
-        &expr.ty,
+        expr.ty.former(),
         Type::Fun {
             fun_kind: crate::ccl::ty::FunKind::Data(..),
             ..
@@ -320,7 +322,7 @@ pub(super) fn insert_iterate_recurse(
 fn mark_component_source(
     component: &mut Expr,
     ctx: &mut PlanningCtx,
-    memo: &PredMemo<Type>,
+    memo: &PredMemo<PredicateContext>,
 ) -> Result<(), String> {
     if let TypedExprNode::Apply { argument, function } = &mut component.node
         && matches!(
@@ -433,7 +435,7 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
 pub(super) fn wrap_with_iterate(
     expr: &mut Expr,
     ctx: &mut PlanningCtx,
-    memo: &PredMemo<Type>,
+    memo: &PredMemo<PredicateContext>,
     site: &str,
 ) -> Result<(), String> {
     // `Let` nodes pass input through to both children — op-conversion's
@@ -525,7 +527,10 @@ pub(super) fn wrap_with_iterate(
         // type, and a carried witness bounds its keys without enumerating them. Falling
         // through hands it to `extent_of`, which rejects it by name rather than dropping the
         // restriction silently.
-        if !matches!(domain_ty, Type::Refinement(..)) {
+        if !matches!(
+            crate::ccl::ty::TypeLet::peel(&domain_ty).1,
+            Type::Refinement(..)
+        ) {
             return Ok(());
         }
     }
@@ -565,7 +570,7 @@ pub(super) fn wrap_with_iterate(
     // `Rc` reachable from several sites, as every earlier position's predicate is
     // through a nest's types, compiles once, and every occurrence is re-pointed at that
     // one rebuild.
-    compile_refinement_predicates(expr, memo);
+    compile_refinement_predicates(expr, memo, &ctx.held);
     let Some(domain_ty) = expr.ty.domain() else {
         return Ok(());
     };
@@ -644,11 +649,14 @@ pub(super) fn planned_restrict(
     ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
     let planned = plan_lifted(lifted, PlanningPhase::MarkIterationSites, ctx)?;
-    Ok(make_restrict_stating(
+    // The predicate's domain reads a type `let`'s definition the root binds by the root's binder.
+    let held = Rc::clone(&ctx.held);
+    Ok(ccl_utils::make_restrict_stating_under(
         &mut Solver::none(),
         stated,
         planned,
         upstream,
+        &|n| held.definitions.get(n).map(|d| d.term()),
     ))
 }
 
@@ -731,7 +739,7 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         } => is_iteration_bearing(bound_expr) && is_iteration_bearing(body),
         TypedExprNode::Var(_)
             if matches!(
-                &head.ty,
+                head.ty.former(),
                 Type::Fun {
                     fun_kind: crate::ccl::ty::FunKind::Data(..),
                     ..
@@ -756,7 +764,7 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             if matches!(
                 builtin_at_function_position(function),
                 Some(Builtin::VariantProject(_))
-            ) && !matches!(argument.ty.peel_refinements(), Type::Fun { .. }) =>
+            ) && !matches!(argument.ty.former(), Type::Fun { .. }) =>
         {
             true
         }
@@ -822,7 +830,10 @@ fn keys_of(term: &Expr, ctx: &mut PlanningCtx) -> Result<Expr, String> {
         .ok_or_else(|| format!("a projected value has a sum type, got {}", term.ty))?;
     let (copy, held) = {
         let _frame = provenance::copy_frame("planning.projected_keys");
-        (term.duplicate(), Rc::new(term.duplicate()))
+        (
+            term.duplicate(),
+            crate::ccl::ty::IntoHeldTerm::into_held(term.duplicate()),
+        )
     };
     // The copy is a term lifted out of a type into the tree, so it is planned as every such
     // term is (`src/ccl/design/optimization.md`, "Planning a lifted term"): a conditional it
@@ -863,19 +874,28 @@ fn domain_keys(
     site: &str,
 ) -> Result<Expr, String> {
     // Compilation rewrites the set in place, so each refinement keeps its position unless two
-    // compile to one and the set drops the duplicate.
-    if domain.refinements().len() != uncompiled.refinements().len() {
+    // compile to one and the set drops the duplicate. Each is read under the level's held
+    // `let`s ([`refinements_under_lets`]), and the level's structure below them.
+    let stated_refinements = refinements_under_lets(domain, &ctx.held);
+    let uncompiled_refinements = refinements_under_lets(uncompiled, &ctx.held);
+    let (uncompiled_lets, uncompiled) = crate::ccl::ty::TypeLet::peel(uncompiled);
+    if stated_refinements.len() != uncompiled_refinements.len() {
         return Err(format!(
             "two refinements of an iteration site compiled to one, which planning does not pair \
              with the refinements it lifts yet [{site}]: {domain}"
         ));
     }
-    let base = domain.peel_refinements();
+    // The level's base taken out of its refinements, its structure at the root and each part
+    // holding the type `let`s it reads.
+    let (domain_lets, refined) = crate::ccl::ty::TypeLet::peel(domain);
+    let base =
+        &crate::ccl::ty::TypeLet::innermost_each(&domain_lets, refined.peel_refinements().clone())
+            .lets_distributed()
+            .into_owned();
     // A level carries at most one membership: a second would fall into the filters as a
     // `restrict`, which op-conversion cannot compile, and which membership supplied the keys
     // would depend on the refinement set's physical order.
-    let mut memberships = domain
-        .refinements()
+    let mut memberships = stated_refinements
         .iter()
         .filter_map(|r| r.membership_collection().map(|collection| (r, collection)));
     let membership = memberships.next();
@@ -890,8 +910,7 @@ fn domain_keys(
     let (mut source, filters, filtered_base) = match membership {
         Some((m, collection)) => {
             let present = Type::refined_one(base.clone(), m.clone());
-            let filters: Vec<_> = domain
-                .refinements()
+            let filters: Vec<_> = stated_refinements
                 .iter()
                 .filter(|r| *r != m)
                 .cloned()
@@ -903,20 +922,27 @@ fn domain_keys(
             )
         }
         None => (
-            base_keys(base, uncompiled.peel_refinements(), ctx, site)?,
-            domain.refinements().to_vec(),
+            base_keys(
+                base,
+                &crate::ccl::ty::TypeLet::innermost_each(
+                    &uncompiled_lets,
+                    uncompiled.peel_refinements().clone(),
+                ),
+                ctx,
+                site,
+            )?,
+            stated_refinements.clone(),
             base.clone(),
         ),
     };
     for (r, elem_ty) in crate::ccl::application_order(&filters, &filtered_base) {
-        let position = domain
-            .refinements()
+        let position = stated_refinements
             .iter()
             .position(|stated| stated == r)
             .expect("a filter is one of the level's refinements");
         let stated = fn_of_bare_predicate(&elem_ty, &r.predicate, &[]);
         let lifted =
-            fn_of_bare_predicate(&elem_ty, &uncompiled.refinements()[position].predicate, &[]);
+            fn_of_bare_predicate(&elem_ty, &uncompiled_refinements[position].predicate, &[]);
         source = planned_restrict(stated, lifted, source, ctx)?;
     }
     // A refined level's source produces the refined domain it iterates, `{𝐷 | p} ⤇ {𝐷 | p}`,
@@ -924,7 +950,7 @@ fn domain_keys(
     // element type or a product family over it, expects that domain as the codomain.
     // `domain` rather than the built source's domain, because `make_restrict` drops a
     // trivially-true layer (`if True`) that the consumer's type still states.
-    Ok(if matches!(domain, Type::Refinement(..)) {
+    Ok(if !stated_refinements.is_empty() {
         set_codomain(&mut Solver::none(), source, domain.clone())
     } else {
         source
@@ -948,6 +974,9 @@ fn base_keys(
     ctx: &mut PlanningCtx,
     site: &str,
 ) -> Result<Expr, String> {
+    // A part of `uncompiled` a component's keys read takes the type `let`s it reads with it.
+    let (uncompiled_lets, uncompiled) = crate::ccl::ty::TypeLet::peel(uncompiled);
+    let with_lets = |part: Type| crate::ccl::ty::TypeLet::innermost_each(&uncompiled_lets, part);
     match base {
         Type::WitnessProjection(p) => keys_of(&p.term, ctx),
         Type::Tuple(components) if components.iter().any(extent_overstates_keys) => {
@@ -963,7 +992,7 @@ fn base_keys(
             let mut keys = components
                 .iter()
                 .zip(uncompiled)
-                .map(|(c, uc)| domain_keys(c, uc, ctx, site))
+                .map(|(c, uc)| domain_keys(c, &with_lets(uc.clone()), ctx, site))
                 .collect::<Result<Vec<_>, _>>()?;
             let Some(mut nested) = keys.pop() else {
                 return Ok(make_iterate(trivially_true_predicate(base.clone())));
@@ -1026,7 +1055,7 @@ fn base_keys(
                 ])
             };
             let pair = pair_of(base, components);
-            let uncompiled_pair = pair_of(uncompiled, uncompiled_components);
+            let uncompiled_pair = with_lets(pair_of(uncompiled, uncompiled_components));
             let paired = domain_keys(&pair, &uncompiled_pair, ctx, site)?;
             let indices = Expr::list(vec![
                 Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int)),
@@ -1064,7 +1093,7 @@ fn base_keys(
             let [(_, uncompiled_first), _] = uncompiled_components.as_slice() else {
                 unreachable!("a dependent tuple keeps its components when compiled")
             };
-            let outer = domain_keys(first, uncompiled_first, ctx, site)?;
+            let outer = domain_keys(first, &with_lets(uncompiled_first.clone()), ctx, site)?;
             let family = correlated::keys_family(components, ctx)?;
             let Type::Fun {
                 binder, codomain, ..
@@ -1124,6 +1153,8 @@ pub(super) fn extent_overstates_keys(ty: &Type) -> bool {
     match ty {
         Type::Refinement(..) | Type::WitnessProjection(_) | Type::DepTuple(_) => true,
         Type::Tuple(cs) => cs.iter().any(extent_overstates_keys),
+        // A type `let` decorates the position it holds.
+        Type::Let(l) => extent_overstates_keys(&l.body),
         _ => false,
     }
 }

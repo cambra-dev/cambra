@@ -4,6 +4,7 @@
 
 use crate::ccl::expr::CallObligation;
 use crate::ccl::infer::solver::Solver;
+use crate::ccl::ty::IntoHeldTerm;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -27,7 +28,7 @@ use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{
     BindingTransparency, Bound, Expr, InferVar, Level, Lit, Name, Refinement, Type, TypedBinding,
-    TypedExpr, TypedExprNode,
+    TypedExprNode,
 };
 use crate::util::ScopeStack;
 
@@ -216,7 +217,7 @@ pub(super) struct InferCtx {
     /// term is ground (see [`singleton_predicate`](super::singleton_predicate)), so
     /// sharing it carries none of the context-dependence that makes sharing
     /// delicate elsewhere.
-    lit_singletons: HashMap<Lit, Rc<TypedExpr>>,
+    lit_singletons: HashMap<Lit, Rc<crate::ccl::ty::HeldTerm>>,
     /// The node whose typing rule is currently running, maintained by the
     /// [`emit_node`](super::emit::emit_node) wrapper: set on entry and restored
     /// on exit, error path included. Read only through
@@ -563,7 +564,7 @@ fn keys_detail(solver: &mut Solver, key: &Type) -> String {
 /// What an unordered loop's refusal says of a source whose positions have type `positions`,
 /// as emission required `Orderable` of them: a concatenation's are a variant of its parts'.
 pub(super) fn positions_detail(solver: &mut Solver, positions: &Type) -> String {
-    match positions.peel_refinements() {
+    match positions.lets_distributed().peel_refinements() {
         Type::Variant(..) => {
             "the positions of a concatenation, which puts neither part first".to_string()
         }
@@ -1482,7 +1483,7 @@ impl InferCtx {
                 .unwrap_or(l.iter);
             // Resolving the source renames its binders, so a sum of one binder names the
             // positions by being one.
-            let kind = match iter.peel_refinements().sum() {
+            let kind = match iter.lets_distributed().peel_refinements().sum() {
                 Some([only]) => Some(only.type_kind()),
                 Some(ws) => ws.iter().find(|w| w.id() == id).map(|w| w.type_kind()),
                 None => None,
@@ -1572,7 +1573,7 @@ impl InferCtx {
             };
             let positions = order.position_type(&mut self.solver);
             let detail = positions_detail(&mut self.solver, &positions);
-            if matches!(positions.peel_refinements(), Type::WitnessRef(_)) {
+            if matches!(positions.former(), Type::WitnessRef(_)) {
                 if let Some(capability) = capability {
                     errors.push(LocatedInferError::new(
                         InferError::UnorderedLoop {
@@ -2693,6 +2694,8 @@ impl InferCtx {
                     Type::Infer(InferVar::fresh_in(&mut self.solver, self.level, telescope))
                 })
                 .clone(),
+            // A program never writes a `let` in a type; only a scope exit makes one.
+            Type::Let(_) => unreachable!("an annotation holds a `let` type: {ty:?}"),
             Type::FamilyApp(app) if app.param.generalized => {
                 unreachable!("a generalized family is born after inference")
             }
@@ -2984,6 +2987,11 @@ impl InferCtx {
         // a position's value reads the position (`Type::History`), so a feed declared
         // `x: Feed(_)` over a channel keyed by its position keeps the key.
         fn function_layer(ty: &Type) -> &Type {
+            debug_assert!(
+                !matches!(ty.peel_refinements(), Type::Let(_))
+                    || !matches!(ty.former(), Type::History { .. }),
+                "a history under a type `let`: {ty}"
+            );
             match ty.peel_refinements() {
                 Type::History { function, .. } => function,
                 other => other,
@@ -3227,6 +3235,7 @@ impl InferCtx {
     /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its target").
     pub(super) fn feed_row(&mut self, target: &Name, value: &Type, channel: &Type) -> Type {
         if matches!(self.exit_of(target), ScopeExit::Join) {
+            let channel = channel.lets_distributed();
             let Type::Fun { codomain, .. } = channel.peel_refinements() else {
                 unreachable!(
                     "a feed's channel is the data function `domain ⤇ value`, got {channel}"
@@ -3285,7 +3294,7 @@ impl InferCtx {
             let contribution = row(self);
             return self.require_sub(&contribution, channel, at);
         };
-        let keyed = match channel.peel_refinements() {
+        let keyed = match channel.lets_distributed().peel_refinements() {
             Type::Fun {
                 binder: crate::ccl::FunBinder::Whole(key),
                 domain,
@@ -3542,7 +3551,7 @@ impl InferCtx {
     pub(super) fn lit_singleton(&mut self, lit: &Lit) -> Type {
         let base = super::lit_base(lit);
         let Some(predicate) = self.lit_singletons.get(lit).cloned().or_else(|| {
-            let p = super::singleton_predicate(lit)?;
+            let p = super::singleton_predicate(lit)?.into_held();
             self.lit_singletons.insert(lit.clone(), Rc::clone(&p));
             Some(p)
         }) else {
@@ -3597,7 +3606,7 @@ fn exits_but(
             }
             let exit = match exit_of(scope_exits, name) {
                 ScopeExit::Discharge(definition) => {
-                    Subst::discharge(name.clone(), Rc::clone(definition))
+                    Subst::let_exit(name.clone(), Rc::clone(definition))
                 }
                 _ if !joined[i] => return exits,
                 _ => match at_key.iter().find(|(x, _)| x == name) {
@@ -4389,7 +4398,7 @@ impl Typing for InferCtx {
     fn composed_capabilities(&mut self, recorded: &Type, parts: &[Type]) -> Capabilities {
         let var = CapabilityVar::fresh(&mut self.solver, self.level, &self.telescope);
         for part in parts {
-            if let Type::Fun { capabilities, .. } = part.peel_refinements() {
+            if let Type::Fun { capabilities, .. } = part.former() {
                 match capabilities.repr() {
                     Repr::Var(v) => var.flows_from(&mut self.solver, v, Filter::default()),
                     Repr::Known(_) => {
@@ -4990,13 +4999,13 @@ impl Typing for InferCtx {
             unreachable!("fresh() yields a Type::Infer var");
         };
         let read_body = self.read_value_type(&body_ty);
-        let discharge = Subst::discharge(name.clone(), definition);
+        let exit = Subst::let_exit(name.clone(), definition);
         if read_body != body_ty {
             let read_lifted = self.fresh();
             let Type::Infer(read_variable) = &read_lifted else {
                 unreachable!()
             };
-            let bound = Bound::with_subst(&mut self.solver, read_body, discharge.clone());
+            let bound = Bound::with_subst(&mut self.solver, read_body, exit.clone());
             enforce_bound_scope(&mut self.solver, read_variable, "lower", &bound);
             read_variable
                 .bounds_mut(&mut self.solver)
@@ -5004,7 +5013,7 @@ impl Typing for InferCtx {
                 .push(bound);
             self.place_reads.insert(v.uid, read_lifted);
         }
-        let bound = Bound::with_subst(&mut self.solver, body_ty, discharge);
+        let bound = Bound::with_subst(&mut self.solver, body_ty, exit);
         enforce_bound_scope(&mut self.solver, v, "lower", &bound);
         v.bounds_mut(&mut self.solver).lower_mut().push(bound);
         lifted
@@ -5127,7 +5136,7 @@ impl Typing for InferCtx {
         //
         // A dependent node type's binder rides the shape: the codomain it supplies reads the
         // binder, and an unnamed function would leave that reference with nothing to bind it.
-        let shape = match t.peel_refinements() {
+        let shape = match t.lets_distributed().peel_refinements() {
             Type::Fun {
                 binder: crate::ccl::FunBinder::Whole(b),
                 ..
@@ -5296,7 +5305,8 @@ impl Typing for InferCtx {
             // takes `𝑦` at `B(𝑥)`, whatever `𝑥`'s type has resolved to by now. Meeting the
             // argument tuple's type instead would read `𝑎` as any value of `𝑥`'s type.
             Some(parts) => {
-                let arguments: &[Type] = match arg_ty.peel_refinements() {
+                let arg_shape = arg_ty.lets_distributed();
+                let arguments: &[Type] = match arg_shape.peel_refinements() {
                     Type::Tuple(ts) if ts.len() == parts.len() => ts,
                     Type::Base(crate::ccl::BaseType::Unit) if parts.is_empty() => &[],
                     other => unreachable!(
@@ -5350,10 +5360,12 @@ impl Typing for InferCtx {
 /// with the earlier ones at their arguments. A function known only once inference solves it
 /// states none yet.
 fn reads_earlier_parameters(fn_ty: &Type) -> bool {
-    let function = match fn_ty.peel_refinements() {
+    let fn_shape = fn_ty.lets_distributed();
+    let function = match fn_shape.peel_refinements() {
         Type::Poly(poly) => &poly.body,
         other => other,
     };
+    let function = function.lets_distributed();
     let Type::Fun { binder, domain, .. } = function.peel_refinements() else {
         return false;
     };

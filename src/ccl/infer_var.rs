@@ -457,10 +457,11 @@ pub struct InferBounds {
 
 /// One of [`InferBounds::guarded_upper`]: `{α | guard}‹bound.self_subst› <: bound.ty‹bound.ty_subst›`.
 /// The guard is stored transported through the holder side's morphism, in the frame where the
-/// two sides meet, as the refinement arm compares predicates.
+/// two sides meet, as the refinement arm compares predicates: a refinement type over a hole,
+/// `let 𝐿 in {_ | 𝑅}`, holding the type `let`s its predicates read.
 #[derive(Debug, Clone)]
 pub struct GuardedBound {
-    pub guard: crate::ccl::ty::RefinementSet,
+    pub guard: Type,
     pub bound: Bound,
 }
 

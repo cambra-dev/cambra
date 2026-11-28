@@ -12,7 +12,8 @@ use cambra::ccl::ccl_utils::{
 };
 use cambra::ccl::subst::Subst;
 use cambra::ccl::{
-    BinOpKind, CompareKind, Expr, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
+    BinOpKind, CompareKind, Expr, HeldTerm, IntoHeldTerm, Lit, Name, Refinement, Type, TypedExpr,
+    TypedExprNode,
 };
 use std::rc::Rc;
 
@@ -26,11 +27,11 @@ fn gt(l: TypedExpr, r: TypedExpr) -> TypedExpr {
     TypedExpr::binop(l, BinOpKind::Compare(CompareKind::Greater), r)
 }
 /// `{_ | pred}`, a second occurrence of an existing predicate term.
-fn refined(pred: &Rc<TypedExpr>) -> Type {
+fn refined(pred: &Rc<HeldTerm>) -> Type {
     Type::refined_one(Type::Hole, Refinement::sharing(pred))
 }
 /// The predicate term of a `{_ | p}`.
-fn predicate_of(ty: &Type) -> &Rc<TypedExpr> {
+fn predicate_of(ty: &Type) -> &Rc<HeldTerm> {
     let [r] = ty.refinements() else {
         panic!("expected exactly one refinement, got {ty}");
     };
@@ -52,7 +53,7 @@ fn predicate_of(ty: &Type) -> &Rc<TypedExpr> {
 /// empty-restriction early return declines to enter the body at all.
 #[test]
 fn rewrite_does_not_leak_an_outer_rebuild_into_a_shadowing_scope() {
-    let shared = Rc::new(gt(var("k"), int(0)));
+    let shared = IntoHeldTerm::into_held(gt(var("k"), int(0)));
     // λ k → (j > 0) : {_ | k > 0}          — the body's `k` is the lambda's own.
     //   with the lambda's own ty = ({_ | k > 0} ⇒ _), sharing that one predicate.
     let body = gt(var("j"), int(0)).with_ty(refined(&shared));
@@ -71,7 +72,7 @@ fn rewrite_does_not_leak_an_outer_rebuild_into_a_shadowing_scope() {
         panic!("function type preserved");
     };
     assert_eq!(
-        **predicate_of(domain),
+        *predicate_of(domain).term(),
         gt(int(5), int(0)),
         "the outer occurrence is not under the binder, so it discharges"
     );
@@ -80,7 +81,7 @@ fn rewrite_does_not_leak_an_outer_rebuild_into_a_shadowing_scope() {
         panic!("lambda preserved");
     };
     assert_eq!(
-        **predicate_of(&body.ty),
+        *predicate_of(&body.ty).term(),
         gt(var("k"), int(0)),
         "the occurrence inside `λ k` refers to the lambda's own `k`, which the \
          substitution must not touch — but the memo served it the outer rebuild"
@@ -92,8 +93,8 @@ fn rewrite_does_not_leak_an_outer_rebuild_into_a_shadowing_scope() {
 /// the shadowing walk, and shows that improving sharing is what exposes it.
 #[test]
 fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
-    let outer = Rc::new(gt(var("k"), int(0)));
-    let inner = Rc::new(gt(var("k"), int(0)));
+    let outer = IntoHeldTerm::into_held(gt(var("k"), int(0)));
+    let inner = IntoHeldTerm::into_held(gt(var("k"), int(0)));
     let body = gt(var("j"), int(0)).with_ty(refined(&inner));
     let mut e = TypedExpr::lambda("k", Occurrence::mint(), Type::Hole, body)
         .with_ty(Type::fun(refined(&outer), Type::Hole));
@@ -108,11 +109,11 @@ fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
     let Type::Fun { domain, .. } = &e.ty else {
         panic!("function type preserved");
     };
-    assert_eq!(**predicate_of(domain), gt(int(5), int(0)));
+    assert_eq!(*predicate_of(domain).term(), gt(int(5), int(0)));
     let TypedExprNode::Lambda { body, .. } = &e.node else {
         panic!("lambda preserved");
     };
-    assert_eq!(**predicate_of(&body.ty), gt(var("k"), int(0)));
+    assert_eq!(*predicate_of(&body.ty).term(), gt(var("k"), int(0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +127,7 @@ fn rewrite_respects_shadowing_when_the_occurrences_are_not_shared() {
 /// disagree — the stale-copy defect this file exists to pin.
 #[test]
 fn rewrite_reaches_the_lambda_param_type_slot() {
-    let shared = Rc::new(gt(var("k"), int(0)));
+    let shared = IntoHeldTerm::into_held(gt(var("k"), int(0)));
     let mut e = TypedExpr::lambda("x", Occurrence::mint(), refined(&shared), var("x"))
         .with_ty(Type::fun(refined(&shared), Type::Hole));
 
@@ -137,7 +138,7 @@ fn rewrite_reaches_the_lambda_param_type_slot() {
     };
     let param = &params[0];
     assert_eq!(
-        **predicate_of(&param.ty),
+        *predicate_of(&param.ty).term(),
         gt(int(5), int(0)),
         "`param.ty` holds its own `Rc`, so the discharge must reach it too"
     );
@@ -162,7 +163,7 @@ fn is_free_sees_a_predicate_on_a_let_binding_slot() {
     let mut e = Expr::let_bind(
         "y",
         Occurrence::mint(),
-        Expr::lit(Lit::Int(1)).with_ty(refined(&Rc::new(gt(var("k"), int(0))))),
+        Expr::lit(Lit::Int(1)).with_ty(refined(&IntoHeldTerm::into_held(gt(var("k"), int(0))))),
         Expr::lit(Lit::Unit),
     );
     // `let_bind` copies `bound_expr.ty` into `binding.ty`; clear the former so
@@ -202,7 +203,7 @@ fn walk_preserves_a_repointing_made_by_a_nested_memo_hit() {
     let memo: PredMemo = PredMemo::new();
 
     // An inner predicate `q`, rebuilt through the memo by some earlier occurrence.
-    let q = Rc::new(gt(var("a"), int(0)));
+    let q = IntoHeldTerm::into_held(gt(var("a"), int(0)));
     let mut t_q = refined(&q);
     walk_refined_predicates_mut(&mut t_q, &memo, &(), &mut |pred, _| {
         *pred = gt(var("a"), int(1)); // a real rewrite
@@ -213,7 +214,7 @@ fn walk_preserves_a_repointing_made_by_a_nested_memo_hit() {
 
     // An outer predicate `p` carrying a second occurrence of `q` on its own type
     // slot. The transform has nothing to say about `p` itself.
-    let p = Rc::new(int(1).with_ty(refined(&q)));
+    let p = IntoHeldTerm::into_held(int(1).with_ty(refined(&q)));
     let mut t_p = refined(&p);
     walk_refined_predicates_mut(&mut t_p, &memo, &(), &mut |pred, memo| {
         // Recurse into the predicate's own type slots, as every caller does.

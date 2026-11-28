@@ -632,7 +632,7 @@ pub(crate) fn equal_to(term: &TypedExpr) -> Refinement {
 /// A constructor's payload is read at the declaration's own payload type, refinements
 /// included: what [`Encode::assume_along`] assumes of it, under the constructor's tag.
 fn field_type(solver: &mut Solver, ty: &Type, key: &Key) -> Option<Type> {
-    match (ty.peel_refinements(), key) {
+    match (ty.lets_distributed().peel_refinements(), key) {
         (Type::Record(fields), Key::Proj(ProjKey::Field(name))) => fields
             .iter()
             .find(|(field, _)| field == name)
@@ -648,7 +648,7 @@ fn field_type(solver: &mut Solver, ty: &Type, key: &Key) -> Option<Type> {
 
 /// The position of the constructor `ctor` of the nominal type `ty`.
 fn ctor_position(ty: &Type, ctor: &str) -> Option<usize> {
-    match ty.peel_refinements() {
+    match ty.lets_distributed().peel_refinements() {
         Type::Nominal(decl, _) => decl.ctor_index(ctor),
         _ => None,
     }
@@ -748,6 +748,49 @@ pub fn refuted(solver: &mut Solver, scope: &dyn ScopeEnv) -> Result<bool, SmtErr
             scope,
         )
     })
+}
+
+/// `inner` with the binders of the type `let`s a query's refinements read, each assumed equal to
+/// its definition ([`defined_as`]), as a transparent `let`'s binder is where a tree binds it.
+/// The refinements read a binder by name in place of the definition
+/// ([`super::constrain::Ambient`]).
+pub struct UnderLets<'a> {
+    inner: &'a dyn ScopeEnv,
+    lets: Vec<crate::ccl::ty::TypeLetExit>,
+}
+
+impl<'a> UnderLets<'a> {
+    /// `inner` under the `let`s of `sides`, whose binders are apart: one name, one definition.
+    pub(super) fn of(inner: &'a dyn ScopeEnv, sides: &[&super::constrain::Ambient]) -> Self {
+        let mut lets: Vec<crate::ccl::ty::TypeLetExit> = Vec::new();
+        for l in sides.iter().flat_map(|s| &s.lets) {
+            if !lets.iter().any(|(n, _)| *n == l.0) {
+                lets.push(l.clone());
+            }
+        }
+        UnderLets { inner, lets }
+    }
+}
+
+impl ScopeEnv for UnderLets<'_> {
+    fn binder_type(&self, solver: &mut Solver, name: &Name) -> Option<Type> {
+        match self.lets.iter().find(|(n, _)| n == name) {
+            // The definition's type read as a scope reads a binder's: a variable as what it
+            // resolves to so far ([`crate::ccl::infer::solve::value_type`]).
+            Some((_, definition)) => {
+                let ty = crate::ccl::infer::solve::value_type(solver, &definition.ty)
+                    .unwrap_or_else(|| definition.ty.clone());
+                Some(defined_as(solver, ty, definition))
+            }
+            None => self.inner.binder_type(solver, name),
+        }
+    }
+    fn facts(&self) -> Vec<TypedExpr> {
+        self.inner.facts()
+    }
+    fn is_skip_smt(&self) -> bool {
+        self.inner.is_skip_smt()
+    }
 }
 
 /// `inner` with `facts` added to the ones it holds.
@@ -1118,7 +1161,7 @@ impl<'a> Encode<'a> {
     /// otherwise translate must not fail because of what else is in scope.
     fn assume_refinements(&mut self, solver: &mut Solver, path: &Path, ty: &Type) {
         let enclosing = self.subject.replace(path.clone());
-        for r in ty.refinements() {
+        for r in &ty.standalone_refinements() {
             let e = self.claim(solver, &r.predicate);
             self.assumptions.push(e);
         }
@@ -1208,7 +1251,7 @@ impl<'a> Encode<'a> {
     /// Cambra type, which [`Sort::declare`] asserts: non-negativity for `UInt`,
     /// non-negativity and the upper bound for `UIntRange`.
     fn sort(&self, ty: &Type) -> Option<Sort> {
-        match ty.peel_refinements() {
+        match ty.lets_distributed().peel_refinements() {
             Type::Base(BaseType::Int) => Some(Sort::Int),
             Type::Base(BaseType::UInt) => Some(Sort::UInt),
             Type::UIntRange(n) => Some(Sort::UIntRange(*n)),
@@ -1360,7 +1403,7 @@ impl<'a> Encode<'a> {
         r: &Path,
         ty: &Type,
     ) -> Result<SExpr, String> {
-        let components: Vec<(Key, Type)> = match ty.peel_refinements() {
+        let components: Vec<(Key, Type)> = match ty.lets_distributed().peel_refinements() {
             Type::Record(fields) => fields
                 .iter()
                 .map(|(name, ty)| (Key::Proj(ProjKey::Field(name.clone())), ty.clone()))

@@ -245,6 +245,26 @@ pub(crate) fn transport<T: Transport + ?Sized>(
             ))
         }
         Type::WitnessRef(w) => Type::WitnessRef(t.witness(w)),
+        // A type `let`: its definition is a held term, mapped as a projection's is, standing
+        // where the `let` does, and its body is read at the `let`'s side. The binder is one the
+        // type labels, so a copy that names it afresh renames what the body reads of it.
+        Type::Let(l) => {
+            let name = t.label(&l.name);
+            let definition = {
+                let _f = crate::ccl::provenance::copy_frame("infer.transport_let_definition");
+                let mut term = l.definition.term().duplicate();
+                transport_term(solver, &mut term, t);
+                crate::ccl::ty::IntoHeldTerm::into_held(term)
+            };
+            let body = transport(solver, &l.body, side, t);
+            let body = if name == l.name {
+                body
+            } else {
+                crate::ccl::ty::TypeLet::new(l.name.clone(), Rc::clone(&definition), body)
+                    .body_as(&name)
+            };
+            crate::ccl::ty::TypeLet::wrap(name, definition, body)
+        }
         Type::Refinement(inner, refinements) => Type::refined(
             transport(solver, inner, side, t),
             refinements

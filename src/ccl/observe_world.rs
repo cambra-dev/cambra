@@ -23,7 +23,8 @@
 use crate::ccl::capabilities::Capabilities;
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{Builtin, Expr, Name, Type, TypedExprNode, provenance};
+use crate::ccl::{Builtin, Expr, Name, Refinement, Type, TypedExprNode, provenance};
+use std::rc::Rc;
 
 /// Give every reading in `expr` its position as an operand.
 ///
@@ -34,7 +35,7 @@ use crate::ccl::{Builtin, Expr, Name, Type, TypedExprNode, provenance};
 pub fn eliminate(mut expr: Expr) -> Expr {
     bind(&mut expr, &mut Vec::new(), false);
     let memo = PredMemo::new();
-    in_filters(&mut expr, &memo);
+    in_filters(&mut expr, &memo, &mut Vec::new());
     assert_eliminated(&expr);
     expr
 }
@@ -157,14 +158,17 @@ fn filters_under_a_loop(e: &Expr, loops: &mut usize) -> Result<(), String> {
     result
 }
 
-/// The predicates `target` refines its collection's domain by that `from`'s domain lacks.
-fn own_filters<'a>(from: &Type, target: &'a Type) -> Vec<&'a Expr> {
-    let domain_refinements = |ty: &Type| match ty.peel_refinements() {
+/// The predicates `target` refines its collection's domain by that `from`'s domain lacks, each
+/// type and domain read under its type `let`s, and the definitions of the type `let`s each
+/// predicate reads ([`crate::ccl::ty::TypeLet::read_by`]): a reading in a definition is one the
+/// filter makes.
+fn own_filters(from: &Type, target: &Type) -> Vec<Rc<crate::ccl::ty::HeldTerm>> {
+    let domain_refinements = |ty: &Type| match ty.former() {
         Type::Fun {
             fun_kind: FunKind::Data(..),
             domain,
             ..
-        } => match domain.as_ref() {
+        } => match crate::ccl::ty::TypeLet::peel(domain).1 {
             Type::Refinement(_, refinements) => {
                 refinements.iter().map(|r| r.predicate_id()).collect()
             }
@@ -173,33 +177,59 @@ fn own_filters<'a>(from: &Type, target: &'a Type) -> Vec<&'a Expr> {
         _ => Vec::new(),
     };
     let inherited = domain_refinements(from);
-    match target.peel_refinements() {
+    match target.former() {
         Type::Fun {
             fun_kind: FunKind::Data(..),
             domain,
             ..
-        } => match domain.as_ref() {
-            Type::Refinement(_, refinements) => refinements
-                .iter()
-                .filter(|r| !inherited.contains(&r.predicate_id()))
-                .map(|r| &*r.predicate)
-                .collect(),
-            _ => Vec::new(),
-        },
+        } => {
+            // The `let`s around the function and those around its domain, outermost first.
+            let (mut lets, _) = crate::ccl::ty::TypeLet::peel(target);
+            let (domain_lets, refined) = crate::ccl::ty::TypeLet::peel(domain);
+            lets.extend(domain_lets);
+            match refined {
+                Type::Refinement(_, refinements) => refinements
+                    .iter()
+                    .filter(|r| !inherited.contains(&r.predicate_id()))
+                    .flat_map(|r| {
+                        let read = crate::ccl::ty::TypeLet::read_by(
+                            &lets,
+                            crate::ccl::ccl_utils::free_names(&r.predicate),
+                        );
+                        std::iter::once(Rc::clone(&r.predicate)).chain(
+                            lets.iter()
+                                .zip(read)
+                                .filter(|(_, read)| *read)
+                                .map(|(l, _)| Rc::clone(&l.definition))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
         _ => Vec::new(),
     }
 }
 
 /// Rewrite the readings of every filter in a type slot of `e` or its descendants, once per
-/// predicate however many slots carry it.
-fn in_filters(e: &mut Expr, memo: &PredMemo<()>) {
-    e.walk_type_slots_mut(|ty| in_type(ty, memo, false));
-    e.walk_children_mut(|child| in_filters(child, memo));
+/// predicate however many slots carry it. `bound` holds each filter rewritten so far, before and
+/// after ([`in_type`]).
+fn in_filters(e: &mut Expr, memo: &PredMemo<()>, bound: &mut Vec<(Refinement, Refinement)>) {
+    e.walk_type_slots_mut(|ty| in_type(ty, memo, bound, false));
+    e.walk_children_mut(|child| in_filters(child, memo, bound));
 }
 
 /// Rewrite the readings of each refinement in `ty` that holds one. `domain` is whether `ty` is a
-/// collection's domain, where a refinement's element is a position.
-fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) {
+/// collection's domain, where a refinement's element is a position. Elsewhere a refinement holding
+/// a reading is a copy of a filter rewritten at its domain, such as a key collection's values,
+/// `{𝐷 | 𝑝} ⤇ {𝐷 | 𝑝}`, and takes that rewrite (`bound`).
+fn in_type(
+    ty: &mut Type,
+    memo: &PredMemo<()>,
+    bound: &mut Vec<(Refinement, Refinement)>,
+    domain: bool,
+) {
     if let Type::Refinement(base, refinements) = ty
         && refinements.iter().any(|r| holds_reading(&r.predicate))
     {
@@ -208,6 +238,13 @@ fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) {
             if !holds_reading(&refinement.predicate) {
                 return;
             }
+            if !domain
+                && let Some((_, rewritten)) = bound.iter().find(|(filter, _)| filter == refinement)
+            {
+                *refinement = rewritten.clone();
+                return;
+            }
+            let filter = refinement.clone();
             memo.rebuild(refinement, &(), |predicate| {
                 assert!(
                     domain,
@@ -218,6 +255,7 @@ fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) {
                 bind(predicate, &mut vec![(Name::elem(), element.clone())], false);
                 true
             });
+            bound.push((filter, refinement.clone()));
         });
     }
     match ty {
@@ -227,10 +265,13 @@ fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) {
             codomain,
             ..
         } => {
-            in_type(domain, memo, true);
-            in_type(codomain, memo, false);
+            in_type(domain, memo, bound, true);
+            in_type(codomain, memo, bound, false);
         }
-        _ => ty.walk_children_mut(|child| in_type(child, memo, false)),
+        // A type `let` stands at the position it decorates, so its body is a domain where the
+        // `let` is.
+        Type::Let(l) => in_type(&mut Rc::make_mut(l).body, memo, bound, domain),
+        _ => ty.walk_children_mut(|child| in_type(child, memo, bound, false)),
     }
 }
 

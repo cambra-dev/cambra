@@ -347,7 +347,8 @@ pub fn typed_case_facts(
     else {
         return none();
     };
-    let Type::Nominal(scrutinee_decl, args) = scrutinee.ty.peel_refinements() else {
+    let scrutinee_ty = scrutinee.ty.lets_distributed();
+    let Type::Nominal(scrutinee_decl, args) = scrutinee_ty.peel_refinements() else {
         return none();
     };
     if scrutinee_decl != decl {
@@ -524,7 +525,7 @@ impl WrittenOrder {
     /// The order of `ty` where no declaration writes it: a tuple by position, and a record
     /// none.
     pub fn of_type(ty: &Type) -> WrittenOrder {
-        match ty.peel_refinements() {
+        match ty.lets_distributed().peel_refinements() {
             Type::Tuple(elems) => WrittenOrder::Fields(
                 elems
                     .iter()
@@ -1561,6 +1562,8 @@ fn replace_params(
         Type::FamilyApp(app) if map.contains_key(&app.param.id) => {
             let (input, output) = map[&app.param.id];
             let family = if pol { output } else { input };
+            // The type `let`s around the family stand around its application.
+            let (family_lets, family) = crate::ccl::ty::TypeLet::peel(family);
             let Type::Family { binders, body } = family else {
                 panic!(
                     "family parameter `{}` takes a family as its argument, got {family}",
@@ -1578,9 +1581,12 @@ fn replace_params(
                 |j| crate::ccl::subst::Mapping::Rename(names[j].clone()),
                 ids,
             );
-            let terms: Vec<Rc<crate::ccl::TypedExpr>> =
+            let terms: Vec<Rc<crate::ccl::ty::HeldTerm>> =
                 app.args.iter().map(|a| Rc::clone(&a.term)).collect();
-            *ty = crate::ccl::subst::discharge_binders(solver, &names, &opened, &terms);
+            *ty = crate::ccl::ty::TypeLet::innermost_each(
+                &family_lets,
+                crate::ccl::subst::discharge_binders(solver, &names, &opened, &terms),
+            );
         }
         Type::Fun {
             fun_kind,

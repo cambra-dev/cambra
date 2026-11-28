@@ -155,6 +155,8 @@ fn blame_node_for_place(expr: &Expr, uids: &[crate::ccl::InferVarId]) -> Option<
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
             Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => false,
+            // The definition is a held term, which a node's type is not written in terms of.
+            Type::Let(l) => mentions(&l.body, uid),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -390,9 +392,17 @@ pub(super) fn resolve_predicate_types(solver: &mut Solver, ty: &mut Type) {
         // `elements` call.
         Type::WitnessProjection(p) => {
             let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
-            let mut term = (*p.term).duplicate();
+            let mut term = p.term.term().duplicate();
             resolve_expr(solver, &mut term);
             *p = crate::ccl::ty::WitnessProjection::new(Rc::new(term), p.position);
+        }
+        // A type `let`'s definition is a term the type holds, read as a projection's is.
+        Type::Let(l) => {
+            let l = Rc::make_mut(l);
+            let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
+            let mut definition = l.definition.term().duplicate();
+            resolve_expr(solver, &mut definition);
+            l.definition = crate::ccl::ty::IntoHeldTerm::into_held(definition);
         }
         _ => {}
     }
@@ -531,7 +541,7 @@ pub(super) fn map_constrain_err(
         } => InferError::NoJoinOverBinder {
             binders,
             reads: Vec::new(),
-            predicate: refinement.predicate,
+            predicate: Rc::new(refinement.predicate.clone_preserving_ids()),
             position: solver::compact::JoinedPosition::Keys,
             site,
             fed_elsewhere: false,
@@ -658,7 +668,7 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
         } => InferError::NoJoinOverBinder {
             binders,
             reads: Vec::new(),
-            predicate: refinement.predicate,
+            predicate: Rc::new(refinement.predicate.clone_preserving_ids()),
             position,
             site,
             fed_elsewhere: false,
@@ -1385,7 +1395,7 @@ fn values_ending_function_blocks(expr: &TypedExpr) -> Vec<NodeId> {
                     }
                 }
                 N::Raise { .. } => {}
-                _ if !matches!(expr.ty.peel_refinements(), Type::Base(BaseType::Unit)) => {
+                _ if !matches!(expr.ty.former(), Type::Base(BaseType::Unit)) => {
                     out.push(e.node_id());
                 }
                 _ => {}

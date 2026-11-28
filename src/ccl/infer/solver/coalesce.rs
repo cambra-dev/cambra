@@ -491,7 +491,9 @@ pub fn coalesce_compact(solver: &mut Solver, graph: &CompactGraph) -> Result<Typ
             site: violation.site,
         });
     }
-    coalesce_compact_go(solver, &graph.term, true, &[])
+    // The predicates read each definition the walk held by name; the type holds them.
+    let ty = coalesce_compact_go(solver, &graph.term, true, &[])?;
+    Ok(graph.lets.over(ty))
 }
 
 /// [`coalesce_compact`] of one position at `polarity`, outside any binder.
@@ -588,7 +590,20 @@ fn absorb_uint_ranges(atoms: &mut Vec<Type>, polarity: bool) {
     atoms.retain(|a| rank(a).is_none_or(|r| r == keep));
 }
 
+/// `ct` materialized, holding the type `let`s that stand around it
+/// ([`super::compact::CompactType::lets`]).
 fn coalesce_compact_go(
+    solver: &mut Solver,
+    ct: &CompactType,
+    polarity: bool,
+    scope: &[crate::ccl::ty::Witness],
+) -> Result<Type, CoalesceError> {
+    let ty = coalesce_compact_shape(solver, ct, polarity, scope)?;
+    Ok(ct.lets.wrap(ty))
+}
+
+/// `ct` materialized without the type `let`s around it ([`coalesce_compact_go`]).
+fn coalesce_compact_shape(
     solver: &mut Solver,
     ct: &CompactType,
     polarity: bool,
@@ -696,9 +711,10 @@ fn coalesce_compact_go(
                 coalesce_compact_go(solver, d, polarity, scope)?,
             ));
         }
+        let body = coalesce_compact_go(solver, &family.body, polarity, scope)?;
         shapes.push(Type::Family {
             binders,
-            body: Box::new(coalesce_compact_go(solver, &family.body, polarity, scope)?),
+            body: Box::new(body),
         });
     }
     if let Some(var) = &ct.var {
@@ -716,7 +732,7 @@ fn coalesce_compact_go(
         let mut inner_scope = scope.to_vec();
         inner_scope.extend(binders.iter().cloned());
         let scope: &[crate::ccl::ty::Witness] = &inner_scope;
-        // Materialize the codomain (covariant).
+        // Materialize the codomain (covariant), with the type `let`s standing in it.
         let c = coalesce_compact_go(solver, &cf.codomain, polarity, scope)?;
         // The domain, materialized contravariantly. At a `Data` position the atoms are
         // *alternatives* — one candidate each (see `denoted_domains`) — and a
@@ -1000,7 +1016,7 @@ fn coalesce_compact_go(
     // A position that materializes as a **variable** has not become a type yet and has no
     // membership to decide: the requirement stays on the variable, which every position it
     // reaches carries.
-    if !matches!(out.peel_refinements(), Type::Infer(_)) {
+    if !matches!(out.former(), Type::Infer(_)) {
         for k in &ct.kinds {
             record_membership(solver, &out, k, scope, FailedPosition::of(ct));
         }
@@ -1274,6 +1290,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
         assert_eq!(
             coalesce_compact(solver, &graph).unwrap(),
@@ -1318,6 +1335,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
         assert!(matches!(
             coalesce_compact(solver, &graph),
@@ -1350,6 +1368,7 @@ mod tests {
             },
             rec_vars: BTreeMap::new(),
             join_violations: Vec::new(),
+            lets: Default::default(),
         };
         assert!(matches!(
             coalesce_compact(solver, &graph),

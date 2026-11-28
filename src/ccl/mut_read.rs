@@ -949,11 +949,11 @@ fn box_at(value: &mut Expr, target: Type) {
     if !holds_sum(&target) {
         return;
     }
-    if target.peel_refinements().sum().is_some() {
+    if target.former().sum().is_some() {
         crate::ccl::mut_elim::view_at(value, target);
         return;
     }
-    if matches!(target.peel_refinements(), Type::Tuple(_) | Type::Record(_))
+    if matches!(target.former(), Type::Tuple(_) | Type::Record(_))
         && !matches!(
             value.node,
             TypedExprNode::Tuple(_) | TypedExprNode::Record(_)
@@ -1031,12 +1031,20 @@ fn hidden(ty: &Type, out_of_scope: &dyn Fn(&Name) -> bool) -> Type {
             codomain,
             ..
         } if fun_kind.resolved().is_data()
-            && matches!(&**domain, Type::Refinement(_, rs) if rs.iter().any(reads)) =>
+            && matches!(
+                crate::ccl::ty::TypeLet::peel(domain).1,
+                Type::Refinement(_, rs) if rs.iter().any(reads)
+            ) =>
         {
-            let Type::Refinement(base, rs) = &**domain else {
+            // The domain's type `let`s stay over what is kept of it.
+            let (lets, under) = crate::ccl::ty::TypeLet::peel(domain);
+            let Type::Refinement(base, rs) = under else {
                 unreachable!("matched a refined domain above")
             };
-            let base = Type::refined(hidden(base, out_of_scope), kept(rs));
+            let base = crate::ccl::ty::TypeLet::innermost_each(
+                &lets,
+                Type::refined(hidden(base, out_of_scope), kept(rs)),
+            );
             Type::sum_over(
                 crate::ccl::ty::TypeKind::SubtypesOf(Box::new(base)),
                 binder.clone(),
@@ -1047,6 +1055,8 @@ fn hidden(ty: &Type, out_of_scope: &dyn Fn(&Name) -> bool) -> Type {
         _ => {
             let mut out = ty.clone();
             out.walk_children_mut(|c| *c = hidden(c, out_of_scope));
+            // Dropping a refinement can leave a type `let` that nothing reads any more.
+            crate::ccl::ccl_utils::inline_rewritten_let(&mut out);
             out
         }
     }
@@ -1089,10 +1099,11 @@ fn reveal_go(
                 break;
             }
             for (n, d) in escaped {
-                // The terms the restated type holds are minted for the `let` whose definiens
-                // they copy.
+                // The type holds the definiens as a type `let`, as a type lifted past a
+                // transparent `let` does ([`Subst::let_exit`]). The terms it holds are minted
+                // for the `let` whose definiens they copy.
                 let _g = provenance::enter(d.at, "mut_read.reveal", Nature::Machinery);
-                *ty = Subst::discharge(n, d.value.clone_preserving_ids()).apply_type(ty);
+                *ty = Subst::let_exit(n, d.value.clone_preserving_ids()).apply_type(ty);
             }
         }
     });

@@ -696,7 +696,7 @@ fn alias_predicates(expr: &Expr) -> HashMap<PredicateId, EarlyResolution> {
 /// a predicate.
 #[cfg(debug_assertions)]
 fn for_each_predicate(ty: &Type, f: &mut impl FnMut(&Refinement)) {
-    ty.refinements().iter().for_each(&mut *f);
+    ty.own_refinements().iter().for_each(&mut *f);
     ty.walk_children(|c| for_each_predicate(c, f));
 }
 
@@ -726,7 +726,7 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
     use crate::ccl::provenance::NodeId;
 
     fn from_ty(t: &Type, out: &mut Vec<NodeId>) {
-        for r in t.refinements() {
+        for r in t.own_refinements() {
             from_expr(&r.predicate, out);
         }
         t.walk_children(|c| from_ty(c, out));
@@ -819,7 +819,7 @@ mod tests {
     /// inside other refinements' predicate expressions.
     fn collect_refinements(e: &Expr, out: &mut Vec<Refinement>) {
         fn from_ty(t: &Type, out: &mut Vec<Refinement>) {
-            for r in t.refinements() {
+            for r in t.own_refinements() {
                 out.push(r.clone());
                 collect_refinements(&r.predicate, out);
             }

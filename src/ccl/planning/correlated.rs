@@ -127,7 +127,10 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     // the component its type picks (`src/ccl/design/type-inference.md`, "Iterating a
     // dependent tuple"). The site pairs each enclosing value with its own keys rather
     // than with one collection every row shares.
-    if let Some(Type::DepTuple(components)) = g.ty.domain().map(|d| d.peel_refinements().clone()) {
+    if let Some(Type::DepTuple(components)) =
+        g.ty.domain()
+            .map(|d| d.lets_distributed().peel_refinements().clone())
+    {
         let family = keys_family(&components, ctx)?;
         let family_ty = family.ty.clone();
         let pair = Expr::tuple(vec![family, g.as_ref().clone_preserving_ids()])
@@ -157,7 +160,7 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
     // element; the domain ranged over is the keys before any filter. The filter rides the
     // pair as well, which [`emit_pair_filter`] has applied, so the collection is matched — and
     // its keys enumerated — at the component's membership alone.
-    let inner_domain = collection_domain(component);
+    let inner_domain = collection_domain(component, &ctx.held);
     // **A collection the row carries**: the body reads the element out of the enclosing
     // value, not out of a collection every row shares, so each row's keys are that
     // collection's own. The site pairs each enclosing value with them, as a dependent
@@ -196,6 +199,8 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
             expr.ty.clone(),
         )));
     }
+    // The level's refinements under its type `let`s.
+    let inner_refinements = predicates::refinements_under_lets(&inner_domain, &ctx.held);
     let keys = match inner_source(g, &inner_domain) {
         Some(source) => {
             // A **recorded copy**: the source stays where it is inside `𝑔`, which applies it
@@ -216,14 +221,16 @@ fn through_strength(expr: &Expr, ctx: &mut PlanningCtx) -> Result<Option<Expr>, 
         // (`iterate::membership_keys`): a body that never applies the collection still ranges
         // over the keys it holds. Only a collection the row does not read is one set of keys
         // every row shares; one that reads it is a dependent tuple's, which `keys_family` reads.
-        None if let [membership] = inner_domain.refinements()
+        // A type `let`'s binder the program's root binds is the same value in every row.
+        None if let [membership] = inner_refinements.as_slice()
             && let Some(collection) = membership.membership_collection()
-            && ccl_utils::free_names(collection).is_empty() =>
+            && ccl_utils::free_names(collection)
+                .iter()
+                .all(|n| ctx.held.bound.contains(n)) =>
         {
             iterate::membership_keys(collection, &inner_domain, ctx)?
         }
-        None if inner_domain
-            .refinements()
+        None if inner_refinements
             .iter()
             .any(|r| r.is_collection_membership()) =>
         {
@@ -330,13 +337,14 @@ pub(super) fn keys_family(
     // keys are its own, so the family is that collection unboxed and re-viewed at its keys,
     // `(λ 𝑥 → unbox(𝑡(𝑥))) ≫ map_domain` (`src/ccl/design/collections.md`, "A `for` loop over a
     // sum").
-    if let Type::WitnessProjection(projection) = &component
+    // Under the type `let`s it reads, read as a compiled predicate reads them.
+    if let Some(projection) = predicates::projection_under_lets(&component, &ctx.held)
         && ccl_utils::is_free(&x, &projection.term)
     {
+        let component = Type::WitnessProjection(projection.clone());
         return row_keys_family(&x, enclosing, &component, &projection.term, ctx);
     }
-    let image = component
-        .refinements()
+    let image = predicates::refinements_under_lets(&component, &ctx.held)
         .iter()
         .find_map(|r| {
             r.membership_collection()
@@ -440,7 +448,7 @@ fn row_keys_family(
     x: &Name,
     enclosing: &Type,
     component: &Type,
-    row: &Rc<Expr>,
+    row: &Rc<crate::ccl::ty::HeldTerm>,
     ctx: &mut PlanningCtx,
 ) -> Result<Expr, String> {
     let (unboxed, unboxed_ty) = {
@@ -519,9 +527,8 @@ fn row_keys_family(
 
 /// `component` with only its membership refinements: the domain of the collection
 /// it ranges over, without the filters a comprehension applies to the elements.
-fn collection_domain(component: &Type) -> Type {
-    let membership: Vec<_> = component
-        .refinements()
+fn collection_domain(component: &Type, held: &held::TypeLetRoles) -> Type {
+    let membership: Vec<_> = predicates::refinements_under_lets(component, held)
         .iter()
         .filter(|r| r.is_collection_membership())
         .cloned()
@@ -700,14 +707,15 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
     else {
         return Ok(false);
     };
-    let Type::Refinement(bare, filters) = domain.as_ref() else {
+    // The pair's filters, under the type `let`s around them ([`predicates::refined_under_lets`]).
+    let Some((bare, filters)) = predicates::refined_under_lets(domain, &ctx.held) else {
         return Ok(false);
     };
-    if !matches!(bare.as_ref(), Type::Tuple(components) if components.len() == 2) {
+    if !matches!(&bare, Type::Tuple(components) if components.len() == 2) {
         return Ok(false);
     }
-    let pair_ty = (**bare).clone();
-    let predicates = applied_last_first(filters.as_slice(), &pair_ty);
+    let pair_ty = bare;
+    let predicates = applied_last_first(&filters, &pair_ty);
     let old_domain = (**domain).clone();
     // The binder stays: a row whose keys depend on the pair reads it in the codomain, which
     // is stored closed against it.
@@ -750,10 +758,14 @@ fn emit_pair_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, String>
 /// front of the chain built so far, which puts the first one applied at the chain's head. The
 /// order is [`application_order`](crate::ccl::application_order)'s, so a filter reading a value
 /// another narrowed, as a group read at a key is defined only at its group's keys, runs after it.
-fn applied_last_first(filters: &[crate::ccl::Refinement], base: &Type) -> Vec<Rc<TypedExpr>> {
-    let mut ordered: Vec<Rc<TypedExpr>> = crate::ccl::application_order(filters, base)
-        .map(|(r, _)| Rc::clone(&r.predicate))
-        .collect();
+fn applied_last_first(
+    filters: &[crate::ccl::Refinement],
+    base: &Type,
+) -> Vec<Rc<crate::ccl::ty::HeldTerm>> {
+    let mut ordered: Vec<Rc<crate::ccl::ty::HeldTerm>> =
+        crate::ccl::application_order(filters, base)
+            .map(|(r, _)| Rc::clone(&r.predicate))
+            .collect();
     ordered.reverse();
     ordered
 }
@@ -779,15 +791,14 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
         second,
         crate::ccl::Ids::Fresh,
     );
-    let filters: Vec<crate::ccl::Refinement> = second
-        .refinements()
+    let stated = predicates::refinements_under_lets(&second, &ctx.held);
+    let filters: Vec<crate::ccl::Refinement> = stated
         .iter()
         .filter(|r| !r.is_collection_membership())
         .cloned()
         .collect();
     if filters.is_empty()
-        || second
-            .refinements()
+        || stated
             .iter()
             .any(|r| r.is_collection_membership() && ccl_utils::is_free(&a, &r.predicate))
     {
@@ -797,8 +808,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
     // keys exist, which the collection the row is read from demands on its domain, so it stays.
     let keys = Type::refined(
         second.peel_refinements().clone(),
-        second
-            .refinements()
+        stated
             .iter()
             .filter(|r| r.is_collection_membership())
             .cloned()
@@ -915,7 +925,7 @@ fn mentions_type(e: &Expr, old: &Type) -> bool {
     fn in_type(ty: &Type, old: &Type) -> bool {
         ty == old
             || ty
-                .refinements()
+                .own_refinements()
                 .iter()
                 .any(|r| mentions_type(&r.predicate, old))
             || {

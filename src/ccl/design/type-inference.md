@@ -1635,8 +1635,9 @@ allocation, and a rewritten term is not identified merely by its predecessor's s
 
 Two refinements are equal when their predicates' normal forms are equal as terms
 (`eq_term_modulo_ty_slots`, which pairs interior binders), and a refinement hashes by its normal
-form. `ccl_utils::normal_form` computes it, and `Refinement` caches it beside the predicate it was
-computed for.
+form. `ccl_utils::normal_form` computes it. A held term lives in an allocation the type slots
+holding it share (`HeldTerm`), and the allocation keeps the normal form, computed once for every
+slot. A held term is immutable, so the normal form never goes stale.
 
 A type holds terms, and passes respell the terms it holds. A-normalization names operands,
 inlining moves a definition into place, lambda elimination rewrites a definition point-free while a
@@ -1682,6 +1683,16 @@ does not state. `𝑥 ▷ (𝑚 ▷ filter_values)` equals `𝑥` where `𝑥` s
 elimination and correlated filters stamp `𝑚 ▷ filter_values` at the unrefined `𝐷 ⤇ 𝐷`. The
 enclosing refinement keeps the argument where `𝑚` holds, and the comparison does not check that it
 does.
+
+A free read of a binder a type `let` defines is that definition where a rule above takes the read
+apart: the reduction reads the definition's normal form there (`ccl_utils::normal_form_through`).
+Every other read stays a read, and a comparison reads it as its definition
+([A type `let`](#a-type-let)). A normal form records the binders a rule took
+apart reads of (`ccl_utils::normal_form_taking_apart`), so a term none of whose such binders is
+held keeps the normal form it has alone. The allocation keeps each read through definitions with
+the binders the read looked up and the definition allocation that answered each, or that none did
+(`HeldTerm::read_through`). A scope that gives the same answers reads the term alike and reuses the
+read.
 
 Normalizing is term-level: it leaves type slots as they are and mints no node identity, so an
 equality can run it. A consumer that reads a predicate as a term rather than comparing it, the SMT
@@ -1734,7 +1745,8 @@ coalesce as several copies, one per substitution, and each copy coalesces apart.
 Each inference run records what every predicate copy and every coalesce rebuild was derived from
 (`ccl_utils::record_derivation`, held by the run's solver). Coalesce follows a coalesced predicate
 to its origin and points it at a predicate already coalesced from the same origin that equals it and
-reads the same names and witnesses (`share_with_its_origin` in `infer/solve.rs`). Term equality
+reads the same names and witnesses (`share_with_its_origin` in `infer/solve.rs`, through
+`ccl_utils::SharedTerms`). Term equality
 compares a refinement nested in a type slot type-blind, and two copies made under different
 substitutions can differ there in a name they read, so the reads are compared as well: the shared
 predicate is in scope at every slot that holds it. Predicates with different origins stay apart even
@@ -3248,9 +3260,11 @@ chain reads each position as its input carried there.
 
 #### `let` binders and scope exit
 
-When a result type leaves a transparent let binder's scope, references to the binder are replaced
-with its definition, subject to the mutable-definition exceptions below. A Pi binder has no
-defining value to substitute; leaving that binder instead
+When a result type leaves a transparent `let` binder's scope, the type holds the binder's
+definition as `let 𝑥 = 𝑒 in 𝑇` ([A type `let`](#a-type-let)). A definition no
+larger than a read of its binder, a literal or a path of projections of a variable named in a
+scope, is discharged at each read instead (`Subst::let_exit`). The mutable-definition exceptions
+below apply to both. A Pi binder has no defining value to substitute; leaving that binder instead
 abstracts the result into a function type.
 
 An opaque entry (`x ^= e`) is not discharged: its name remains in the lifted type.
@@ -3262,7 +3276,7 @@ and discharges the name it left in the lifted types
 
 For a transparent value binding, `InferCtx::close_let_type` runs after restoring the enclosing
 telescope. It creates the let
-node's result variable there and adds the body's type as a lower bound with the discharge
+node's result variable there and adds the body's type as a lower bound with the binder's exit
 `[𝑥 ↦ definition]`. A direct substitution into the body's variable would miss refinements
 stored on its bounds. Returning that variable unchanged would expose its local name outside
 the binder without a mediating edge.
@@ -3277,9 +3291,102 @@ outward. Coalescing does not resolve a `let`'s own result variable, nor an effec
 mutable introduction's type, which is its body's own: each takes its body's coalesced type, and
 resolving the variable would compact the whole spine below it, quadratic in the spine's length. A
 conflict on that variable is one on the body's variable, which every upper bound on it reaches when
-it is recorded, so it is reported at the body. If lambda elimination rewrites a definition held by
-the result type, its let rebuild must discharge the rewritten definition again. The post-pass check
-likewise reconstructs from the tree it receives, not from a pre-transformation held term.
+it is recorded, so it is reported at the body. If lambda elimination rewrites a definition, the
+`let` it rebuilds holds the rewritten definition in the `let`'s type. The post-pass check likewise
+reconstructs from the tree it receives, not from a pre-transformation held term.
+
+#### A type `let`
+
+`Type::Let` (`TypeLet`) is `let 𝑥 = 𝑒 in 𝑇`: the values of `𝑇[𝑥 ↦ 𝑒]`, with the definition `𝑒`
+stored once rather than at each read of `𝑥`. No program writes one. A transparent `let`'s scope
+exit creates it ([`let` binders and scope exit](#let-binders-and-scope-exit)). A diagnostic writes
+a binder the program named by its name and a binder the compiler minted as its definition, a term
+the program wrote once (`chl_print`).
+
+**Scope.** `𝑥` is bound in `𝑇`, the terms `𝑇` holds and the types inside those terms included.
+`𝑒` stands where the `let` does: it reads the term binders around the `let` by name and the
+functions around it by index. A run holds each definition under one name, equal definitions under
+one name and two definitions under two (`TypeLetNames` in `solver/compact.rs`).
+
+**Sharing.** Copies of one definition that are equal terms and read the same names and witnesses
+share one allocation, as copies of one predicate do
+([Copies of one predicate share after coalesce](#copies-of-one-predicate-share-after-coalesce)).
+Each phase that makes copies shares them: a run's compactions (`TypeLetNames::shared`), coalescing
+(`share_held_term` in `solve.rs`), and planning (`TypeLetScope::share_definition`), each through
+`ccl_utils::SharedTerms`. Without sharing, a definition held at 𝑛 positions is 𝑛 copies, and a chain
+of `let`s, each defined by reading the one before, grows quadratically in its length
+(`tests/it/let_definition_cost.rs`).
+
+**Placement.** A type `let` stands at the innermost position holding every read of its binder,
+and is gone where its body reads none (`TypeLet::innermost`). A definition moved under a function is
+closed against that function's binder. A definition that is a literal or a path of projections of
+a variable is discharged (`TypeLet::inline_atomic`), at each read raised by the binders between the
+`let` and the read, which its indices count (`TypeLet::discharged`).
+
+**Reading a type's parts.** A part taken out of a type is read from `Type::lets_distributed`, which
+moves the `let`s at the root into the parts that read them, so the part stands with its
+definitions. A test of which former a type is reads `Type::former`. A projection's witness is read
+with its candidates under the `let`s of the projected term's type (`WitnessProjection::witness`).
+
+**Substitution.** A substitution acting on `let 𝑥 = 𝑒 in 𝑇` rewrites `𝑒` once and `𝑇` under `𝑥`.
+Composition stacks `let` exits rather than rewriting the first substitution's terms through them
+(`Subst::then`), so a composite holds each definition once. A join over a binder a definition reads
+first discharges the definition into its readers, which then name the joined binder
+(`Subst::lets_joined_by`). A comparison holds the `let` exit on a projection it substitutes:
+`σ(𝑥)` under `[𝑥 ↦ 𝑒]` is `let 𝑥 = 𝑒 in σ(𝑥)`, a projection to every rule of the comparison
+(`constrain::substituted_projection`). A substitution acting on a realized conditional acts on the
+conditional it stages as on its legs (`Subst::apply_staged`).
+
+**Equality.** A type `let` is sharing. `Type`'s `==` and hash read `let 𝑥 = 𝑒 in 𝑇` as `𝑇` with `𝑒`
+discharged at each read of `𝑥` (`type_eq_go`, `type_hash_go`), so a type holding a definition and the
+type with the definition discharged are one type. A held term's read of `𝑥` compares as `𝑒` in
+normal form, raised by the binders between the `let` and the read, and the term's normal form has
+`𝑒` discharged where a reduction takes the read apart
+([Predicates are compared by normal form](#predicates-are-compared-by-normal-form)). The hash builds
+each node's hash from its children's, and a read hashes as its definition (`TermHasher`). Types are
+compared as they stand: a binder one side defines and the other reads free are two binders, and two
+definitions of one binder compare each where its own `let` stands. A debug build checks that types
+`==` equates through a definition hash alike. Equal under definitions (`type_eq_under_definitions`)
+is the same walk with each side's binders paired, alpha-equivalence, and a free read of a binder
+its caller defines read as the definition.
+
+**Refinements in a comparison.** `constrain` forces each side's refinements through that side's
+morphism with the morphism's `let` exits held (`Subst::force_refinement_holding`): a forced
+refinement keeps reading the binder, and the side's `let`s stand beside it (`constrain::Ambient`).
+A refinement of one side is among the other's where it is equal under both sides' `let`s
+(`ty::refinement_eq_under_lets`), and the solver takes each binder as equal to its definition
+(`smt::UnderLets`). A guarded bound stores its guard as `let 𝐿 in {_ | 𝑅}`, and a specialization key
+keys a refinement beside the `let`s it reads. `Subst::force_refinement` refuses a refinement reading
+a `let` exit.
+
+**Compaction.** A walk holds each definition it reaches through a `let` exit (`CompactLets`), at the
+scope of the innermost binder the definition reads. The compacted position that scope opens over
+carries it (`CompactType::lets`), and coalescing wraps the position's materialized type in it. Each
+scope keeps the copy held in it: copies closed alike can differ in type slots whose variables
+resolve to that scope's binders. Two positions are equal where they also bind the same names to
+definitions equal up to type slots (`TypeLets`). A projection or family application reading a type
+`let`'s definition is one atom with the one holding the definition discharged: the atom hashes and
+compares through the definitions it reads (`ClosedAtom::held`).
+
+**Generalized definitions.** In a type `let`'s body, its binder names the type `let`'s definition,
+never a generalized `let` of the program spelled the same (`CoalesceCtx::let_shadows`). Once the
+program's generalized `let`s are specialized, a generalized definition a type holds becomes the
+specializations its reads need: `let f = 𝑒 in 𝑇` reading `f` at an instantiation the program
+specialized as `f₁` becomes `let f₁ = 𝑒₁ in 𝑇[f ↦ f₁]` (`specialize_generic_type_lets` in
+`solve.rs`). A read matches the specialization whose instantiation resolves to the read's type.
+
+**The post-pass check.** An edge is drawn under the `let`s around the position checked
+(`CheckCtx::scope_lets`): the type `let`s of the type being walked, and the tree's transparent
+`let`s whose binders a type reads. Both sides start under the exits of the ones they read
+(`CheckCtx::scope_exits`), the morphism constrain composes for a type `let` around a side, so a
+rule meets each side's own shape. A definition a pass made a statement, as mutability elimination
+makes a generator's call a `letrec`, is no term a type holds, so a type reads its binder by name.
+
+**Planning.** The program's root binds each type `let`'s definition a compiled refinement reads
+where it can, and the compiled refinement reads that binder (`planning/held.rs`). A compiled
+refinement has every other type `let`'s definition it reads discharged
+(`TypeLetScope::compiled_form` in `planning/predicates.rs`). A `restrict`'s domains compare equal
+under the definitions the root binds (`ccl_utils::make_restrict_stating_under`).
 
 #### A lambda's codomain drops the body's opaque binders
 

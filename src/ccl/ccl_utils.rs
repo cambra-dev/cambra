@@ -9,10 +9,11 @@ use std::rc::Rc;
 
 use crate::ccl::feed_nest::FeedValue;
 use crate::ccl::subst::Subst;
+use crate::ccl::ty::IntoHeldTerm;
 use crate::ccl::{
-    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, HeldTerm,
-    Lit, LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedBinding,
-    TypedExprNode, UnaryOpKind, V_FIRED, V_IDLE,
+    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
+    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, TermHolder, Type,
+    TypedBinding, TypedExprNode, UnaryOpKind, V_FIRED, V_IDLE,
 };
 use crate::ccl::{Duplicate, Ids};
 
@@ -244,7 +245,7 @@ pub(crate) fn writer_decision(
 /// The type of field `field` of a writer decision's record type `decision_ty`, peeling its
 /// refinements ([`writer_decision`]).
 pub fn decision_field_ty(decision_ty: &Type, field: &Label) -> Type {
-    match decision_ty.peel_refinements() {
+    match decision_ty.lets_distributed().peel_refinements() {
         Type::Record(fields) => fields
             .iter()
             .find(|(k, _)| k == field)
@@ -641,8 +642,8 @@ pub(crate) fn predicate_term(solver: &mut Solver, term: &Expr) -> Expr {
 /// - an applied `cast` reads its value: `𝑎 ▷ cast(𝑣)` is `𝑎 ▷ 𝑣`, since a cast re-views a
 ///   collection's domain and leaves what it holds at a key;
 /// - every eliminated combinator applied to an argument reads back to the term it stands for:
-///   `id`, `const`, a `zip` pairing, `apply`, a binary or unary operator, a chain, `curry`
-///   (`𝑥 ▷ (𝑓 ▷ curry)` is `λ 𝑦 → (𝑥, 𝑦) ▷ 𝑓`) and `uncurry`;
+///   `id`, `const`, a `zip` pairing, `apply`, a binary or unary operator, an aggregate, a
+///   chain, `curry` (`𝑥 ▷ (𝑓 ▷ curry)` is `λ 𝑦 → (𝑥, 𝑦) ▷ 𝑓`) and `uncurry`;
 /// - a value `Case` eliminated over its input, `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back
 ///   as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`, each guard its leg's first-match gate with the earlier guards peeled
 ///   off ([`read_fan_out`]);
@@ -662,8 +663,7 @@ pub(crate) fn predicate_term(solver: &mut Solver, term: &Expr) -> Expr {
 /// It mints no node identity, so an equality can run it. A reduction that shifts a term whose
 /// type slots hold a variable records the shifted variable's suspension in `solver`.
 pub(crate) fn normal_form_in(solver: &mut Solver, term: &Expr) -> Expr {
-    let mut fuel = NORMAL_FORM_STEPS;
-    normalize(solver, term.clone_preserving_ids(), &mut fuel)
+    normalize(&mut Reduction::new(solver), term.clone_preserving_ids())
 }
 
 /// [`normal_form_in`] outside every typing run, with whether the result is the same in every run.
@@ -686,13 +686,97 @@ pub(crate) fn normal_form(term: &Expr) -> Expr {
     normal_form_detached(term).0
 }
 
+/// What a free read of a binder stands for where a reduction takes it apart
+/// ([`normal_form_through`]): the binder's definition in normal form, or `None` for a binder it
+/// leaves as read.
+pub(crate) type LetDefinitions<'h> = dyn FnMut(&Name) -> Option<Rc<Expr>> + 'h;
+
+/// A reduction to normal form in progress ([`normal_form_in`]): the run's solver, the steps
+/// left before it gives up, the definitions it reads through, and the binders it found read
+/// where it takes a term apart.
+struct Reduction<'a> {
+    solver: &'a mut Solver,
+    fuel: usize,
+    held: Option<&'a mut LetDefinitions<'a>>,
+    taken_apart: Vec<Name>,
+}
+
+impl<'a> Reduction<'a> {
+    fn new(solver: &'a mut Solver) -> Self {
+        Reduction {
+            solver,
+            fuel: NORMAL_FORM_STEPS,
+            held: None,
+            taken_apart: Vec::new(),
+        }
+    }
+
+    /// `e` as a reduction taking it apart reads it: a free read of a binder this reduction
+    /// reads through is that binder's definition.
+    fn seen<'e>(&mut self, e: &'e Expr) -> Seen<'e> {
+        if let TypedExprNode::Var(n) = &e.node {
+            if let Some(held) = self.held.as_mut()
+                && let Some(definition) = held(n)
+            {
+                return Seen::Held(definition);
+            }
+            self.taken_apart.push(n.clone());
+        }
+        Seen::Here(e)
+    }
+}
+
+/// A term a reduction takes apart ([`Reduction::seen`]): the term itself, or the definition of
+/// the binder it reads.
+enum Seen<'e> {
+    Here(&'e Expr),
+    Held(Rc<Expr>),
+}
+
+impl std::ops::Deref for Seen<'_> {
+    type Target = Expr;
+    fn deref(&self) -> &Expr {
+        match self {
+            Seen::Here(e) => e,
+            Seen::Held(d) => d,
+        }
+    }
+}
+
+/// `normal`, a normal form ([`normal_form`]), with each free read of a binder `held` defines
+/// discharged where a reduction takes the read apart, and reduced there. A read no reduction
+/// takes apart stays a read. The result is the normal form of the term with every definition
+/// discharged, up to the reads it keeps
+/// (`src/ccl/design/type-inference.md`, "A type `let`").
+pub(crate) fn normal_form_through(normal: &Expr, held: &mut LetDefinitions<'_>) -> Expr {
+    let mut solver = Solver::none();
+    let mut r = Reduction::new(&mut solver);
+    r.held = Some(held);
+    normalize(&mut r, normal.clone_preserving_ids())
+}
+
+/// [`normal_form_detached`], with the binders its reduction found read where it takes a term
+/// apart: where none of them is a type `let`'s binder, the normal form is the one
+/// [`normal_form_through`] gives.
+pub(crate) fn normal_form_taking_apart(term: &Expr) -> (Expr, bool, Vec<Name>) {
+    let mut closed = term.clone_preserving_ids();
+    let held_variables = crate::ccl::infer::close_term(&mut closed);
+    let mut solver = Solver::none();
+    let mut r = Reduction::new(&mut solver);
+    let normal = normalize(&mut r, closed);
+    let mut taken_apart = r.taken_apart;
+    taken_apart.sort();
+    taken_apart.dedup();
+    (normal, !held_variables, taken_apart)
+}
+
 /// The reduction steps [`normal_form`] takes before it gives up. A typed predicate's reduction
 /// terminates, so running out means a reduction rule that loops or a predicate larger than any
 /// a program here builds.
 const NORMAL_FORM_STEPS: usize = 100_000;
 
-fn normalize(solver: &mut Solver, mut e: Expr, fuel: &mut usize) -> Expr {
-    *fuel = fuel.checked_sub(1).unwrap_or_else(|| {
+fn normalize(r: &mut Reduction<'_>, mut e: Expr) -> Expr {
+    r.fuel = r.fuel.checked_sub(1).unwrap_or_else(|| {
         panic!(
             "normalizing a predicate took more than {NORMAL_FORM_STEPS} reduction steps: \
              either a reduction rule loops or the predicate outgrew the bound"
@@ -701,14 +785,14 @@ fn normalize(solver: &mut Solver, mut e: Expr, fuel: &mut usize) -> Expr {
     // A realized conditional reads as the conditional it stages. Its gated legs are a change of
     // representation, not a respelling, so they are not read back.
     if let TypedExprNode::Realized { staged, .. } = &e.node {
-        return normalize(solver, staged.clone_preserving_ids(), fuel);
+        return normalize(r, staged.clone_preserving_ids());
     }
-    e.map_children(|c| normalize(solver, c, fuel));
-    reduce_head(solver, e, fuel)
+    e.map_children(|c| normalize(r, c));
+    reduce_head(r, e)
 }
 
 /// A node whose children are normal, reduced at its head.
-fn reduce_head(solver: &mut Solver, e: Expr, fuel: &mut usize) -> Expr {
+fn reduce_head(r: &mut Reduction<'_>, e: Expr) -> Expr {
     match &e.node {
         TypedExprNode::Let {
             binding,
@@ -716,7 +800,7 @@ fn reduce_head(solver: &mut Solver, e: Expr, fuel: &mut usize) -> Expr {
             body,
         } if binding.transparency == BindingTransparency::Transparent => {
             let substituted = substitute_term(
-                solver,
+                r.solver,
                 body.as_ref().clone_preserving_ids(),
                 &binding.name,
                 bound_expr,
@@ -728,20 +812,20 @@ fn reduce_head(solver: &mut Solver, e: Expr, fuel: &mut usize) -> Expr {
             if is_free_in_value(&binding.name, &substituted) {
                 return e;
             }
-            normalize(solver, substituted, fuel)
+            normalize(r, substituted)
         }
         TypedExprNode::Apply { argument, function } => {
-            reduce_application(solver, argument, function, &e.ty, fuel).unwrap_or(e)
+            reduce_application(r, argument, function, &e.ty).unwrap_or(e)
         }
         TypedExprNode::Case {
             scrutinee: Some(_), ..
         } => {
             let e = match_by_tags(e);
-            known_constructor(solver, &e, fuel).unwrap_or(e)
+            known_constructor(r, &e).unwrap_or(e)
         }
         // A chain headed by planning's `iterate` is the rest of the chain: `iterate` maps each
         // key to itself, as it does applied.
-        TypedExprNode::Compose(steps) if steps.len() > 1 && is_iterate(&steps[0]) => {
+        TypedExprNode::Compose(steps) if steps.len() > 1 && is_iterate(&r.seen(&steps[0])) => {
             let rest: Vec<Expr> = steps[1..].iter().map(Expr::clone_preserving_ids).collect();
             match <[Expr; 1]>::try_from(rest) {
                 Ok([only]) => only,
@@ -766,7 +850,7 @@ fn is_iterate(e: &Expr) -> bool {
 /// A `match` over a value its constructor builds where it stands, `match C(𝑥) { C(𝑝) → body }`,
 /// read as the arm that constructor selects: `body` with `𝑝` bound to `𝑥`. `None` where the
 /// scrutinee is no constructor's value or no arm is known to select it.
-fn known_constructor(solver: &mut Solver, e: &Expr, fuel: &mut usize) -> Option<Expr> {
+fn known_constructor(r: &mut Reduction<'_>, e: &Expr) -> Option<Expr> {
     let TypedExprNode::Case {
         scrutinee: Some(scrutinee),
         branches,
@@ -775,6 +859,7 @@ fn known_constructor(solver: &mut Solver, e: &Expr, fuel: &mut usize) -> Option<
     else {
         return None;
     };
+    let scrutinee = r.seen(scrutinee);
     let (tag, payload) = match &scrutinee.node {
         TypedExprNode::NominalCtor {
             decl,
@@ -787,18 +872,21 @@ fn known_constructor(solver: &mut Solver, e: &Expr, fuel: &mut usize) -> Option<
     };
     // The first arm that matches, which needs a guard known to hold.
     for branch in branches {
-        if !matches!(branch.guard.node, TypedExprNode::Lit(Lit::Bool(true))) {
+        if !matches!(
+            r.seen(&branch.guard).node,
+            TypedExprNode::Lit(Lit::Bool(true))
+        ) {
             return None;
         }
         match &branch.pattern {
             Some(pattern) if pattern.tag() == tag => {
                 let selected = substitute_term(
-                    solver,
+                    r.solver,
                     branch.body.clone_preserving_ids(),
                     &pattern.binding.name,
                     payload,
                 );
-                return Some(normalize(solver, selected, fuel));
+                return Some(normalize(r, selected));
             }
             Some(_) => continue,
             None => return Some(branch.body.clone_preserving_ids()),
@@ -808,18 +896,12 @@ fn known_constructor(solver: &mut Solver, e: &Expr, fuel: &mut usize) -> Option<
 }
 
 /// `argument ▷ function` built without an identity, then reduced.
-fn applied(
-    solver: &mut Solver,
-    argument: Expr,
-    function: Expr,
-    ty: Type,
-    fuel: &mut usize,
-) -> Expr {
+fn applied(r: &mut Reduction<'_>, argument: Expr, function: Expr, ty: Type) -> Expr {
     let node = TypedExprNode::Apply {
         argument: Box::new(argument),
         function: Box::new(function),
     };
-    reduce_head(solver, Expr::throwaway(node).with_ty(ty), fuel)
+    reduce_head(r, Expr::throwaway(node).with_ty(ty))
 }
 
 /// `argument ▷ (inner ▷ combinator)` reduced at its head, for [`reduce_application`]. A
@@ -827,13 +909,12 @@ fn applied(
 /// temporaries share one frame, and the combinators' arms would otherwise ride on every level
 /// of a deep reduction.
 fn reduce_combinator_application(
-    solver: &mut Solver,
+    r: &mut Reduction<'_>,
     argument: &Expr,
     function: &Expr,
     inner: &Expr,
     combinator: &Expr,
     ty: &Type,
-    fuel: &mut usize,
 ) -> Option<Expr> {
     let a = || argument.clone_preserving_ids();
     let codomain = |f: &Expr| f.ty.codomain().unwrap_or(Type::Hole);
@@ -844,6 +925,7 @@ fn reduce_combinator_application(
         )),
         _ => None,
     };
+    let combinator = r.seen(combinator);
     match &combinator.node {
         TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
         TypedExprNode::Builtin(Builtin::Converse) => {
@@ -851,10 +933,10 @@ fn reduce_combinator_application(
             let read = Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
             let element = Expr::throwaway(TypedExprNode::Var(Name::elem())).with_ty(Type::Hole);
             let (key_function, at_key) = (
-                crate::ccl::subst::shift_elems(solver, inner, 1, Ids::Kept),
-                crate::ccl::subst::shift_elems(solver, argument, 1, Ids::Kept),
+                crate::ccl::subst::shift_elems(r.solver, inner, 1, Ids::Kept),
+                crate::ccl::subst::shift_elems(r.solver, argument, 1, Ids::Kept),
             );
-            let key = applied(solver, element, key_function, Type::Hole, fuel);
+            let key = applied(r, element, key_function, Type::Hole);
             let predicate = Expr::throwaway(TypedExprNode::BinOp {
                 left: Box::new(key),
                 op: BinOpKind::Compare(crate::ccl::CompareKind::Equals),
@@ -872,29 +954,25 @@ fn reduce_combinator_application(
         TypedExprNode::Builtin(Builtin::Map) => {
             let position = Name::fresh("__mapped_position");
             let read = Expr::throwaway(TypedExprNode::Var(position.clone())).with_ty(Type::Hole);
-            let value = applied(solver, read, a(), Type::Hole, fuel);
-            let body = applied(
-                solver,
-                value,
-                inner.clone_preserving_ids(),
-                Type::Hole,
-                fuel,
-            );
-            let mapped = normal_function_value(solver, function, argument, ty, position, body);
-            Some(if let TypedExprNode::Cast { target, .. } = &argument.node {
-                let lambda = match mapped.node {
-                    TypedExprNode::Cast { value, .. } => *value,
-                    _ => mapped,
-                };
-                normal_cast_collection(lambda, target.domain().unwrap_or(Type::Hole), ty)
-            } else {
-                mapped
-            })
+            let value = applied(r, read, a(), Type::Hole);
+            let body = applied(r, value, inner.clone_preserving_ids(), Type::Hole);
+            let mapped = normal_function_value(r.solver, function, argument, ty, position, body);
+            Some(
+                if let TypedExprNode::Cast { target, .. } = &r.seen(argument).node {
+                    let lambda = match mapped.node {
+                        TypedExprNode::Cast { value, .. } => *value,
+                        _ => mapped,
+                    };
+                    normal_cast_collection(lambda, target.domain().unwrap_or(Type::Hole), ty)
+                } else {
+                    mapped
+                },
+            )
         }
         // `zip` fans its input out to each component, of a tuple or of a record.
         TypedExprNode::Builtin(Builtin::Zip) => {
-            let mut at =
-                |f: &Expr| applied(solver, a(), f.clone_preserving_ids(), codomain(f), fuel);
+            let inner = r.seen(inner);
+            let mut at = |f: &Expr| applied(r, a(), f.clone_preserving_ids(), codomain(f));
             let node = match &inner.node {
                 TypedExprNode::Tuple(parts) => {
                     TypedExprNode::Tuple(parts.iter().map(&mut at).collect())
@@ -930,7 +1008,7 @@ fn reduce_combinator_application(
             function: transformer,
             ..
         } if matches!(
-            transformer.node,
+            r.seen(transformer).node,
             TypedExprNode::Builtin(Builtin::Restrict | Builtin::Converse)
         ) =>
         {
@@ -939,8 +1017,8 @@ fn reduce_combinator_application(
         TypedExprNode::Builtin(Builtin::StrengthOver) => {
             let k = Name::fresh("__strength_key");
             let k_var = Expr::throwaway(TypedExprNode::Var(k.clone())).with_ty(Type::Hole);
-            let collection = applied(solver, a(), inner.clone_preserving_ids(), Type::Hole, fuel);
-            let element = applied(solver, k_var, collection, Type::Hole, fuel);
+            let collection = applied(r, a(), inner.clone_preserving_ids(), Type::Hole);
+            let element = applied(r, k_var, collection, Type::Hole);
             let body =
                 Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
             let param = TypedBinding {
@@ -964,27 +1042,26 @@ fn reduce_combinator_application(
         TypedExprNode::Apply {
             argument: g,
             function: map,
-        } if matches!(map.node, TypedExprNode::Builtin(Builtin::Map)) => {
-            let at = applied(solver, a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+        } if matches!(r.seen(map).node, TypedExprNode::Builtin(Builtin::Map)) => {
+            let at = applied(r, a(), inner.clone_preserving_ids(), Type::Hole);
             Some(applied(
-                solver,
+                r,
                 at,
                 g.as_ref().clone_preserving_ids(),
                 ty.clone(),
-                fuel,
             ))
         }
         TypedExprNode::Builtin(Builtin::Curry | Builtin::CurryOver) => {
             let inner = match &combinator.node {
-                TypedExprNode::Builtin(Builtin::CurryOver) => pair(inner)?.1,
+                TypedExprNode::Builtin(Builtin::CurryOver) => pair(&r.seen(inner))?.1,
                 _ => inner.clone_preserving_ids(),
             };
             let y = Name::fresh("__curried");
             let y_var = Expr::throwaway(TypedExprNode::Var(y.clone())).with_ty(Type::Hole);
             let both = Expr::throwaway(TypedExprNode::Tuple(vec![a(), y_var])).with_ty(Type::Hole);
-            let body = applied(solver, both, inner, Type::Hole, fuel);
+            let body = applied(r, both, inner, Type::Hole);
             Some(normal_function_value(
-                solver, function, argument, ty, y, body,
+                r.solver, function, argument, ty, y, body,
             ))
         }
         // At a tuple `(𝑘₁, …, 𝑘ₙ)`, `uncurry(𝑛)` of `𝑔` reads `𝑘ₙ ▷ (… ▷ (𝑘₁ ▷ 𝑔))`.
@@ -994,9 +1071,9 @@ fn reduce_combinator_application(
             };
             let mut level = inner.clone_preserving_ids();
             for k in 0..*n {
-                let key = applied(solver, a(), project(k), Type::Hole, fuel);
+                let key = applied(r, a(), project(k), Type::Hole);
                 let at = if k + 1 == *n { ty.clone() } else { Type::Hole };
-                level = applied(solver, key, level, at, fuel);
+                level = applied(r, key, level, at);
             }
             Some(level)
         }
@@ -1007,11 +1084,10 @@ fn reduce_combinator_application(
 /// `argument ▷ function` reduced at its head, for normal `argument` and `function`; `None`
 /// where it is already normal.
 fn reduce_application(
-    solver: &mut Solver,
+    r: &mut Reduction<'_>,
     argument: &Expr,
     function: &Expr,
     ty: &Type,
-    fuel: &mut usize,
 ) -> Option<Expr> {
     let a = || argument.clone_preserving_ids();
     let codomain = |f: &Expr| f.ty.codomain().unwrap_or(Type::Hole);
@@ -1022,58 +1098,58 @@ fn reduce_application(
         )),
         _ => None,
     };
+    let function = r.seen(function);
     match &function.node {
         // Several parameters take the components of a tuple; a tuple named rather than built
         // has none to take, and stays applied.
         TypedExprNode::Lambda { params, body } => {
-            let parts: Vec<&Expr> = match (params.as_slice(), &argument.node) {
-                ([_], _) => vec![argument],
-                (params, TypedExprNode::Tuple(parts)) if parts.len() == params.len() => {
-                    parts.iter().collect()
+            let tuple;
+            let parts: Vec<&Expr> = match params.as_slice() {
+                [_] => vec![argument],
+                params => {
+                    tuple = r.seen(argument);
+                    match &tuple.node {
+                        TypedExprNode::Tuple(parts) if parts.len() == params.len() => {
+                            parts.iter().collect()
+                        }
+                        _ => return None,
+                    }
                 }
-                _ => return None,
             };
             let body = params.iter().zip(parts).fold(
                 body.as_ref().clone_preserving_ids(),
-                |body, (param, part)| substitute_term(solver, body, &param.name, part),
+                |body, (param, part)| substitute_term(r.solver, body, &param.name, part),
             );
-            Some(normalize(solver, body, fuel))
+            Some(normalize(r, body))
         }
         TypedExprNode::Cast { value, .. } => Some(applied(
-            solver,
+            r,
             a(),
             value.as_ref().clone_preserving_ids(),
             ty.clone(),
-            fuel,
         )),
         // `unbox` is the identity on the map: it re-types a sum's keys by its projected domain
         // and changes no key or value.
         TypedExprNode::Builtin(Builtin::Id | Builtin::Unbox) => Some(a()),
         TypedExprNode::Compose(steps) => Some(steps.iter().fold(a(), |acc, step| {
-            applied(
-                solver,
-                acc,
-                step.clone_preserving_ids(),
-                codomain(step),
-                fuel,
-            )
+            applied(r, acc, step.clone_preserving_ids(), codomain(step))
         })),
         TypedExprNode::Apply {
             argument: inner,
             function: combinator,
-        } => reduce_combinator_application(solver, argument, function, inner, combinator, ty, fuel),
+        } => reduce_combinator_application(r, argument, &function, inner, combinator, ty),
         TypedExprNode::Builtin(Builtin::Apply) => {
-            let (x, f) = pair(argument)?;
-            Some(applied(solver, x, f, ty.clone(), fuel))
+            let (x, f) = pair(&r.seen(argument))?;
+            Some(applied(r, x, f, ty.clone()))
         }
         TypedExprNode::Builtin(Builtin::NotFn) => Some(unary(UnaryOpKind::Not, a(), ty)),
         TypedExprNode::Builtin(Builtin::Neg) => Some(unary(UnaryOpKind::Neg, a(), ty)),
-        TypedExprNode::DisjointJoin(legs) => read_fan_out(solver, argument, legs, ty, fuel),
+        TypedExprNode::DisjointJoin(legs) => read_fan_out(r, argument, legs, ty),
         TypedExprNode::Builtin(Builtin::FinalOrDefault) => {
-            read_eliminated_match(solver, argument, ty, fuel).map(|m| reduce_head(solver, m, fuel))
+            read_eliminated_match(r, argument, ty).map(|m| reduce_head(r, m))
         }
         TypedExprNode::Builtin(Builtin::VariantProject(FieldKey::Name(tag))) => {
-            Some(reduce_head(solver, projection_as_match(a(), tag, ty), fuel))
+            Some(reduce_head(r, projection_as_match(a(), tag, ty)))
         }
         TypedExprNode::Builtin(Builtin::VariantWrap(FieldKey::Name(tag))) => Some(
             Expr::throwaway(TypedExprNode::VariantCtor {
@@ -1083,10 +1159,19 @@ fn reduce_application(
             })
             .with_ty(ty.clone()),
         ),
+        // An aggregate's builtin applied is the aggregate, the form lambda elimination
+        // desugars (`Builtin::for_aggregate`).
+        TypedExprNode::Builtin(b) if let Some(kind) = b.as_aggregate() => Some(
+            Expr::throwaway(TypedExprNode::Aggregate {
+                input: Box::new(a()),
+                kind,
+            })
+            .with_ty(ty.clone()),
+        ),
         TypedExprNode::Builtin(Builtin::BinOp(op)) => {
             // A binary operation's argument is a pair, so one that is not a pair former
             // reads as its two components (tuple η).
-            let (left, right) = pair(argument).unwrap_or_else(|| {
+            let (left, right) = pair(&r.seen(argument)).unwrap_or_else(|| {
                 let component = |k: usize| {
                     Expr::throwaway(TypedExprNode::Apply {
                         argument: Box::new(a()),
@@ -1109,11 +1194,11 @@ fn reduce_application(
                 .with_ty(ty.clone()),
             )
         }
-        TypedExprNode::Proj(ProjKey::Index(k)) => match &argument.node {
+        TypedExprNode::Proj(ProjKey::Index(k)) => match &r.seen(argument).node {
             TypedExprNode::Tuple(parts) => parts.get(*k).map(Expr::clone_preserving_ids),
             _ => None,
         },
-        TypedExprNode::Proj(ProjKey::Field(field)) => match &argument.node {
+        TypedExprNode::Proj(ProjKey::Field(field)) => match &r.seen(argument).node {
             TypedExprNode::Record(fields) => fields
                 .iter()
                 .find(|entry| entry.label == *field)
@@ -1136,7 +1221,7 @@ fn normal_function_value(
 ) -> Expr {
     let lambda = normal_lambda(name, body, ty);
     // The codomain is the function's own, read here, so opening it keeps the ids it copies.
-    let (binder, mut result_ty) = match function.ty.peel_refinements() {
+    let (binder, mut result_ty) = match function.ty.lets_distributed().peel_refinements() {
         Type::Fun {
             binder: binder @ crate::ccl::FunBinder::Whole(b),
             domain,
@@ -1158,17 +1243,16 @@ fn normal_function_value(
         // denote data here; transport their values without traversing inference metadata.
         if let Some(binder) = binder
             && let Type::Fun { domain, .. } = &mut result_ty
-            && let Type::Refinement(_, refinements) = domain.as_mut()
         {
-            let mut substitution = Substitution {
+            Substitution {
                 solver,
                 x: &binder,
                 replacement: argument,
                 free: None,
                 elem_depth: 0,
                 rewritten: HashMap::new(),
-            };
-            refinements.rewrite_each(|_, r| *r = substitution.refinement(r));
+            }
+            .cast_domain(domain.as_mut());
         }
         Expr::throwaway(TypedExprNode::Cast {
             value: Box::new(lambda),
@@ -1234,31 +1318,29 @@ fn match_by_tags(mut e: Expr) -> Expr {
 /// `case _:` arm is the default of the tupled form `(arms, 𝑑) ▷ final_or_default`
 /// (`lambda_elim`'s scrutinee `Case`). Arm `𝑖` reads back as `𝑇ᵢ(𝑝) → 𝑝 ▷ 𝑓ᵢ`, its payload bound
 /// fresh: a payload binder compares by its position in the term, not its spelling.
-fn read_eliminated_match(
-    solver: &mut Solver,
-    argument: &Expr,
-    ty: &Type,
-    fuel: &mut usize,
-) -> Option<Expr> {
+fn read_eliminated_match(r: &mut Reduction<'_>, argument: &Expr, ty: &Type) -> Option<Expr> {
+    let argument = r.seen(argument);
     let (stream, default) = match &argument.node {
         TypedExprNode::Tuple(parts) if parts.len() == 2 => (&parts[0], Some(&parts[1])),
-        _ => (argument, None),
+        _ => (&*argument, None),
     };
-    let arms = match &stream.node {
-        TypedExprNode::Copair(arms) => arms.as_slice(),
-        _ => std::slice::from_ref(stream),
+    let stream = r.seen(stream);
+    let arms: Vec<Seen<'_>> = match &stream.node {
+        TypedExprNode::Copair(arms) => arms.iter().map(|arm| r.seen(arm)).collect(),
+        _ => vec![Seen::Here(&stream)],
     };
-    let mut scrutinee: Option<&Expr> = None;
+    let mut scrutinee: Option<Expr> = None;
     let mut branches: Vec<Branch> = Vec::with_capacity(arms.len() + 1);
     let truth =
         || Expr::throwaway(TypedExprNode::Lit(Lit::Bool(true))).with_ty(Type::Base(BaseType::Bool));
-    for arm in arms {
+    for arm in &arms {
         let TypedExprNode::Compose(steps) = &arm.node else {
             return None;
         };
         let [driver, project, rest @ ..] = steps.as_slice() else {
             return None;
         };
+        let driver = r.seen(driver);
         let TypedExprNode::Apply {
             argument: x,
             function: konst,
@@ -1266,20 +1348,23 @@ fn read_eliminated_match(
         else {
             return None;
         };
-        let TypedExprNode::Builtin(Builtin::VariantProject(FieldKey::Name(tag))) = &project.node
+        let TypedExprNode::Builtin(Builtin::VariantProject(FieldKey::Name(tag))) =
+            &r.seen(project).node
         else {
             return None;
         };
-        if !matches!(konst.node, TypedExprNode::Builtin(Builtin::Const))
-            || scrutinee.is_some_and(|s| !crate::ccl::eq_term_modulo_ty_slots(s, x))
+        if !matches!(r.seen(konst).node, TypedExprNode::Builtin(Builtin::Const))
+            || scrutinee
+                .as_ref()
+                .is_some_and(|s| !crate::ccl::eq_term_modulo_ty_slots(s, x))
         {
             return None;
         }
-        scrutinee = Some(x);
+        scrutinee = Some(x.as_ref().clone_preserving_ids());
         let payload = Name::fresh("__match_payload");
         let read = Expr::throwaway(TypedExprNode::Var(payload.clone())).with_ty(Type::Hole);
         let body = rest.iter().fold(read, |acc, step| {
-            applied(solver, acc, step.clone_preserving_ids(), Type::Hole, fuel)
+            applied(r, acc, step.clone_preserving_ids(), Type::Hole)
         });
         branches.push(Branch {
             pattern: Some(crate::ccl::Pattern {
@@ -1309,7 +1394,7 @@ fn read_eliminated_match(
     }
     Some(
         Expr::throwaway(TypedExprNode::Case {
-            scrutinee: Some(Box::new(scrutinee?.clone_preserving_ids())),
+            scrutinee: Some(Box::new(scrutinee?)),
             branches,
             refuted: Vec::new(),
         })
@@ -1394,7 +1479,8 @@ fn projection_gap(projections: &[Vec<ProjectedTag<'_>>], live: &[usize]) -> Opti
 fn gate_gap(solver: &mut Solver, legs: &[Expr], live: &[usize]) -> Option<String> {
     let mut collection: Option<&Expr> = None;
     let mut kinds = (false, false);
-    let mut fuel = usize::MAX;
+    let mut r = Reduction::new(solver);
+    r.fuel = usize::MAX;
     let element = Expr::var("disjoint_join_element").with_ty(Type::Hole);
     let mut gated: Vec<(usize, Vec<Expr>)> = Vec::with_capacity(live.len());
     for &i in live {
@@ -1429,13 +1515,12 @@ fn gate_gap(solver: &mut Solver, legs: &[Expr], live: &[usize]) -> Option<String
                 .with_ty(Type::Base(BaseType::Bool)),
             Some(gate) => {
                 let at = applied(
-                    solver,
+                    &mut r,
                     element.clone_preserving_ids(),
                     gate.clone_preserving_ids(),
                     Type::Base(BaseType::Bool),
-                    &mut fuel,
                 );
-                normalize(solver, at, &mut fuel)
+                normalize(&mut r, at)
             }
         };
         if matches!(guard.node, TypedExprNode::Lit(Lit::Bool(false))) {
@@ -1635,19 +1720,15 @@ fn projection_as_match(scrutinee: Expr, tag: &Label, ty: &Type) -> Expr {
 /// conjunction, is read back where only the first guard's negation remains. A predicate that
 /// does not peel to the earlier guards is not this shape. An `elif` chain's trailing `Case` is eliminated inside its own leg, so it
 /// reads back nested, as it was written.
-fn read_fan_out(
-    solver: &mut Solver,
-    argument: &Expr,
-    legs: &[Expr],
-    ty: &Type,
-    fuel: &mut usize,
-) -> Option<Expr> {
+fn read_fan_out(r: &mut Reduction<'_>, argument: &Expr, legs: &[Expr], ty: &Type) -> Option<Expr> {
     let mut branches: Vec<Branch> = Vec::with_capacity(legs.len());
     for leg in legs {
+        let leg = r.seen(leg);
         let TypedExprNode::Compose(steps) = &leg.node else {
             return None;
         };
         let (filter, values) = steps.split_first()?;
+        let filter = r.seen(filter);
         let TypedExprNode::Apply {
             argument: gate,
             function,
@@ -1655,50 +1736,59 @@ fn read_fan_out(
         else {
             return None;
         };
-        if !matches!(function.node, TypedExprNode::Builtin(Builtin::FilterValues)) {
+        if !matches!(
+            r.seen(function).node,
+            TypedExprNode::Builtin(Builtin::FilterValues)
+        ) {
             return None;
         }
         let bool_ty = Type::Base(BaseType::Bool);
         let mut guard = applied(
-            solver,
+            r,
             argument.clone_preserving_ids(),
             gate.as_ref().clone_preserving_ids(),
             bool_ty,
-            fuel,
         );
         for (i, earlier) in branches.iter().enumerate().rev() {
             // A leg guarded by the literal `true` has `true ∧ ¬𝑔₀` innermost, which constant
             // folding reduces to `¬𝑔₀` (`planning::const_fold`), so the bare negation of the
             // first guard reads back as the guard `true`.
-            if i == 0
-                && let TypedExprNode::UnaryOp(UnaryOpKind::Not, negated, _) = &guard.node
-                && crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard)
-            {
+            let negates_first = i == 0
+                && matches!(
+                    &r.seen(&guard).node,
+                    TypedExprNode::UnaryOp(UnaryOpKind::Not, negated, _)
+                        if crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard)
+                );
+            if negates_first {
                 guard = Expr::throwaway(TypedExprNode::Lit(Lit::Bool(true)))
                     .with_ty(Type::Base(BaseType::Bool));
                 break;
             }
-            let TypedExprNode::BinOp {
-                left,
-                op: BinOpKind::BoolLogic(LogicKind::And),
-                right,
-                ..
-            } = &guard.node
-            else {
-                return None;
+            let left = {
+                let seen = r.seen(&guard);
+                let TypedExprNode::BinOp {
+                    left,
+                    op: BinOpKind::BoolLogic(LogicKind::And),
+                    right,
+                    ..
+                } = &seen.node
+                else {
+                    return None;
+                };
+                match &r.seen(right).node {
+                    TypedExprNode::UnaryOp(UnaryOpKind::Not, negated, _)
+                        if crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard) => {}
+                    _ => return None,
+                }
+                left.as_ref().clone_preserving_ids()
             };
-            match &right.node {
-                TypedExprNode::UnaryOp(UnaryOpKind::Not, negated, _)
-                    if crate::ccl::eq_term_modulo_ty_slots(negated, &earlier.guard) => {}
-                _ => return None,
-            }
-            guard = left.as_ref().clone_preserving_ids();
+            guard = left;
         }
         let body = values
             .iter()
             .fold(argument.clone_preserving_ids(), |acc, step| {
                 let codomain = step.ty.codomain().unwrap_or(Type::Hole);
-                applied(solver, acc, step.clone_preserving_ids(), codomain, fuel)
+                applied(r, acc, step.clone_preserving_ids(), codomain)
             });
         branches.push(Branch {
             pattern: None,
@@ -1752,7 +1842,7 @@ struct Substitution<'a> {
     /// The cast-target predicates rewritten so far, by allocation, so a predicate shared
     /// across occurrences is rewritten once and stays shared. Each entry holds its origin,
     /// so the address it is keyed by is not reused while the walk lasts.
-    rewritten: HashMap<(PredicateId, u32), (Rc<Expr>, Refinement)>,
+    rewritten: HashMap<(PredicateId, u32), (Rc<crate::ccl::ty::HeldTerm>, Refinement)>,
 }
 
 impl Substitution<'_> {
@@ -1804,11 +1894,29 @@ impl Substitution<'_> {
         body.map_children(|c| self.term(c));
         if let TypedExprNode::Cast { target, .. } = &mut body.node
             && let Type::Fun { domain, .. } = target
-            && let Type::Refinement(_, refinements) = domain.as_mut()
         {
-            refinements.rewrite_each(|_, r| *r = self.refinement(r));
+            self.cast_domain(domain.as_mut());
         }
         body
+    }
+
+    /// A cast target's domain with the substitution applied to its refinements, and to the
+    /// definitions of the type `let`s around them, which read what the refinements read.
+    fn cast_domain(&mut self, domain: &mut Type) {
+        match domain {
+            Type::Let(l) => {
+                let l = Rc::make_mut(l);
+                if count_free(self.x, &l.definition) > 0 {
+                    let rewritten = self.term(l.definition.clone_preserving_ids());
+                    l.definition = rewritten.into_held();
+                }
+                self.cast_domain(&mut l.body);
+            }
+            Type::Refinement(_, refinements) => {
+                refinements.rewrite_each(|_, r| *r = self.refinement(r));
+            }
+            _ => {}
+        }
     }
 
     /// `r` with the substitution applied to its predicate, the same allocation where the
@@ -1853,11 +1961,10 @@ pub(crate) fn normal_refinement_in(solver: &mut Solver, r: &Refinement) -> Refin
 /// A type stating `input ▷ f` then spells the value as the program did before elimination,
 /// which is the spelling its other copies keep: types compare predicates structurally.
 pub(crate) fn read_at(solver: &mut Solver, input: &Expr, f: &Expr) -> Expr {
-    let cod = match f.ty.peel_refinements() {
-        Type::Fun {
-            binder, codomain, ..
-        } => crate::ccl::subst::discharge_at_binder_in(solver, binder, input, codomain, Ids::Fresh),
-        _ => f.ty.codomain().unwrap_or(Type::Hole),
+    let cod = if matches!(f.ty.former(), Type::Fun { .. }) {
+        applied_type_in(solver, &f.ty, input)
+    } else {
+        f.ty.codomain().unwrap_or(Type::Hole)
     };
     read_back_application(solver, input, f, &cod)
         .unwrap_or_else(|| Expr::apply(input.duplicate(), f.duplicate()).with_ty(cod))
@@ -1962,7 +2069,7 @@ pub(crate) fn closed_let_type(
     }
     // A type-level discharge. The template keeps its ids because a template is not a tree
     // node — it is cloned again at every read, and that read is where the sibling is minted.
-    Subst::discharge(&binding.name, predicate_term(solver, bound_expr))
+    Subst::let_exit(&binding.name, predicate_term(solver, bound_expr))
         .apply_type_in(solver, &body_ty)
 }
 
@@ -2334,7 +2441,12 @@ pub(crate) fn indexed_loop_in(
         domain,
         codomain,
         ..
-    } = source.ty.read_view().peel_refinements().clone()
+    } = source
+        .ty
+        .read_view()
+        .lets_distributed()
+        .peel_refinements()
+        .clone()
     else {
         panic!("a loop runs over a collection, got {}", source.ty)
     };
@@ -2385,7 +2497,8 @@ pub(crate) fn applied_type(function: &Type, argument: &Expr) -> Type {
 
 /// [`applied_type`], reading the variables the function's type holds through `solver`.
 pub(crate) fn applied_type_in(solver: &mut Solver, function: &Type, argument: &Expr) -> Type {
-    match function.read_view().peel_refinements() {
+    // The codomain takes the type `let`s it reads ([`Type::lets_distributed`]).
+    match function.read_view().lets_distributed().peel_refinements() {
         Type::Fun {
             binder, codomain, ..
         } => crate::ccl::subst::discharge_at_binder_in(
@@ -2476,7 +2589,8 @@ fn chain_type_at(solver: &mut Solver, elts: &[Expr], types: &[Type], stated: Typ
     let (Some(last), Some(last_ty)) = (elts.last(), types.last()) else {
         return stated;
     };
-    let last_ty = crate::ccl::generalize::opened(last_ty);
+    // Each morphism's binder and parts, under the type `let`s its type holds.
+    let last_ty = &crate::ccl::generalize::opened(last_ty).lets_distributed();
     let (
         Type::Fun {
             binder: stated_name,
@@ -2491,13 +2605,18 @@ fn chain_type_at(solver: &mut Solver, elts: &[Expr], types: &[Type], stated: Typ
     };
     let named: Vec<Option<(Name, Type)>> = types
         .iter()
-        .map(|t| match crate::ccl::generalize::opened(t) {
-            Type::Fun {
-                binder: crate::ccl::FunBinder::Whole(b),
-                domain,
-                ..
-            } => Some((b.clone(), (**domain).clone())),
-            _ => None,
+        .map(|t| {
+            match crate::ccl::generalize::opened(t)
+                .lets_distributed()
+                .into_owned()
+            {
+                Type::Fun {
+                    binder: crate::ccl::FunBinder::Whole(b),
+                    domain,
+                    ..
+                } => Some((b, *domain)),
+                _ => None,
+            }
         })
         .collect();
     let opened = crate::ccl::subst::open_codomain_in(solver, last_ty, &last_cod);
@@ -2816,6 +2935,19 @@ pub fn make_restrict_stating(
     predicate: Expr,
     upstream: Expr,
 ) -> Expr {
+    make_restrict_stating_under(solver, stated, predicate, upstream, &|_| None)
+}
+
+/// [`make_restrict_stating`] where the upstream's type holds definitions a predicate's domain
+/// reads by the binder the program's root binds them to: `definitions` gives each such binder's
+/// definition (`src/ccl/planning/held.rs`), and the two domains are equal under them.
+pub(crate) fn make_restrict_stating_under(
+    solver: &mut Solver,
+    stated: Expr,
+    predicate: Expr,
+    upstream: Expr,
+    definitions: &crate::ccl::ty::Definitions<'_>,
+) -> Expr {
     let domain = stated
         .ty
         .domain()
@@ -2837,7 +2969,9 @@ pub fn make_restrict_stating(
                 strip_refinements_in(solver, &upstream_dom),
                 strip_refinements_in(solver, &domain),
             );
-            u.without_pi_names() == d.without_pi_names()
+            let (u, d) = (u.without_pi_names(), d.without_pi_names());
+            let definitions = |n: &Name| definitions(n);
+            crate::ccl::ty::type_eq_under_definitions(&u, &d, &definitions)
                 || (matches!(u, Type::WitnessRef(_)) && matches!(d, Type::WitnessRef(_)))
         },
         "restrict upstream domain {upstream_dom} must match predicate domain {domain}",
@@ -2996,8 +3130,11 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
     // witness spells the function inside a `Σ` binder, and `Type::fun_like` — which is what
     // builds these targets — re-closes that binder. Matching the outer constructor rejects
     // the shape the paired constructor just produced.
+    // A domain holding definitions is refined under its type `let`s.
     assert!(
-        matches!(target_ty.domain(), Some(Type::Refinement(..))),
+        target_ty
+            .domain()
+            .is_some_and(|d| matches!(crate::ccl::ty::TypeLet::peel(&d).1, Type::Refinement(..))),
         "make_cast target_ty must denote a function with a refined domain, got {target_ty}"
     );
     Expr::cast(value, target_ty)
@@ -3022,10 +3159,22 @@ pub fn cast_target_refinement(target: &Type) -> Option<RefinementSet> {
     // witness-indexed collection, whose function sits under a `Σ` binder. This has to agree
     // with `make_cast` on which targets carry a refinement, since one asserts what the
     // other reads.
-    let Type::Refinement(_, refinements) = target.domain()? else {
+    // A domain holding definitions gives its refinements standing alone, each predicate under
+    // the definitions it reads ([`crate::ccl::ty::TypeLet::refinement_under`]).
+    let domain = target.domain()?;
+    let (lets, under) = crate::ccl::ty::TypeLet::peel(&domain);
+    let Type::Refinement(_, refinements) = under else {
         return None;
     };
-    Some(refinements)
+    if lets.is_empty() {
+        return Some(refinements.clone());
+    }
+    Some(
+        refinements
+            .iter()
+            .map(|r| crate::ccl::ty::TypeLet::refinement_under(&lets, r))
+            .collect(),
+    )
 }
 
 /// Build a function type whose domain is `base_domain` wrapped in a fresh
@@ -3134,6 +3283,8 @@ pub(crate) fn strip_refinements_in(solver: &mut Solver, ty: &Type) -> Type {
                 .collect(),
             body: Box::new(strip_refinements_in(solver, body)),
         },
+        // Stripping may remove every read of the binder, and the `let` then goes.
+        Type::Let(l) => l.over(strip_refinements_in(solver, &l.body)),
         Type::Record(fs) => Type::Record(
             fs.iter()
                 .map(|(n, t)| (n.clone(), strip_refinements_in(solver, t)))
@@ -3326,7 +3477,7 @@ pub(crate) fn canonical_cast_ty(
         t
     };
     let born_refinements = match born.domain() {
-        Some(d) => d.refinements().to_vec(),
+        Some(d) => d.standalone_refinements(),
         None => return at_born_answer(solver, view),
     };
     let Some(view_dom) = view.domain() else {
@@ -3336,12 +3487,12 @@ pub(crate) fn canonical_cast_ty(
     // only) ∪ born refinements.
     let mut canon_refinements: RefinementSet = value_ty
         .and_then(|t| t.domain())
-        .map(|d| d.refinements().to_vec())
+        .map(|d| d.standalone_refinements())
         .unwrap_or_default()
         .into_iter()
         .collect();
     canon_refinements.extend(born_refinements);
-    let view_refinements = view_dom.refinements();
+    let view_refinements = view_dom.standalone_refinements();
     let same = canon_refinements.len() == view_refinements.len()
         && view_refinements
             .iter()
@@ -3521,9 +3672,10 @@ pub(crate) fn type_element_reads_from_base(pred: &mut Expr, base: &Type) {
     go(pred, base);
 }
 
-/// Re-base `slot` on `from`'s shape, keeping `slot`'s own refinements.
+/// Re-base `slot` on `from`'s shape, keeping `slot`'s own refinements, each with the definitions
+/// it reads ([`Type::standalone_refinements`]).
 fn take_index_from(slot: &mut Type, from: &Type) {
-    let refinements = slot.refinements().iter().cloned().collect();
+    let refinements = slot.standalone_refinements().into_iter().collect();
     *slot = Type::refined(from.peel_refinements().clone(), refinements);
 }
 
@@ -3534,6 +3686,13 @@ fn take_index_from(slot: &mut Type, from: &Type) {
 fn base_at<'a>(base: &'a Type, path: &[ProjKey]) -> Option<&'a Type> {
     let mut ty = base;
     for key in path {
+        // The position is read in this type's own parts, so no product stands under a type
+        // `let`.
+        debug_assert!(
+            !matches!(ty.peel_refinements(), Type::Let(_))
+                || !matches!(ty.former(), Type::Tuple(_) | Type::Record(_)),
+            "a product under a type `let` read by position: {ty}"
+        );
         ty = match (ty.peel_refinements(), key) {
             (Type::Tuple(ts), ProjKey::Index(i)) => ts.get(*i)?,
             (Type::Record(fs), ProjKey::Field(n)) => &fs.iter().find(|(k, _)| k == n)?.1,
@@ -3759,14 +3918,18 @@ struct MemoStore<C> {
 struct Entry<C> {
     /// Keep the address key allocated for the memo's lifetime.
     #[allow(dead_code)]
-    keepalive: Rc<Expr>,
-    rebuilt: Rc<Expr>,
+    keepalive: Rc<crate::ccl::ty::HeldTerm>,
+    rebuilt: Rc<crate::ccl::ty::HeldTerm>,
     context: C,
 }
 
 impl<C> MemoStore<C> {
     /// Point `held` at `to`, counting it when the `Rc` actually changes.
-    fn point_at(&mut self, held: &mut (impl HeldTerm + ?Sized), to: Rc<Expr>) {
+    fn point_at(
+        &mut self,
+        held: &mut (impl TermHolder + ?Sized),
+        to: Rc<crate::ccl::ty::HeldTerm>,
+    ) {
         if !Rc::ptr_eq(held.held(), &to) {
             self.revision += 1;
         }
@@ -3794,7 +3957,7 @@ impl<C: PartialEq + Clone> PredMemo<C> {
     /// See `src/ccl/design/type-inference.md`, "Predicate rebuild completion".
     pub fn rebuild(
         &self,
-        refinement: &mut (impl HeldTerm + ?Sized),
+        refinement: &mut (impl TermHolder + ?Sized),
         context: &C,
         f: impl FnOnce(&mut Expr) -> bool,
     ) -> bool {
@@ -3829,14 +3992,14 @@ impl<C: PartialEq + Clone> PredMemo<C> {
                 "predicate.rebuild",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let mut pred = (*keepalive).duplicate();
+            let mut pred = keepalive.term().duplicate();
             let reported = f(&mut pred);
             (pred, reported)
         };
         let mut store = self.0.borrow_mut();
         let changed = reported || store.revision != before;
         let installed = if changed {
-            Rc::new(pred)
+            pred.into_held()
         } else {
             Rc::clone(&keepalive)
         };
@@ -3864,7 +4027,7 @@ impl TermMemo {
     /// Ordinary callback return completes installation; unwinding does not.
     /// Later copies are discarded after their callbacks, retaining per-occurrence
     /// effects without splitting the shared allocation.
-    pub fn rebuild_always(&self, refinement: &mut impl HeldTerm, f: impl FnOnce(&mut Expr)) {
+    pub fn rebuild_always(&self, refinement: &mut impl TermHolder, f: impl FnOnce(&mut Expr)) {
         let keepalive = Rc::clone(refinement.held());
         // Copy and rewrite under the memo's declared intent; see `rebuild`.
         let pred = if self.0.is_replacing() {
@@ -3877,7 +4040,7 @@ impl TermMemo {
                 "predicate.rebuild",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            let mut pred = (*keepalive).duplicate();
+            let mut pred = keepalive.term().duplicate();
             f(&mut pred);
             pred
         };
@@ -3890,7 +4053,7 @@ impl TermMemo {
         match shared {
             Some(term) => store.point_at(refinement, term),
             None => {
-                let installed = Rc::new(pred);
+                let installed = pred.into_held();
                 store.point_at(refinement, Rc::clone(&installed));
                 store
                     .entries
@@ -3911,10 +4074,15 @@ impl TermMemo {
 /// (`src/ccl/design/type-inference.md`, "Copies of one predicate share after coalesce").
 /// Keyed by the derived predicate's allocation; each entry keeps both terms alive, so neither
 /// address is reused while the run lasts.
-pub(crate) type Derivations = HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>;
+pub(crate) type Derivations =
+    HashMap<PredicateId, (Rc<crate::ccl::ty::HeldTerm>, Rc<crate::ccl::ty::HeldTerm>)>;
 
 /// Record in `solver`'s run that `to` was derived from `from`.
-pub(crate) fn record_derivation(solver: &mut Solver, from: &Rc<Expr>, to: &Rc<Expr>) {
+pub(crate) fn record_derivation(
+    solver: &mut Solver,
+    from: &Rc<crate::ccl::ty::HeldTerm>,
+    to: &Rc<crate::ccl::ty::HeldTerm>,
+) {
     if Rc::ptr_eq(from, to) {
         return;
     }
@@ -3926,12 +4094,64 @@ pub(crate) fn record_derivation(solver: &mut Solver, from: &Rc<Expr>, to: &Rc<Ex
 
 /// The predicate `predicate` was derived from, through every derivation `solver`'s run
 /// recorded: itself where none is recorded.
-pub(crate) fn derivation_origin(solver: &Solver, predicate: &Rc<Expr>) -> Rc<Expr> {
+pub(crate) fn derivation_origin(
+    solver: &Solver,
+    predicate: &Rc<crate::ccl::ty::HeldTerm>,
+) -> Rc<crate::ccl::ty::HeldTerm> {
     let mut at = Rc::clone(predicate);
     while let Some((_, from)) = solver.derivations.get(&Rc::as_ptr(&at)) {
         at = Rc::clone(from);
     }
     at
+}
+
+/// The names and witnesses a term reads free, the types it holds included.
+pub(crate) type TermReads = (BTreeSet<Name>, BTreeSet<crate::ccl::ty::WitnessId>);
+
+/// What `term` reads ([`TermReads`]).
+pub(crate) fn term_reads(term: &Expr) -> TermReads {
+    (
+        crate::ccl::free_names::names(term, crate::ccl::free_names::EVERY_READ),
+        free_witnesses(term),
+    )
+}
+
+/// Copies of one term made apart, of which equal ones share one allocation: copies of a
+/// predicate or of a type `let`'s definition that the substitutions carrying them made apart and that
+/// coalesce or compile to equal terms (`src/ccl/design/type-inference.md`, "Copies of one
+/// predicate share after coalesce" and "A type `let`").
+///
+/// Term equality compares a refinement nested in a type slot type-blind and a type `let` up to
+/// renaming its binder, so two equal terms can read different names. One term stands for another
+/// only where both read the same names and witnesses: the term kept is in scope wherever the
+/// other was.
+#[derive(Default)]
+pub(crate) struct SharedTerms(Vec<(Rc<crate::ccl::ty::HeldTerm>, TermReads)>);
+
+impl SharedTerms {
+    /// The kept term `term` shares, reading `reads`: `None` where `term` is kept, already or as
+    /// the first of its value.
+    pub(crate) fn share(
+        &mut self,
+        term: &Rc<crate::ccl::ty::HeldTerm>,
+        reads: impl FnOnce() -> TermReads,
+    ) -> Option<Rc<crate::ccl::ty::HeldTerm>> {
+        if self.0.iter().any(|(kept, _)| Rc::ptr_eq(kept, term)) {
+            return None;
+        }
+        let reads = reads();
+        match self
+            .0
+            .iter()
+            .find(|(kept, kept_reads)| **kept == **term && *kept_reads == reads)
+        {
+            Some((kept, _)) => Some(Rc::clone(kept)),
+            None => {
+                self.0.push((Rc::clone(term), reads));
+                None
+            }
+        }
+    }
 }
 
 /// Reachable refinements in walk order, deduplicated by predicate allocation.
@@ -3988,13 +4208,44 @@ where
     F: FnMut(&mut Expr, &PredMemo<C>) -> bool,
 {
     let mut changed = false;
-    if let Type::Refinement(_, refinements) = ty {
-        refinements.rewrite_each(|_, refinement| {
+    match ty {
+        Type::Refinement(_, refinements) => refinements.rewrite_each(|_, refinement| {
             changed |= memo.rebuild(refinement, context, |pred| f(pred, memo));
-        });
+        }),
+        // A type `let`'s definition is a term the type holds as it holds a predicate, read by
+        // the type rather than typing a position, so a rewrite of predicates rewrites it too.
+        Type::Let(_) => {
+            for quoted in ty.held_terms_mut() {
+                changed |= memo.rebuild(quoted, context, |term| f(term, memo));
+            }
+        }
+        _ => {}
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
+    changed |= inline_rewritten_let(ty);
     changed
+}
+
+/// `ty` in normal form at its root after a rewrite of a type `let`: the body alone where the
+/// rewrite left the body reading no binder of it, and the definition discharged where the
+/// rewrite left it a variable or a literal ([`crate::ccl::ty::TypeLet::inline_atomic`]).
+/// Whether it changed.
+pub(crate) fn inline_rewritten_let(ty: &mut Type) -> bool {
+    let Type::Let(l) = ty else {
+        return false;
+    };
+    let normal = if !crate::ccl::subst::type_free_vars(&l.body).contains(&l.name) {
+        Some(l.body.clone())
+    } else {
+        l.inline_atomic()
+    };
+    match normal {
+        Some(normal) => {
+            *ty = normal;
+            true
+        }
+        None => false,
+    }
 }
 
 /// [`walk_refined_predicates_mut`] over every term `ty` holds: each refinement's predicate
@@ -4021,6 +4272,7 @@ where
         }
     }
     ty.walk_children_mut(|child| changed |= walk_held_terms_mut(child, memo, context, f));
+    changed |= inline_rewritten_let(ty);
     changed
 }
 
