@@ -992,9 +992,9 @@ runs after `specialize_use` has pinned the clone to its use
 ([Specialization scope and lifecycle](#specialization-scope-and-lifecycle)).
 `pin_unreached_values` skips the right-hand side of a generalized `let`, whose clones are walked,
 and pinned, one per use. So `def f(x: Int): []` called at `List(Int)` and at `List(String)` gives
-each use's element the type that use requires. A use whose instantiation leaves a variable for the
-pins shares no clone, so two uses that only their joins tell apart get one clone each
-([A use the key does not determine shares no clone](#a-use-the-key-does-not-determine-shares-no-clone)).
+each use's element the type that use requires. Two uses that only their joins tell apart get one
+clone each, since their pins read different types
+([A use shares the clone its pins answer alike](#a-use-shares-the-clone-its-pins-answer-alike)).
 
 The program's own literals are pinned before any specialization. A literal passed to a call, as in
 `total([])`, takes its element from the call's instantiated parameter type, which carries the
@@ -1391,18 +1391,35 @@ positions keys what reaches it, by the relations `var_binder_kind` reads (`key_v
 clone typed over one of them (`a_data_function_type_admits_both_collections` in
 `tests/it/compilation_pipeline/type_annotations.rs`).
 
-##### A use the key does not determine shares no clone
+##### A use shares the clone its pins answer alike
 
-A clone may be shared only where the key determines it. A clone's pins give each variable its
-instantiation leaves undetermined what the join around the use supplies there
-([An unobservable variable takes the type of its position](#an-unobservable-variable-takes-the-type-of-its-position)),
-which the key does not read: `box([1]) if c else box(f(1))` and `box([1]) if c else box(f(2))`
+A clone's pins give each variable its instantiation leaves undetermined the type of that variable's
+position, which the join around the use supplies
+([An unobservable variable takes the type of its position](#an-unobservable-variable-takes-the-type-of-its-position)).
+The `SpecKey` does not read it: `box([1]) if c else box(f(1))` and `box([1]) if c else box(f(2))`
 key `f` alike and need clones pinned from different joins. So a use whose instantiation leaves a
-variable for the pins shares no clone and is specialized on its own (`specialize_use`). The test
-is the pins' own: nothing reaches the variable, or it stands at an output and no value reaches it
+variable for the pins keys on what the pins read too (`clone_key`). The test for such a variable is
+the pins' own: nothing reaches it, or it stands at an output and no value reaches it
 (`has_output_variable`). A demand alone does not count at an output: `sum` demanding `Int` of the
-element of `box(f(2))` says nothing of what the element is. A use that is fully determined shares
-as before.
+element of `box(f(2))` says nothing of what the element is.
+
+The second part of the key is the instantiation as resolved and as the values reaching it read it.
+Each variable left standing is replaced by the type the pins would give it
+(`accepted_position_type`), where one is determined, and every other one is numbered in order of
+occurrence. Two uses with equal keys get clones pinned alike, and the later one shares the first
+one's clone. A use that leaves no variable for the pins keys on its `SpecKey` alone.
+
+The shared clone was pinned to the first use's variables, not the later one's. So the later use
+pins each variable a position determines to that position's type itself (`pin_answered`), as its
+own clone's pins would, and nothing relates it to the first use. A variable no position determines
+is left to the use's later context by its own clone, which a shared clone cannot do. A use leaving
+one shares by key only in a walk whose types are dropped
+([Checking a definition alone](#checking-a-definition-alone)), where nothing later reads it.
+
+A definition checked alone is where this matters: each use inside it is at variables the
+definition leaves open, `f(x)` at `?𝑎 ⇒ ?𝑎` for a parameter `x`, and every such use of `f` reads
+alike. Without sharing, each use cloned `f`, and each clone of `f` cloned its own callees, which
+doubled the clones per level of a call graph whose definitions each call the next twice.
 
 A copy of a use takes the clone of the use it copies, whether or not the key determines that
 clone. A refinement predicate holds the term it refines by, so a call in a group-by key or a
@@ -1430,8 +1447,6 @@ since `specialize_use` relates the two by pinning the clone's type against the u
 variable inside the definition that the instantiation does not mention, such as the element of a
 `[]` the body sums, is pinned from inside the clone, the same way for every use. A change that
 relates a clone to its context another way breaks the rule.
-
-The rule over-splits: two under-determined uses whose joins supply one type get two clones.
 
 `key_go` has a cycle guard and a completed-result memo. The memo includes variable identity,
 polarity, and enclosing binders, and keeps each result with the accumulated substitution it was
