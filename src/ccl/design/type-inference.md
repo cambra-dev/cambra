@@ -777,20 +777,20 @@ those spellings. See `higher_order_dependent_application_discharges_the_binder` 
 
 ##### Compaction traversal cost
 
-`CompactState::in_process` prevents recursive re-entry while a variable is being visited, and
-its entry is removed when that visit returns. A bound graph shares variables freely:
-constraining `?a <: ?b` copies `?a`'s lower bounds onto `?b`, so `?b` reaches `?a`'s bounds
-twice, and each level of a nested type doubles the walk. `CompactState::memo` keeps what each
-variable compacted to, so a walk reads a variable once rather than once per path that reaches it.
-An invariant data domain draws both edges between two variables, so cycles of variables are
-ordinary ([Data domains are invariant](#data-domains-are-invariant)).
+`CompactState::components` holds the variables being visited, so a visit does not re-enter itself. A
+bound graph shares variables freely: constraining `?a <: ?b` copies `?a`'s lower bounds onto `?b`,
+so `?b` reaches `?a`'s bounds twice, and each level of a nested type doubles the walk.
+`CompactState::memo` keeps what each variable compacted to, so a walk reads a variable once rather
+than once per path that reaches it. An invariant data domain draws both edges between two variables,
+so cycles of variables are ordinary ([Data domains are invariant](#data-domains-are-invariant)).
 
 A result depends on more than the variable, and the memo's key holds the rest: the polarity, the
 binders the refinement-closing runs against (`st.scope`), whether the walk is at the position
 (`fallback_allowed`), and whether the position is invariant. It also depends on the path's
 substitution, `subst_acc`, which the key leaves out. The walk reuses the identity's result
 where the substitution cannot change any read below the variable. Otherwise it can reuse a
-result under the same substitution restricted to the term names read below it.
+result under the same substitution restricted to the term names read below it, and where those
+reads are unknown, under the same whole substitution.
 
 `consulted_below` summarizes those reads through the bounds `compact_go` follows: the
 polarity-correct side, the opposite side where it may be read, and a barrier variable's lowers.
@@ -807,12 +807,33 @@ with the names. This includes the names brought back by cycles: a rename cycle c
 back as `y` makes both names consulted. The completed summaries are reusable from every entry
 into the graph; they carry no assumptions about which ancestors a query is already reading.
 Unknown reads propagate as unknown, and a propagation that does not settle within 64 rounds
-also returns unknown. Either case disables reuse conservatively.
+also returns unknown. Either case limits reuse to the same whole substitution.
 
-A result can also depend on the path through the cycles its walk cut back to variables entered
-before it. It is stored only where each such cut was spurious, and it records them
-(`Memoized::cuts`); it is reused only where each is again being walked and on the bound chain,
-so the walk would cut it again. A result naming a recursive placeholder is not stored.
+##### Cycles of variables
+
+A cycle along one bound chain, with no structural intermediary, makes each variable's result depend
+on the others'. The walks over the bound graph (`compact_go` and `spec_key`'s `key_go`) therefore
+finish each strongly connected component of the graph before any result inside it is final
+(`ComponentWalk`, in `src/ccl/infer/solver/component_walk.rs`). A back edge reads its target's
+result from the component's last round, and nothing in the first. So a result depends on the
+variable and that round alone, and every path in one round reads the same one. The component's root
+is walked again until a round changes no member's result. Merging a result again changes nothing, so
+the root's result is what a walk cutting each back edge computes, and each member's result holds
+everything the member reaches round the cycle.
+
+A back edge carries one round per edge, so a chain of `𝑛` variables equated in both directions would
+take `𝑛` rounds. A member whose result is the merge of its bounds' results, each carried unchanged,
+is **uniform**: a compaction result read by its variable alone. In a component of uniform members,
+every member reaches everything the root's first round merged and adds nothing. The second round
+starts each back edge from the root's result, so every member's result holds all of it, and the
+second round's results are final. Each is the member's own merge, so a diagnostic that records the
+first pair of domains a merge combined (`CombinedDomains`) records the member's own first pair.
+
+A walk that returns along its chain to the position it started from meets the variable as a
+separate key, one read along a chain (`ComponentKey`): the position's opposite-side reading is not
+part of the cycle. A variable reached again across a structural boundary is a recursive type rather
+than a cycle. Compaction answers it with a placeholder and `key_go` truncates it, and neither
+stores a result above it.
 
 #### Binder-slot resolution
 
@@ -1409,12 +1430,12 @@ The rule over-splits: two under-determined uses whose joins supply one type get 
 `key_go` has a cycle guard and a completed-result memo. The memo includes variable identity,
 polarity, and enclosing binders, and keeps each result with the accumulated substitution it was
 reached under, restricted to the names that substitution could act on below the variable
-(`ConsultedNames`, compaction's `consulted_below`). A later reach reuses a result whose
-restricted substitution is the same, as the identity's is wherever the substitution acts on
-none of those names. A witness half skips the memo only where the dependency summary retains
-witness dependence; unknown summaries also skip it. A result whose walk cut a cycle is not
-cached. This memo belongs to one `spec_key` calculation; it is distinct from the specialization
-list stored on a frame and from compaction's cycle guard.
+(`ConsultedNames`, compaction's `consulted_below`). A later reach reuses a result whose restricted
+substitution is the same, as the identity's is wherever the substitution acts on none of those
+names. A witness half skips the memo only where the dependency summary retains witness dependence;
+unknown summaries also skip it. A cycle along one bound chain is finished as compaction finishes one
+([Cycles of variables](#cycles-of-variables)). This memo belongs to one `spec_key` calculation; it
+is distinct from the specialization list stored on a frame and from compaction's memo.
 
 ##### Key timing and precision limits
 
