@@ -4875,9 +4875,10 @@ over the edges reaching a variable.
 
 Emission keeps a stack of frames, one for the module's top level and one for each function body
 under emission (`InferCtx::capability_frames`), each holding the telescope its function stands in,
-and gives each node its own capability variable ("Capabilities on every expression" below). A
-function's capabilities are its body's, through an edge from the body's variable into the variable
-of the function's type. Capabilities are recorded on the node that does them:
+and gives each node that anything reaches its own capability variable ("Capabilities on every
+expression" below). A function's capabilities are its body's, through an edge from the body's
+variable into the variable of the function's type. Capabilities are recorded on the node that does
+them:
 
 | Node | Capability |
 | --- | --- |
@@ -5191,10 +5192,14 @@ stands for what `f` does.
 Every expression carries what evaluating it requires and causes, `TypedExpr::capabilities`, beside
 its type, and what it does of its own besides its children, `TypedExpr::own_capabilities`: a
 variable's mention its read, a call what its function does, and a write, a feed, a definition or a
-block what it states. Emission gives each node a variable for each
-(`InferCtx::enter_node_capabilities`), which its slots hold until coalesce resolves them as it
+block what it states. Emission gives a node a variable for each the first time anything flows into
+it: a capability it records, an edge a call or a collection draws into it, or a child holding a
+variable (`InferCtx::node_capability_var`). Its slots hold them until coalesce resolves them as it
 resolves the node's type, so a specialization's clone has its own copies
-(`freshen_expr_type_slots`). A capability is recorded on the own variable of the node that does it,
+(`freshen_expr_type_slots`). A node nothing reaches holds the empty set, which is what its
+variables would resolve to. The root's variables, and those of a node denoting a mutable variable,
+which a read records on after the node is emitted (`Typing::record_read`), are minted as the node is
+entered. A capability is recorded on the own variable of the node that does it,
 which flows into the node's, and a node's variable flows into its parent's, but into a `with
 begin():` block's less `Transaction`, which the block supplies, and not into a lambda's: making a
 function does nothing. A function body's frame is its body node's variable seen through the frame's

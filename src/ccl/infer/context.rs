@@ -516,10 +516,18 @@ impl Inflow {
 
 /// A node under emission: the variable collecting what evaluating it requires and causes, how
 /// its children's capabilities reach it, and, for a lambda, its body's variable.
+///
+/// A node's two variables are minted together the first time anything flows into it
+/// ([`InferCtx::node_capability_var`], [`InferCtx::node_var`]): a capability it records, an edge a
+/// call or a collection draws into it, or a child holding one. A node nothing reaches holds the
+/// empty set, which is what its variables would resolve to.
 struct NodeCapabilities {
-    var: Rc<CapabilityVar>,
+    var: Option<Rc<CapabilityVar>>,
     /// What the node does of its own, which `var` holds besides what its children do.
-    own: Rc<CapabilityVar>,
+    own: Option<Rc<CapabilityVar>>,
+    /// Where the node's variables stand: its level and telescope.
+    level: Level,
+    telescope: Telescope,
     inflow: Inflow,
     body: Option<Rc<CapabilityVar>>,
     /// The node a capability crossing into the parent's variable entered at, where it is not
@@ -1122,70 +1130,100 @@ impl InferCtx {
         self.capability_frames.len() == 1
     }
 
-    /// Begin emitting a node: a fresh variable collects what evaluating it requires and causes,
-    /// which its `capabilities` slot holds (`src/ccl/design/type-inference.md`, "4.9 Capabilities").
-    pub(super) fn enter_node_capabilities(
-        &mut self,
-        node: &TypedExprNode,
-    ) -> (Capabilities, Capabilities) {
-        let var = CapabilityVar::fresh(self.level, &self.telescope);
-        let own = CapabilityVar::fresh(self.level, &self.telescope);
-        var.flows_from(&own, Filter::default());
+    /// Begin emitting a node (`src/ccl/design/type-inference.md`, "4.9 Capabilities"). `denotes`
+    /// is the variable the node's value denotes, where it denotes one: a read of a mutable
+    /// variable records on the node after it is emitted ([`Typing::record_read`]), so such a
+    /// node's variables are minted now. So are the root's, which the top level's effects read.
+    pub(super) fn enter_node_capabilities(&mut self, node: &TypedExprNode, denotes: Option<&Name>) {
+        let eager = self.node_capabilities.is_empty()
+            || denotes.is_some_and(|name| self.places.contains_key(name));
         self.node_capabilities.push(NodeCapabilities {
-            var: Rc::clone(&var),
-            own: Rc::clone(&own),
+            var: None,
+            own: None,
+            level: self.level,
+            telescope: self.telescope.clone(),
             inflow: Inflow::of(node),
             body: None,
             at: None,
             transaction: false,
             catches: None,
         });
-        (Capabilities::var(var), Capabilities::var(own))
+        if eager {
+            self.node_capability_var();
+        }
     }
 
     /// Finish emitting the innermost node: its capabilities reach its parent's as the parent lets
-    /// them in.
-    pub(super) fn leave_node_capabilities(&mut self) {
+    /// them in. Returns what its `capabilities` and `own_capabilities` slots hold, which coalesce
+    /// resolves as it resolves `ty`.
+    pub(super) fn leave_node_capabilities(&mut self) -> (Capabilities, Capabilities) {
         let node = self
             .node_capabilities
             .pop()
             .expect("a node under emission entered its effects");
-        let Some(parent) = self.node_capabilities.last_mut() else {
-            self.root_capabilities = Some(node.var);
-            return;
+        let slot = |v: &Option<Rc<CapabilityVar>>| match v {
+            Some(v) => Capabilities::var(Rc::clone(v)),
+            None => Capabilities::known(CapabilitySet::default()),
         };
-        {
-            match parent.inflow {
-                Inflow::All => parent.var.flows_from(
-                    &node.var,
-                    Filter {
-                        at: node.at,
-                        catches: node.catches,
-                        ..Filter::default()
-                    },
-                ),
-                Inflow::DischargesTransaction => parent.var.flows_from(
-                    &node.var,
-                    Filter {
-                        discharges: [Requirement::transaction()].into_iter().collect(),
-                        at: node.at,
-                        catches: node.catches,
-                        ..Filter::default()
-                    },
-                ),
-                Inflow::Closed => parent.body = Some(node.var),
+        let slots = (slot(&node.var), slot(&node.own));
+        let Some(var) = node.var else {
+            return slots;
+        };
+        let Some(parent) = self.node_capabilities.last() else {
+            self.root_capabilities = Some(var);
+            return slots;
+        };
+        let filter = match parent.inflow {
+            Inflow::All => Filter {
+                at: node.at,
+                catches: node.catches,
+                ..Filter::default()
+            },
+            Inflow::DischargesTransaction => Filter {
+                discharges: [Requirement::transaction()].into_iter().collect(),
+                at: node.at,
+                catches: node.catches,
+                ..Filter::default()
+            },
+            Inflow::Closed => {
+                self.node_capabilities
+                    .last_mut()
+                    .expect("the parent checked above")
+                    .body = Some(var);
+                return slots;
             }
-        }
+        };
+        self.node_var().flows_from(&var, filter);
+        slots
     }
 
-    /// The capability variable of the node under emission.
-    /// The variable collecting what the node under emission does of its own.
-    fn node_capability_var(&self) -> &Rc<CapabilityVar> {
-        &self
+    /// The variable collecting what the node under emission does, minted with the node's own
+    /// ([`Self::node_capability_var`]).
+    fn node_var(&mut self) -> Rc<CapabilityVar> {
+        self.node_capability_var();
+        let node = self
             .node_capabilities
             .last()
-            .expect("a capability is recorded while a node is under emission")
-            .own
+            .expect("a node is under emission");
+        Rc::clone(node.var.as_ref().expect("minted with the node's own"))
+    }
+
+    /// The variable collecting what the node under emission does of its own, minted the first
+    /// time anything flows into the node, with the node's variable, which it flows into first.
+    fn node_capability_var(&mut self) -> Rc<CapabilityVar> {
+        let node = self
+            .node_capabilities
+            .last_mut()
+            .expect("a capability is recorded while a node is under emission");
+        if let Some(own) = &node.own {
+            return Rc::clone(own);
+        }
+        let var = CapabilityVar::fresh(node.level, &node.telescope);
+        let own = CapabilityVar::fresh(node.level, &node.telescope);
+        var.flows_from(&own, Filter::default());
+        node.var = Some(var);
+        node.own = Some(Rc::clone(&own));
+        own
     }
 
     /// Record where `name` is bound, at the innermost function body, when `ty` is a
@@ -1250,16 +1288,15 @@ impl InferCtx {
         // Each capability crossing into the node entered at it: the lambda, or the composition
         // or cast, the function is.
         let at = Some(self.current_node_id);
-        let node = self.node_capability_var();
         match kind {
-            Some(crate::ccl::ty::FunKind::Data(_)) => node.flows_from(
+            Some(crate::ccl::ty::FunKind::Data(_)) => self.node_capability_var().flows_from(
                 var,
                 Filter {
                     at,
                     ..Filter::default()
                 },
             ),
-            Some(crate::ccl::ty::FunKind::Var(kind)) => node.flows_from(
+            Some(crate::ccl::ty::FunKind::Var(kind)) => self.node_capability_var().flows_from(
                 var,
                 Filter {
                     when_data: Some(Rc::clone(kind)),
@@ -4223,12 +4260,16 @@ impl Typing for InferCtx {
         // What the body does reaches the function's type, minted outside the function: nothing
         // naming a variable the body binds, its parameters' included, enters it
         // ([`CapabilityVar::in_scope`]).
+        // A body nothing reaches holds no variable, and adds nothing to the function's.
         let body = self
             .node_capabilities
             .last_mut()
-            .and_then(|lambda| lambda.body.take())
-            .expect("a lambda's body is emitted inside its frame");
-        var.flows_from(&body, Filter::default());
+            .expect("a lambda's body is emitted inside its frame")
+            .body
+            .take();
+        if let Some(body) = body {
+            var.flows_from(&body, Filter::default());
+        }
         // A `_` in a parameter's type whose capabilities reach a bounded clause of the `def`
         // takes the bound, so a use passing more is refused at the call.
         var.bound_holes_reaching();
@@ -4404,12 +4445,15 @@ impl Typing for InferCtx {
     fn record_read(&mut self, name: &Name, mention: &Expr) {
         // The mention reads the variable, whatever node reads through it: its own capabilities
         // state the read, so it stays where the mention does.
+        let Some(transactional) = self.places.get(name).map(|b| b.transactional) else {
+            return;
+        };
         let Repr::Var(var) = mention.own_capabilities.repr() else {
-            unreachable!("a node under inference holds its capability variable")
+            unreachable!("a node denoting a mutable variable holds its capability variables")
         };
         let var = Rc::clone(var);
         let prev = self.enter_node(mention.node_id());
-        if let Some(transactional) = self.places.get(name).map(|b| b.transactional) {
+        {
             if transactional {
                 var.record(
                     self.capability(
@@ -4434,9 +4478,11 @@ impl Typing for InferCtx {
         // function's own variables included: a statement that writes one does something.
         let var = CapabilityVar::fresh(self.level, &self.telescope);
         self.node_capabilities.push(NodeCapabilities {
-            var: Rc::clone(&var),
+            var: Some(Rc::clone(&var)),
             // Not a node of its own: what it records is the statement's.
-            own: Rc::clone(&var),
+            own: Some(Rc::clone(&var)),
+            level: self.level,
+            telescope: self.telescope.clone(),
             inflow: Inflow::All,
             body: None,
             at: Some(node),
@@ -4453,7 +4499,7 @@ impl Typing for InferCtx {
             .rev()
             .find_map(|e| match e.inflow {
                 Inflow::Closed => Some(None),
-                _ if e.transaction => Some(Some(e.var.uid)),
+                _ if e.transaction => Some(e.var.as_ref().map(|v| v.uid)),
                 _ => None,
             });
         self.capability_statements.push((node, var, body.flatten()));
@@ -4470,8 +4516,10 @@ impl Typing for InferCtx {
         // enclosing function's own variables: an accumulator may be one.
         let var = CapabilityVar::fresh(self.level, &self.telescope);
         self.node_capabilities.push(NodeCapabilities {
-            var: Rc::clone(&var),
-            own: Rc::clone(&var),
+            var: Some(Rc::clone(&var)),
+            own: Some(Rc::clone(&var)),
+            level: self.level,
+            telescope: self.telescope.clone(),
             inflow: Inflow::All,
             body: None,
             at: Some(node),
@@ -4581,8 +4629,10 @@ impl Typing for InferCtx {
         let var = CapabilityVar::fresh(self.level, &self.telescope);
         let catch = Rc::new(crate::ccl::capabilities::Catch::new(node, catches.to_vec()));
         self.node_capabilities.push(NodeCapabilities {
-            var: Rc::clone(&var),
-            own: Rc::clone(&var),
+            var: Some(Rc::clone(&var)),
+            own: Some(Rc::clone(&var)),
+            level: self.level,
+            telescope: self.telescope.clone(),
             inflow: Inflow::All,
             body: None,
             at: None,
@@ -4629,8 +4679,10 @@ impl Typing for InferCtx {
             },
         });
         self.node_capabilities.push(NodeCapabilities {
-            own: Rc::clone(&var),
-            var,
+            own: Some(Rc::clone(&var)),
+            var: Some(var),
+            level: self.level,
+            telescope: self.telescope.clone(),
             inflow: Inflow::All,
             body: None,
             at: Some(node),
@@ -4643,7 +4695,8 @@ impl Typing for InferCtx {
             .last()
             .expect("the body's entry")
             .var
-            .clone();
+            .clone()
+            .expect("a block's body holds its variable from the start");
         self.leave_node_capabilities();
         if !valued {
             self.capability_transactions.push((node, var));

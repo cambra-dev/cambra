@@ -56,13 +56,17 @@ use std::collections::HashMap;
 /// in an already rejected program and cannot accept a program.
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     let prev = ctx.enter_node(expr.node_id());
-    // The node's capabilities, and what it does of its own, which coalesce resolves in their slots
-    // as it resolves `ty` (`src/ccl/design/type-inference.md`, "4.9 Capabilities").
-    (expr.capabilities, expr.own_capabilities) = ctx.enter_node_capabilities(&expr.node);
+    let denotes = match &denoted_expr(expr).node {
+        TypedExprNode::Var(name) => Some(name.clone()),
+        _ => None,
+    };
+    ctx.enter_node_capabilities(&expr.node, denotes.as_ref());
     // One stack frame per node over the whole tree; grow on demand, as the other
     // pass-level walks do.
     let result = stacker::maybe_grow(512 * 1024, 1024 * 1024, || emit_node_inner(expr, ctx));
-    ctx.leave_node_capabilities();
+    // The node's capabilities, and what it does of its own, which coalesce resolves in their slots
+    // as it resolves `ty` (`src/ccl/design/type-inference.md`, "4.9 Capabilities").
+    (expr.capabilities, expr.own_capabilities) = ctx.leave_node_capabilities();
     ctx.leave_node(prev);
     if result.is_err() {
         // A failed rule's selected calls report nothing, as a failed statement's waiting
@@ -5504,5 +5508,36 @@ mod review_tests {
             "the second occurrence's domain must be constrained by the predicate \
              too — the memo hit skipped emission and left `d2` unbounded",
         );
+    }
+
+    /// A node nothing flows into holds the empty set and no capability variable: a literal under
+    /// a comparison records nothing, receives no call's edge and has no child holding a variable.
+    /// The root's variables are minted as it is entered, since the top level's effects read them.
+    #[test]
+    fn a_node_nothing_reaches_holds_no_capability_variable() {
+        let mut expr = TypedExpr::binop(
+            TypedExpr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::Greater),
+            TypedExpr::lit(Lit::Int(0)),
+        );
+        let mut ctx = InferCtx::new(HashMap::new(), expr.node_id());
+        ctx.instances = crate::ccl::infer::solver::traits::InstanceTable::std();
+        emit_node(&mut expr, &mut ctx).expect("`1 > 0` types");
+        assert!(matches!(
+            expr.capabilities.repr(),
+            crate::ccl::capabilities::Repr::Var(_)
+        ));
+        let mut children = 0;
+        expr.walk_children(|child| {
+            children += 1;
+            for slot in [&child.capabilities, &child.own_capabilities] {
+                assert!(
+                    matches!(slot.repr(), crate::ccl::capabilities::Repr::Known(set)
+                        if set == &crate::ccl::capabilities::CapabilitySet::default()),
+                    "a literal holds the empty set, not a variable"
+                );
+            }
+        });
+        assert_eq!(children, 2);
     }
 }
