@@ -49,12 +49,14 @@ pub mod constrain;
 pub(crate) mod containment;
 pub mod display;
 pub mod held;
+pub(crate) mod proxies;
 pub mod scheme;
 pub mod simplify_type;
 pub mod smt;
 pub mod spec_key;
 pub mod state;
 pub mod traits;
+pub(crate) mod transport;
 pub mod var;
 
 // Re-export every symbol that external modules reach through the
@@ -65,8 +67,8 @@ pub use compact::{
     CompactGraph, CompactType, compact_type, compact_type_for_display, compact_type_polarity_only,
 };
 pub use constrain::{
-    ConstrainCache, ConstrainError, Derivation, ExtrudeCache, constrain_subtype,
-    constrain_subtype_in, constrain_subtype_under_in, extrude,
+    ConstrainCache, ConstrainError, Derivation, constrain_subtype, constrain_subtype_in,
+    constrain_subtype_under_in, extrude,
 };
 pub use scheme::{
     FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,

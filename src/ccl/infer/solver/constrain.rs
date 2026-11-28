@@ -26,15 +26,17 @@ use crate::ccl::infer_var::{GuardedBound, Origin};
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunBinder, FunKind, KindPin, TypeKind};
 use crate::ccl::{
-    BarrierUpper, BaseType, Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement,
-    RefinementSet, Type,
+    BarrierUpper, BaseType, Bound, HistoryKind, InferVar, Level, Name, Refinement, RefinementSet,
+    Type,
 };
 
 use super::barrier::EdgeReport;
+use super::held::HeldKind;
 use super::smt::{ScopeEnv, SmtError};
 use super::traits::{
     Trait, link_barrier_watches, link_watches, notify_barrier_lower, notify_lower, notify_upper,
 };
+use super::transport::{Side, Transport, transport, transport_fun_kind};
 use super::type_level;
 use crate::ccl::FieldKey;
 
@@ -312,16 +314,6 @@ pub struct ConstrainCache {
     /// the report the edge's
     /// caller gives them ([`report_recorded`](Self::report_recorded)).
     unreported: Vec<(Rc<InferVar>, usize)>,
-    /// The proxies extrusion has made in the current constraint walk, per target level.
-    ///
-    /// A proxy is linked to its original by a bound, so a bound the original gains later
-    /// in the walk still reaches it: one proxy per variable, polarity and level serves
-    /// every edge of the walk that crosses that level. A cache per extrusion instead
-    /// copies a variable once per edge that reaches it, and a specialization's pin
-    /// reaches the clones of earlier specializations along many edges. Cleared at each
-    /// walk's entry: this cache lives across walks, and a proxy minted inside a `let` that
-    /// has since been generalized must not stand in for its original anywhere else.
-    extruded: HashMap<Level, ExtrudeCache>,
     /// Whether a `Fun`/`Fun` edge relates the two sides' capabilities. A specialization pin does
     /// not: uses that differ only in what they cause share one clone, and relating their
     /// capabilities through it would give each the others' ([`Self::without_capabilities`]).
@@ -380,7 +372,6 @@ impl ConstrainCache {
             in_data_domains: false,
             failure: None,
             unreported: Vec::new(),
-            extruded: HashMap::new(),
             relates_capabilities: true,
             checks_guarded: true,
         }
@@ -536,32 +527,6 @@ impl ConstrainCache {
     }
 }
 
-/// Cache for [`extrude`], keyed by the polar pair (variable uid, polarity).
-///
-/// Each polarity gets its own extruded copy so positive and negative
-/// occurrences of the same variable can be approximated independently
-/// (see Parreaux 2020 §3.4).
-#[derive(Debug, Default)]
-pub struct ExtrudeCache {
-    /// Original inference variable → its proxy at the target level, a barrier variable's
-    /// included. Registered before the proxy's bounds are extruded, so a bound reaching the
-    /// original again resolves to the proxy.
-    pub vars: HashMap<(InferVarId, bool), Rc<InferVar>>,
-    /// Original funkind variable → its proxy at the target level, by direction, as `vars`.
-    pub kinds: HashMap<(crate::ccl::ty::FunKindVarId, bool), Rc<crate::ccl::ty::FunKindVar>>,
-    /// Original capability variable → its proxy at the target level, by direction, as `vars`.
-    pub capabilities: HashMap<
-        (crate::ccl::capabilities::CapabilityVarId, bool),
-        Rc<crate::ccl::capabilities::CapabilityVar>,
-    >,
-}
-
-impl ExtrudeCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 /// The empty scope that also suppresses the deficit rule's semantic fallback, so a
 /// refinement deficit under it is decided structurally.
 ///
@@ -663,7 +628,7 @@ pub fn constrain_subtype_in(
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
-    cache.extruded.clear();
+    solver.proxies.walk();
     constrain_go(solver, lhs, rhs, &Subst::id(), &Subst::id(), cache, scope)
 }
 
@@ -677,7 +642,7 @@ pub fn constrain_subtype_discharged_in(
     cache: &mut ConstrainCache,
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
-    cache.extruded.clear();
+    solver.proxies.walk();
     constrain_go(solver, lhs, rhs, &Subst::id(), rhs_subst, cache, scope)
 }
 
@@ -778,7 +743,7 @@ pub fn constrain_subtype_under_in(
     // the instantiation off the two types is what puts both sides in one spelling, so the
     // reference comparison below is name equality rather than two unrelated names.
     let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
-    cache.extruded.clear();
+    solver.proxies.walk();
     cache.under(lhs_binders, rhs_binders, |cache| {
         constrain_go(solver, lhs, rhs, &Subst::id(), &instantiation, cache, scope)
     })
@@ -982,12 +947,6 @@ fn enforce_scope(
             holder.uid, bound.ty, telescope,
         );
     }
-}
-
-/// Whether `d` is a variable that names one data domain ([`InferVar::names_domain`]), whose
-/// edges are invariant before any kind reaches it.
-fn named_domain(solver: &mut Solver, d: &Type) -> bool {
-    matches!(d, Type::Infer(v) if v.names_domain(solver))
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -2915,26 +2874,14 @@ fn constrain_go_impl(
             if let Some(param) = escaping_param(rhs, lv.level(solver)) {
                 return Err(ConstrainError::TypeParamEscapes { param });
             }
-            let new_rhs = extrude(
-                solver,
-                rhs,
-                false,
-                lv.level(solver),
-                cache.extruded.entry(lv.level(solver)).or_default(),
-            );
+            let new_rhs = extrude(solver, rhs, false, lv.level(solver));
             constrain_go(solver, lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
             if let Some(param) = escaping_param(lhs, rv.level(solver)) {
                 return Err(ConstrainError::TypeParamEscapes { param });
             }
-            let new_lhs = extrude(
-                solver,
-                lhs,
-                true,
-                rv.level(solver),
-                cache.extruded.entry(rv.level(solver)).or_default(),
-            );
+            let new_lhs = extrude(solver, lhs, true, rv.level(solver));
             constrain_go(solver, &new_lhs, rhs, sl, sr, cache, scope)
         }
 
@@ -3263,13 +3210,7 @@ fn record_guarded_upper(
         if let Some(param) = escaping_param(rhs, lv.level(solver)) {
             return Err(ConstrainError::TypeParamEscapes { param });
         }
-        extrude(
-            solver,
-            rhs,
-            false,
-            lv.level(solver),
-            cache.extruded.entry(lv.level(solver)).or_default(),
-        )
+        extrude(solver, rhs, false, lv.level(solver))
     } else {
         rhs.clone()
     };
@@ -3459,495 +3400,523 @@ fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::T
     }
 }
 
-/// Lift `ty` so that all its variables live at level ≤ `target_level`.
-///
-/// When a constraint crosses level boundaries (e.g. an outer-scope variable
-/// gets constrained against an inner-scope type), variables at higher
-/// levels must be approximated by fresh variables at the target level so
-/// the constraint can be recorded locally. `pol` selects which bound to
-/// preserve: positive (`true`) keeps the lower bound, negative (`false`)
-/// keeps the upper bound.
-///
-/// Outside generalized `let`s every variable shares level 0, so extrude is a
-/// no-op there; it fires for real once let-generalization (`scoped_let`) mints
-/// RHS variables at a deeper level and a cross-level constraint arises (the
-/// constrain_subtype solver's level-mismatch branches).
-pub fn extrude(
-    solver: &mut Solver,
-    ty: &Type,
-    pol: bool,
-    target_level: Level,
-    cache: &mut ExtrudeCache,
-) -> Type {
-    if type_level(solver, ty) <= target_level {
-        return ty.clone();
+/// `ty` as seen from `target_level`: each solver variable deeper than it replaced by its proxy
+/// there, related to it on the side its position stands on under `pol` ([`Extruding`]).
+pub fn extrude(solver: &mut Solver, ty: &Type, pol: bool, target_level: Level) -> Type {
+    transport(
+        solver,
+        ty,
+        Side::of(pol),
+        &mut Extruding {
+            level: target_level,
+        },
+    )
+}
+
+/// Extrusion as a mode of the walk every copy uses ([`super::transport`]): each solver variable
+/// deeper than `level` stands as its proxy there, related to the original on the side its
+/// position stands on ([`proxy_of`]), and every name stays, since a proxy is its original read at
+/// a shallower level.
+pub(crate) struct Extruding {
+    pub(crate) level: Level,
+}
+
+impl Transport for Extruding {
+    // What a type holds is read where a copy reads it ([`super::scheme`]'s `freshen_level`): a
+    // refinement's predicate and a projection's term hold type slots whose variables stand where
+    // the type does.
+    fn reaches(&mut self, solver: &mut Solver, ty: &Type) -> bool {
+        super::scheme::freshen_level(solver, ty) > self.level
     }
-    match ty {
-        // Not a type — an annotation-position obligation, erased by
-        // `normalize_annotation` before any constraint is emitted (see `Type::BoundedHole`).
-        Type::BoundedHole(_) | Type::BarrierHole(_) => {
-            unreachable!("{ty:?} reached the solver; `normalize_annotation` must erase it")
-        }
-        // A barrier variable's proxy is a barrier variable at the target level over the
-        // original's bounds, each extruded at `pol`, standing where the original does. Both
-        // lists extrude at the same polarity: a positive extrusion widens the lowers, so the
-        // resolution can only grow, and widens the uppers it is checked against with it; a
-        // negative one narrows both. An ordinary proxy would close the original's lowers,
-        // refinements naming its opaque binders included, against what it flows into.
-        //
-        // The proxy is linked to the original through a fresh variable `?v` at the target
-        // level: `B <: ?v <: B'` at a positive extrusion, `B' <: ?v <: B` at a negative one.
-        // A bound reaching `B` after a positive extrusion then reaches `B'` through the
-        // barrier checks: `B`'s resolution is checked against `?v`, which records it as a
-        // lower bound of `?v`, and compacting `B'` reads the lower bounds of `?v`, one of its
-        // own lowers. A negative extrusion mirrors it with `B` and `B'` exchanged.
-        Type::Infer(barrier) if barrier.is_barrier() => {
-            if let Some(existing) = cache.vars.get(&(barrier.uid, pol)) {
-                return Type::Infer(Rc::clone(existing));
+
+    fn var(&mut self, solver: &mut Solver, v: &Rc<InferVar>, side: Side) -> Type {
+        match side {
+            Side::Pos | Side::Neg if v.is_barrier() => {
+                barrier_proxy(solver, v, side == Side::Pos, self.level)
             }
-            let opaque = Rc::clone(
-                barrier
-                    .opaque()
-                    .expect("a barrier variable has opaque binders"),
-            );
-            // Registered before the bounds are extruded, as `freshen_above` registers its
-            // copy: a bound reaching `B` through structure resolves to `B'` instead of
-            // extruding `B` again.
-            let fresh = InferVar::barrier(solver, target_level, &barrier.telescope, opaque);
-            cache.vars.insert((barrier.uid, pol), Rc::clone(&fresh));
-            // Snapshot bounds before recursing, as the `Infer` arm does.
-            let lows = Rc::clone(barrier.bounds(solver).lower());
-            let ups = barrier.barrier_uppers(solver);
-            let mut extrude_bound = |solver: &mut Solver, b: &Bound| Bound {
-                origin: b.origin,
-                self_subst: b.self_subst.clone(),
-                ty: extrude(solver, &b.ty, pol, target_level, cache),
-                ty_subst: b.ty_subst.clone(),
-                rendered: Default::default(),
-            };
-            let new_lows: Vec<_> = lows.iter().map(|b| extrude_bound(solver, b)).collect();
-            let new_ups: Vec<_> = ups
-                .iter()
-                .map(|u| extrude_bound(solver, &u.bound))
-                .collect();
-            fresh.bounds_mut(solver).set_lower(new_lows);
-            fresh.bounds_mut(solver).set_upper(new_ups);
-            for (i, u) in ups.iter().enumerate() {
-                if let Some(report) = &u.report {
-                    fresh.report_upper(solver, i, Rc::clone(report));
-                }
-            }
-            // The bounds above are direct writes, so the proxy carries the original's
-            // watches, as an ordinary proxy does.
-            copy_watches(solver, barrier, &fresh);
-            let link = Type::Infer(InferVar::fresh(solver, target_level));
-            let (from, to) = if pol {
-                (barrier, &fresh)
-            } else {
-                (&fresh, barrier)
-            };
-            from.bounds_mut(solver)
-                .upper_mut()
-                .push(Bound::conc(link.clone()));
-            to.bounds_mut(solver).lower_mut().push(Bound::conc(link));
-            Type::Infer(fresh)
+            _ => Type::Infer(proxy_of(solver, v, side.directions(), self.level)),
         }
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::Undetermined(_)
-        | Type::ChanDom(..)
-        | Type::Txn
-        | Type::Hole
-        | Type::SharedHole(_) => ty.clone(),
-        // A domain is an index type and extrudes as an invariant argument does; the body at
-        // the family's polarity, its binders staying its own.
-        Type::Family { binders, body } => Type::Family {
+    }
+
+    fn kind(
+        &mut self,
+        solver: &mut Solver,
+        k: &Rc<crate::ccl::ty::FunKindVar>,
+        side: Side,
+    ) -> Rc<crate::ccl::ty::FunKindVar> {
+        proxy_of(solver, k, side.directions(), self.level)
+    }
+
+    fn capability_var(
+        &mut self,
+        solver: &mut Solver,
+        v: &Rc<crate::ccl::capabilities::CapabilityVar>,
+        side: Side,
+    ) -> Rc<crate::ccl::capabilities::CapabilityVar> {
+        proxy_of(solver, v, side.directions(), self.level)
+    }
+
+    // An ordering requirement's proof state is its run's, which a proxy reads where the
+    // original stands.
+    fn ordering(
+        &mut self,
+        _solver: &mut Solver,
+        r: &crate::ccl::capabilities::Requirement,
+    ) -> crate::ccl::capabilities::Requirement {
+        r.clone()
+    }
+
+    fn raised(
+        &mut self,
+        raised: &crate::ccl::capabilities::Raised,
+        ty: Type,
+    ) -> crate::ccl::capabilities::Raised {
+        crate::ccl::capabilities::Raised {
+            ty,
+            ..raised.clone()
+        }
+    }
+
+    fn label(&mut self, name: &Name) -> Name {
+        name.clone()
+    }
+
+    fn witness(&mut self, w: &crate::ccl::ty::WitnessId) -> crate::ccl::ty::WitnessId {
+        *w
+    }
+
+    // A channel's level does not take part in its identity ([`crate::ccl::ChanLevel`]): the
+    // proxy reads the same channel.
+    fn chan_dom(&mut self, _solver: &mut Solver, ty: &Type) -> Type {
+        ty.clone()
+    }
+
+    // `constrain_go` refuses an edge carrying a parameter below its level before it extrudes
+    // (`escaping_param`), so a parameter extrusion reaches is one the target may name.
+    fn param(&mut self, _solver: &mut Solver, ty: &Type) -> Type {
+        ty.clone()
+    }
+
+    fn family_app(&mut self, _solver: &mut Solver, ty: &Type) -> Type {
+        ty.clone()
+    }
+
+    fn poly(&mut self, _solver: &mut Solver, ty: &Type) -> Type {
+        ty.clone()
+    }
+
+    // A family's domains are index types and stand on both sides, as an invariant argument does;
+    // the body stands on the family's side, its binders staying its own.
+    fn family(&mut self, solver: &mut Solver, ty: &Type, side: Side) -> Type {
+        let Type::Family { binders, body } = ty else {
+            unreachable!("a family")
+        };
+        Type::Family {
             binders: binders
                 .iter()
-                .map(|(name, t)| {
-                    (
-                        name.clone(),
-                        extrude_invariant(solver, t, target_level, cache),
-                    )
-                })
+                .map(|(name, t)| (name.clone(), transport(solver, t, Side::Both, self)))
                 .collect(),
-            body: Box::new(extrude(solver, body, pol, target_level, cache)),
-        },
-        // Componentwise, as a tuple is: a component's names stay its binders.
-        Type::DepTuple(components) => Type::DepTuple(
-            components
-                .iter()
-                .map(|(name, t)| (name.clone(), extrude(solver, t, pol, target_level, cache)))
-                .collect(),
-        ),
-        // `constrain_go` refuses an edge carrying a parameter below its level before
-        // it extrudes (`escaping_param`), and the level short-circuit above returns
-        // every other parameter unchanged.
-        Type::Param(param) => unreachable!(
-            "type parameter `{}` reached `extrude` above the target level; the escape \
-             check precedes extrusion",
-            param.spelling
-        ),
-        Type::Poly(_) => unreachable!("a polymorphic type reached `extrude`"),
-        Type::Fun {
-            binder,
-            fun_kind,
-            domain: d,
-            codomain: c,
-            capabilities,
-        } => Type::Fun {
-            // A function's capabilities are what calling it does, so they cross at the
-            // function's polarity, through a proxy as a variable does.
-            capabilities: extrude_capabilities(solver, capabilities, &[pol], target_level, cache),
-            binder: binder.clone(),
-            // A sum's **candidates** are an invariant position, so they cross a level
-            // boundary through two-way proxies rather than the polar one-way
-            // approximation — the same reason a `History` payload does. The kind premise matches
-            // candidates *by value*, so neither direction of a candidate's bounds is the
-            // "unused" one: a one-way proxy inherits whichever side the polarity picked
-            // and silently drops the other, which for a candidate is usually fatal.
-            fun_kind: match fun_kind {
-                FunKind::Var(kind) => {
-                    FunKind::Var(extrude_kind(solver, kind, &[pol], target_level, cache))
-                }
-                FunKind::Data(Some(ws)) => FunKind::Data(Some(Rc::new(
-                    ws.iter()
-                        .map(|w| w.map_types(|t| extrude_invariant(solver, t, target_level, cache)))
-                        .collect(),
-                ))),
-                other => other.clone(),
-            },
-            // A data function's domain is invariant (`src/ccl/design/type-inference.md`, "Data
-            // domains are invariant"), so it crosses through two-way proxies as the candidates
-            // do: a one-way proxy would carry only the contravariant half of the equation the
-            // domain owes, and a domain variable copied up a level would never learn the
-            // domain the collection reaching the copy brings.
-            domain: Box::new(
-                if fun_kind.resolved_in(solver).is_data() || named_domain(solver, d) {
-                    extrude_invariant(solver, d, target_level, cache)
-                } else {
-                    extrude(solver, d, !pol, target_level, cache)
-                },
-            ),
-            codomain: Box::new(extrude(solver, c, pol, target_level, cache)),
-        },
-        Type::Tuple(ts) => Type::Tuple(
-            ts.iter()
-                .map(|t| extrude(solver, t, pol, target_level, cache))
-                .collect(),
-        ),
-        Type::OpenTuple(ts) => Type::OpenTuple(
-            ts.iter()
-                .map(|t| extrude(solver, t, pol, target_level, cache))
-                .collect(),
-        ),
-        // Each argument extrudes at the polarity its variance gives it, and an invariant
-        // one through two-way proxies, as a history's payload does.
-        Type::Nominal(decl, args) => Type::Nominal(
-            decl.clone(),
-            args.iter()
-                .zip(&decl.body().variances)
-                .map(|(t, v)| match (v, t) {
-                    (Variance::Covariant, _) => extrude(solver, t, pol, target_level, cache),
-                    (Variance::Contravariant, _) => extrude(solver, t, !pol, target_level, cache),
-                    (Variance::Bipolar, Type::Split { .. }) => {
-                        extrude(solver, t, pol, target_level, cache)
-                    }
-                    (Variance::Invariant | Variance::Bipolar, _) => {
-                        extrude_invariant(solver, t, target_level, cache)
-                    }
-                })
-                .collect(),
-        ),
-        // A bipolar argument's input side is read where its output side's polarity flips.
-        Type::Split { input, output } => Type::Split {
-            input: Box::new(extrude(solver, input, !pol, target_level, cache)),
-            output: Box::new(extrude(solver, output, pol, target_level, cache)),
-        },
-        Type::Record(fs) => Type::Record(
-            fs.iter()
-                .map(|(n, t)| (n.clone(), extrude(solver, t, pol, target_level, cache)))
-                .collect(),
-        ),
-        Type::Variant(tags, openness) => Type::Variant(
-            tags.iter()
-                // Variant payloads are covariant — same polarity, no flip.
-                .map(|(k, t)| (k.clone(), extrude(solver, t, pol, target_level, cache)))
-                .collect(),
-            *openness,
-        ),
-        Type::Refinement(inner, r) => {
-            Type::refined(extrude(solver, inner, pol, target_level, cache), r.clone())
-        }
-        Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.clone(),
-        // Invariant payload: polarity is meaningless under invariance, so
-        // both children are extruded with two-way proxies (a history is read
-        // *and* written) instead of the polar one-way approximation below.
-        Type::History {
-            function,
-            history_kind,
-        } => {
-            let Type::Fun {
-                binder,
-                fun_kind,
-                domain,
-                codomain,
-                capabilities,
-            } = function.as_ref()
-            else {
-                unreachable!("a history's function is an unrefined function, got {function}")
-            };
-            let fun_kind = match fun_kind {
-                FunKind::Var(kind) => FunKind::Var(extrude_kind(
-                    solver,
-                    kind,
-                    &[true, false],
-                    target_level,
-                    cache,
-                )),
-                other => other.clone(),
-            };
-            Type::history_over(
-                Type::Fun {
-                    binder: binder.clone(),
-                    fun_kind,
-                    domain: Box::new(extrude_invariant(solver, domain, target_level, cache)),
-                    codomain: Box::new(extrude_invariant(solver, codomain, target_level, cache)),
-                    capabilities: extrude_capabilities(
-                        solver,
-                        capabilities,
-                        &[true, false],
-                        target_level,
-                        cache,
-                    ),
-                },
-                *history_kind,
-            )
-        }
-        Type::Infer(tv) => {
-            if let Some(existing) = cache.vars.get(&(tv.uid, pol)) {
-                return Type::Infer(Rc::clone(existing));
-            }
-            // Conservative approximation: a fresh variable at the target
-            // level, linked to the original by the appropriate bound. It
-            // proxies the original, so it inherits the original's telescope —
-            // the bounds copied below close against the same scope.
-            // Each field of the original, and what the proxy makes of it.
-            let crate::ccl::infer_var::InferVarFields {
-                // The proxy's own.
-                uid: (),
-                // The target level.
-                level: (),
-                // Minted by this solver.
-                home: (),
-                // The original's: the bounds copied below close against the same scope.
-                telescope: (),
-                // None: a barrier variable extrudes in its own arm, above.
-                opaque: (),
-                // Linked to the original, and the side the polarity reads copied, below.
-                bounds: (),
-                // Its own funkind variable, related to the original's as the link bound relates
-                // the two variables (`relate_proxy_funkinds`).
-                fun_kind: (),
-                // The original's (`copy_watches`).
-                watches: (),
-                // A memo of the variables reading this one under substitutions, minted afresh as
-                // the proxy is read.
-                suspensions: (),
-                // Marked, so a function edge whose domain is the proxy is an equation as one
-                // whose domain is the original is.
-                named_domain: (),
-                // `inherit_stands_for`.
-                stands_for: (),
-                // `inherit_witness_placement`.
-                witness_scopes: (),
-                // None: a barrier variable extrudes in its own arm, above.
-                barrier: (),
-            } = tv.fields(solver);
-            let nvs = InferVar::fresh_in(solver, target_level, &tv.telescope);
-            nvs.inherit_witness_placement(solver, tv);
-            nvs.inherit_stands_for(solver, tv);
-            if tv.names_domain(solver) {
-                nvs.mark_named_domain(solver);
-            }
-            relate_proxy_funkinds(solver, tv, &nvs, &[pol]);
-            cache.vars.insert((tv.uid, pol), Rc::clone(&nvs));
-            copy_watches(solver, tv, &nvs);
-            // Kinding constraints ride along at **both** polarities, unlike the bounds
-            // below. The proxy stands in for the original wherever the outer scope reads
-            // it, and "must inhabit 𝐾" is a property of what that resolves to, not of a
-            // direction of flow — a one-sided copy would let a scope boundary launder
-            // the constraint away. The kind's own type children extrude with it: a
-            // parameterized kind carries types like any other position.
-            {
-                let kinds = tv.bounds(solver).type_kinds.clone();
-                let carried: Vec<_> = kinds
-                    .iter()
-                    .map(|k| k.map_children(|t| extrude(solver, t, pol, target_level, cache)))
-                    .collect();
-                nvs.bounds_mut(solver).type_kinds = carried;
-            }
-
-            // Each branch snapshots only the list it does *not* push to — the
-            // positive one seeds from `lower` and writes `upper`, the negative
-            // mirrors it — so a branch never holds the list it is about to write
-            // and its own push never forks the shared list. (The snapshot is
-            // needed regardless: the bounds are read across a `borrow_mut` and
-            // across the recursion below.)
-            if pol {
-                // Positive: original flows into new var. Original gains
-                // `nvs` as an upper bound; new var inherits original's
-                // lower bounds (extruded at the same polarity).
-                let lows = Rc::clone(tv.bounds(solver).lower());
-                tv.bounds_mut(solver)
-                    .upper_mut()
-                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
-                let new_lows: Vec<_> = lows
-                    .iter()
-                    .map(|b| Bound {
-                        origin: b.origin,
-                        self_subst: b.self_subst.clone(),
-                        ty: extrude(solver, &b.ty, pol, target_level, cache),
-                        ty_subst: b.ty_subst.clone(),
-                        rendered: Default::default(),
-                    })
-                    .collect();
-                nvs.bounds_mut(solver).set_lower(new_lows);
-            } else {
-                // Negative: new var flows into original. Original gains
-                // `nvs` as a lower bound; new var inherits original's
-                // upper bounds.
-                let ups = Rc::clone(tv.bounds(solver).upper());
-                tv.bounds_mut(solver)
-                    .lower_mut()
-                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
-                let new_ups: Vec<_> = ups
-                    .iter()
-                    .map(|b| Bound {
-                        origin: b.origin,
-                        self_subst: b.self_subst.clone(),
-                        ty: extrude(solver, &b.ty, pol, target_level, cache),
-                        ty_subst: b.ty_subst.clone(),
-                        rendered: Default::default(),
-                    })
-                    .collect();
-                nvs.bounds_mut(solver).set_upper(new_ups);
-                // A guarded bound restricts what reaches `tv`, so the proxy flowing into it
-                // carries it as it carries the upper bounds.
-                let guarded = extrude_guarded(solver, tv, pol, target_level, cache);
-                nvs.bounds_mut(solver).guarded_upper.extend(guarded);
-            }
-            Type::Infer(nvs)
+            body: Box::new(transport(solver, body, side, self)),
         }
     }
 }
 
-/// Record between `original`'s funkind variable and `proxy`'s the edges the bound linking the two
-/// draws, as relating two variables records their funkinds' (`constrain_go`): `original <: proxy`
-/// for a positive direction, `proxy <: original` for a negative one. The link is written directly,
-/// so without this the proxy's funkind variable relates to nothing the original's does.
-fn relate_proxy_funkinds(
+/// A barrier variable's proxy at `target_level` on `pol`'s side.
+///
+/// A barrier variable's proxy is a barrier variable at the target level over the
+/// original's bounds, each extruded at `pol`, standing where the original does. Both
+/// lists extrude at the same polarity: a positive extrusion widens the lowers, so the
+/// resolution can only grow, and widens the uppers it is checked against with it; a
+/// negative one narrows both. An ordinary proxy would close the original's lowers,
+/// refinements naming its opaque binders included, against what it flows into.
+///
+/// The proxy is linked to the original through a fresh variable `?v` at the target
+/// level: `B <: ?v <: B'` at a positive extrusion, `B' <: ?v <: B` at a negative one.
+/// A bound reaching `B` after a positive extrusion then reaches `B'` through the
+/// barrier checks: `B`'s resolution is checked against `?v`, which records it as a
+/// lower bound of `?v`, and compacting `B'` reads the lower bounds of `?v`, one of its
+/// own lowers. A negative extrusion mirrors it with `B` and `B'` exchanged.
+fn barrier_proxy(
+    solver: &mut Solver,
+    barrier: &Rc<InferVar>,
+    pol: bool,
+    target_level: Level,
+) -> Type {
+    if let Some(existing) = solver
+        .proxies
+        .get(barrier.held_key(), target_level, pol)
+        .and_then(<Rc<InferVar> as HeldKind>::from_held)
+        .cloned()
+    {
+        return Type::Infer(existing);
+    }
+    let opaque = Rc::clone(
+        barrier
+            .opaque()
+            .expect("a barrier variable has opaque binders"),
+    );
+    // Registered before the bounds are extruded, as `freshen_above` registers its
+    // copy: a bound reaching `B` through structure resolves to `B'` instead of
+    // extruding `B` again.
+    let fresh = InferVar::barrier(solver, target_level, &barrier.telescope, opaque);
+    solver.proxies.insert(
+        barrier.held_key(),
+        target_level,
+        pol,
+        Rc::clone(&fresh).into_held(),
+    );
+    // Snapshot bounds before recursing, as the `Infer` arm does.
+    let lows = Rc::clone(barrier.bounds(solver).lower());
+    let ups = barrier.barrier_uppers(solver);
+    let extrude_bound = |solver: &mut Solver, b: &Bound| Bound {
+        origin: b.origin,
+        self_subst: b.self_subst.clone(),
+        ty: extrude(solver, &b.ty, pol, target_level),
+        ty_subst: b.ty_subst.clone(),
+        rendered: Default::default(),
+    };
+    let new_lows: Vec<_> = lows.iter().map(|b| extrude_bound(solver, b)).collect();
+    let new_ups: Vec<_> = ups
+        .iter()
+        .map(|u| extrude_bound(solver, &u.bound))
+        .collect();
+    fresh.bounds_mut(solver).set_lower(new_lows);
+    fresh.bounds_mut(solver).set_upper(new_ups);
+    for (i, u) in ups.iter().enumerate() {
+        if let Some(report) = &u.report {
+            fresh.report_upper(solver, i, Rc::clone(report));
+        }
+    }
+    // The bounds above are direct writes, so the proxy carries the original's
+    // watches, as an ordinary proxy does.
+    copy_watches(solver, barrier, &fresh);
+    let link = Type::Infer(InferVar::fresh(solver, target_level));
+    let (from, to) = if pol {
+        (barrier, &fresh)
+    } else {
+        (&fresh, barrier)
+    };
+    from.bounds_mut(solver)
+        .upper_mut()
+        .push(Bound::conc(link.clone()));
+    to.bounds_mut(solver).lower_mut().push(Bound::conc(link));
+    Type::Infer(fresh)
+}
+
+/// Place `proxy`, standing for `original` at `target_level`, under what `original` is placed
+/// under, each kind deeper than the target through its proxy there: a proxy names nothing deeper
+/// than itself. A kind's proxy binds that kind's binders, so the names the proxy may read are the
+/// original's.
+fn inherit_placement_at(
     solver: &mut Solver,
     original: &InferVar,
     proxy: &InferVar,
-    directions: &[bool],
-) {
-    for &positive in directions {
-        relate_proxy_kind(solver, original.fun_kind(), proxy.fun_kind(), positive);
-    }
-}
-
-/// Record between the funkind variables `original` and `proxy` the edges a link in the direction
-/// `positive` draws: `original <: proxy` for a positive one, `proxy <: original` for a negative
-/// one, each recorded on both ends.
-fn relate_proxy_kind(
-    solver: &mut Solver,
-    original: &Rc<crate::ccl::ty::FunKindVar>,
-    proxy: &Rc<crate::ccl::ty::FunKindVar>,
-    positive: bool,
-) {
-    let (lower, upper) = if positive {
-        (original, proxy)
-    } else {
-        (proxy, original)
-    };
-    upper.record(solver, FunKind::Var(Rc::clone(lower)), true);
-    lower.record(solver, FunKind::Var(Rc::clone(upper)), false);
-}
-
-/// `kind` as seen from `target_level`: itself where it stands at or below it, and otherwise a
-/// proxy at the target level related to it in each of `directions`, as [`relate_proxy_funkinds`]
-/// relates a proxy variable's funkind variable to its original's. One proxy serves a direction;
-/// a two-way extrusion adds the missing direction to a one-way proxy rather than minting another.
-///
-/// The proxy binds the original's binders ([`crate::ccl::ty::FunKindVar::proxy`]): the parts of
-/// the function type it stands in name them, and so do the telescopes of the variables in those
-/// parts, which a proxy variable inherits.
-fn extrude_kind(
-    solver: &mut Solver,
-    kind: &Rc<crate::ccl::ty::FunKindVar>,
-    directions: &[bool],
     target_level: Level,
-    cache: &mut ExtrudeCache,
-) -> Rc<crate::ccl::ty::FunKindVar> {
-    if kind.level(solver) <= target_level {
-        return Rc::clone(kind);
-    }
-    let proxy = directions
-        .iter()
-        .find_map(|d| cache.kinds.get(&(kind.uid, *d)).cloned())
-        .unwrap_or_else(|| crate::ccl::ty::FunKindVar::proxy(solver, target_level, kind));
-    for &positive in directions {
-        if cache
-            .kinds
-            .get(&(kind.uid, positive))
-            .is_some_and(|p| Rc::ptr_eq(p, &proxy))
-        {
-            continue;
+) {
+    let mut proxies = HashMap::new();
+    for kind in original.witness_scope_kinds(solver) {
+        if kind.home().is_some() && kind.level(solver) > target_level {
+            let p = proxy_of(solver, &kind, &[true, false], target_level);
+            proxies.insert(kind.uid, p);
         }
-        relate_proxy_kind(solver, kind, &proxy, positive);
-        cache.kinds.insert((kind.uid, positive), Rc::clone(&proxy));
     }
+    proxy.inherit_witness_placement_renamed(
+        solver,
+        original,
+        |k| proxies.get(&k.uid).cloned().unwrap_or_else(|| Rc::clone(k)),
+        |w| *w,
+    );
+}
+
+/// A sort of solver variable that crosses levels through proxies ([`proxy_of`]).
+///
+/// A proxy is a fresh variable at the shallower level related to its original by an edge,
+/// across which what the original knows on the edge's side reaches the proxy: a positive proxy
+/// (`original <: proxy`) holds what flows into the original, and a negative one
+/// (`proxy <: original`) what the original demands. A sort says how its variable is minted and
+/// what crossing the edge gives the proxy, now and as the original learns more; finding,
+/// reusing and registering proxies is [`proxy_of`]'s, one rule for every sort.
+pub(crate) trait Proxied: HeldKind + Clone {
+    /// The level the variable stands at.
+    fn standing(&self, solver: &Solver) -> Level;
+    /// Whether a run owns the variable: one lowering minted is the program's, at level 0.
+    fn owned(&self) -> bool;
+    /// A new variable at `level` to stand for `original`, related to nothing yet. `directions`
+    /// are those the proxy is minted for.
+    fn mint(solver: &mut Solver, original: &Self, directions: &[bool], level: Level) -> Self;
+    /// What the proxy holds whichever way it is related, once it is registered, so a cycle back
+    /// to the original reaches the proxy.
+    fn furnish(_solver: &mut Solver, _original: &Self, _proxy: &Self, _level: Level) {}
+    /// Relate `proxy` to `original` in `positive`'s direction, giving it what the original
+    /// holds on that side.
+    fn link(solver: &mut Solver, original: &Self, proxy: &Self, positive: bool, level: Level);
+}
+
+/// `original` as seen from `level`: itself where it stands at or below `level`, and otherwise
+/// its proxy there, related to it in each of `directions`.
+///
+/// One proxy stands for an original at a level in a direction while the scope that minted it is
+/// live ([`super::proxies::Proxies`]). An existing proxy for one of `directions` serves them all:
+/// the directions it lacks are added to it rather than minting another. Every sort crosses by
+/// this one rule; what crossing gives the proxy is the sort's ([`Proxied`]).
+pub(crate) fn proxy_of<P: Proxied>(
+    solver: &mut Solver,
+    original: &P,
+    directions: &[bool],
+    level: Level,
+) -> P {
+    if !original.owned() || original.standing(solver) <= level {
+        return original.clone();
+    }
+    // A proxy's link extrudes what the original holds on its side, which reaches other variables'
+    // proxies in turn, so a chain of bounds is a chain of frames: grow on demand, as a copy does.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        mint_or_reuse_proxy(solver, original, directions, level)
+    })
+}
+
+/// [`proxy_of`] for an original deeper than `level`.
+fn mint_or_reuse_proxy<P: Proxied>(
+    solver: &mut Solver,
+    original: &P,
+    directions: &[bool],
+    level: Level,
+) -> P {
+    let key = original.held_key();
+    let existing = directions.iter().find_map(|d| {
+        solver
+            .proxies
+            .get(key, level, *d)
+            .and_then(P::from_held)
+            .cloned()
+    });
+    let proxy = match existing {
+        Some(proxy) => proxy,
+        None => {
+            let proxy = P::mint(solver, original, directions, level);
+            // Registered for its first direction before anything is read from the original, so
+            // a cycle back to the original finds the proxy.
+            solver
+                .proxies
+                .insert(key, level, directions[0], proxy.clone().into_held());
+            P::furnish(solver, original, &proxy, level);
+            proxy
+        }
+    };
+    link_proxy(solver, original, &proxy, directions, level);
     proxy
 }
 
-/// `capabilities` as seen from `target_level`: themselves unless they are a variable above it,
-/// which crosses through a proxy at the target level in each of `directions`. A positive proxy
-/// holds what the original holds (`original → proxy`); a negative one flows into the original
-/// (`proxy → original`). An instantiation that copies the original keeps the copy's edge to the
-/// proxy, which stands outside it ([`crate::ccl::infer::solver::scheme`]).
-fn extrude_capabilities(
+/// Relate `proxy`, standing for `original` at `level`, in each of `directions` it is not yet
+/// related in ([`Proxied::link`]), registering it for each.
+fn link_proxy<P: Proxied>(
     solver: &mut Solver,
-    capabilities: &Capabilities,
+    original: &P,
+    proxy: &P,
     directions: &[bool],
-    target_level: Level,
-    cache: &mut ExtrudeCache,
-) -> Capabilities {
-    let Repr::Var(original) = capabilities.repr() else {
-        return capabilities.clone();
-    };
-    if original.level(solver) <= target_level {
-        return capabilities.clone();
-    }
-    let proxy = directions
-        .iter()
-        .find_map(|d| cache.capabilities.get(&(original.uid, *d)).cloned())
-        .unwrap_or_else(|| {
-            crate::ccl::capabilities::CapabilityVar::fresh(
-                solver,
-                target_level,
-                &original.telescope,
-            )
-        });
+    level: Level,
+) {
+    let key = original.held_key();
     for &positive in directions {
-        if cache
-            .capabilities
-            .get(&(original.uid, positive))
-            .is_some_and(|p| Rc::ptr_eq(p, &proxy))
+        if solver
+            .proxies
+            .linked(key, level, positive, &proxy.held_key())
         {
             continue;
         }
+        solver
+            .proxies
+            .insert(key, level, positive, proxy.clone().into_held());
+        solver.proxies.mark_linked(key, level, positive);
+        P::link(solver, original, proxy, positive, level);
+    }
+}
+
+impl Proxied for Rc<InferVar> {
+    fn standing(&self, solver: &Solver) -> Level {
+        self.level(solver)
+    }
+
+    fn owned(&self) -> bool {
+        self.home().is_some()
+    }
+
+    fn mint(solver: &mut Solver, tv: &Self, directions: &[bool], level: Level) -> Self {
+        // Each field of the original, and what the proxy makes of it.
+        let crate::ccl::infer_var::InferVarFields {
+            // The proxy's own.
+            uid: (),
+            // The target level.
+            level: (),
+            // Minted by this solver.
+            home: (),
+            // The original's: the bounds copied across the link close against the same scope.
+            telescope: (),
+            // None: a barrier variable extrudes in its own arm.
+            opaque: (),
+            // Related to the original, and the side each direction reads copied ([`Self::link`]).
+            bounds: (),
+            // The proxy of the original's funkind variable, in the same directions.
+            fun_kind: (),
+            // The original's (`copy_watches`).
+            watches: (),
+            // A memo of the variables reading this one under substitutions, minted afresh as
+            // the proxy is read.
+            suspensions: (),
+            // Marked, so a function edge whose domain is the proxy is an equation as one
+            // whose domain is the original is.
+            named_domain: (),
+            // `inherit_stands_for`.
+            stands_for: (),
+            // `inherit_placement_at`.
+            witness_scopes: (),
+            // None: a barrier variable extrudes in its own arm.
+            barrier: (),
+        } = tv.fields(solver);
+        // The proxy stands over its original's kind's proxy, which holds what that kind knows
+        // on each direction's side and binds its binders.
+        let kind = proxy_of(solver, tv.fun_kind(), directions, level);
+        let nvs = InferVar::fresh_over(solver, level, &tv.telescope, kind);
+        inherit_placement_at(solver, tv, &nvs, level);
+        nvs.inherit_stands_for(solver, tv);
+        if tv.names_domain(solver) {
+            nvs.mark_named_domain(solver);
+        }
+        copy_watches(solver, tv, &nvs);
+        nvs
+    }
+
+    fn furnish(solver: &mut Solver, tv: &Self, nvs: &Self, level: Level) {
+        // Kinding constraints ride along whichever way the proxy is related. The proxy stands in
+        // for the original wherever the outer scope reads it, and "must inhabit 𝐾" is a property
+        // of what that resolves to, not of a direction of flow: a one-sided copy would let a
+        // scope boundary launder the constraint away. The kind's own type children cross as an
+        // invariant position does.
+        let kinds = tv.bounds(solver).type_kinds.clone();
+        let carried: Vec<_> = kinds
+            .iter()
+            .map(|k| k.map_children(|t| extrude_invariant(solver, t, level)))
+            .collect();
+        nvs.bounds_mut(solver).type_kinds = carried;
+    }
+
+    fn link(solver: &mut Solver, tv: &Self, nvs: &Self, positive: bool, level: Level) {
+        // The kinds are related in the same direction.
+        link_proxy(solver, tv.fun_kind(), nvs.fun_kind(), &[positive], level);
+        // The side of the original's bounds the direction reads, without the link to this
+        // proxy itself, which a reused proxy's other direction may have put there.
+        let not_proxy = |b: &Bound| !matches!(&b.ty, Type::Infer(v) if v.uid == nvs.uid);
+        if positive {
+            // `tv <: proxy`: the proxy holds what flows into the original.
+            let lows: Vec<Bound> = tv
+                .bounds(solver)
+                .lower()
+                .iter()
+                .filter(|b| not_proxy(b))
+                .cloned()
+                .collect();
+            tv.bounds_mut(solver)
+                .upper_mut()
+                .push(Bound::conc(Type::Infer(Rc::clone(nvs))));
+            // Each bound's substitutions are kept as the original's bound holds them
+            // (`src/ccl/design/type-inference.md`, "Copying solver state").
+            let new_lows: Vec<_> = lows
+                .iter()
+                .map(|b| Bound {
+                    origin: b.origin,
+                    self_subst: b.self_subst.clone(),
+                    ty: extrude(solver, &b.ty, true, level),
+                    ty_subst: b.ty_subst.clone(),
+                    rendered: Default::default(),
+                })
+                .collect();
+            nvs.bounds_mut(solver).lower_mut().extend(new_lows);
+        } else {
+            // `proxy <: tv`: the proxy holds what the original demands, its guarded bounds too.
+            let ups: Vec<Bound> = tv
+                .bounds(solver)
+                .upper()
+                .iter()
+                .filter(|b| not_proxy(b))
+                .cloned()
+                .collect();
+            tv.bounds_mut(solver)
+                .lower_mut()
+                .push(Bound::conc(Type::Infer(Rc::clone(nvs))));
+            let new_ups: Vec<_> = ups
+                .iter()
+                .map(|b| Bound {
+                    origin: b.origin,
+                    self_subst: b.self_subst.clone(),
+                    ty: extrude(solver, &b.ty, false, level),
+                    ty_subst: b.ty_subst.clone(),
+                    rendered: Default::default(),
+                })
+                .collect();
+            nvs.bounds_mut(solver).upper_mut().extend(new_ups);
+            let guarded = extrude_guarded(solver, tv, false, level);
+            nvs.bounds_mut(solver).guarded_upper.extend(guarded);
+        }
+    }
+}
+
+impl Proxied for Rc<crate::ccl::ty::FunKindVar> {
+    fn standing(&self, solver: &Solver) -> Level {
+        self.level(solver)
+    }
+
+    fn owned(&self) -> bool {
+        self.home().is_some()
+    }
+
+    fn mint(solver: &mut Solver, kind: &Self, _directions: &[bool], level: Level) -> Self {
+        // Binding the original's binders ([`crate::ccl::ty::FunKindVar::proxy`]): the parts of
+        // the function type it stands in name them, and so do the telescopes of the variables in
+        // those parts, which a proxy variable inherits.
+        crate::ccl::ty::FunKindVar::proxy(solver, level, kind)
+    }
+
+    fn link(solver: &mut Solver, kind: &Self, proxy: &Self, positive: bool, _level: Level) {
+        // `original <: proxy` for a positive link and `proxy <: original` for a negative one,
+        // stored on the original, the deeper end, as every edge to a shallower kind is.
+        kind.record(solver, FunKind::Var(Rc::clone(proxy)), !positive);
+        // The proxy holds what the original knows on the side the link reads, as a type
+        // variable's proxy takes the original's bounds on its direction's side: a positive proxy
+        // its lowers and what it is built over, a negative one its concrete uppers. What the
+        // original learns later is delivered the same way as it is recorded
+        // ([`push_to_kind_proxies`]).
+        if positive {
+            for (lower, edge) in kind.lower_edges(solver) {
+                deliver_kind_fact(solver, proxy, &KindFact::Edge(&lower, true, &edge));
+            }
+            for src in kind.built_over(solver).into_iter().rev() {
+                deliver_kind_fact(solver, proxy, &KindFact::BuiltOver(&src));
+            }
+        } else {
+            for (upper, edge) in kind.upper_edges(solver) {
+                deliver_kind_fact(solver, proxy, &KindFact::Edge(&upper, false, &edge));
+            }
+        }
+    }
+}
+
+impl Proxied for Rc<crate::ccl::capabilities::CapabilityVar> {
+    fn standing(&self, solver: &Solver) -> Level {
+        self.level(solver)
+    }
+
+    fn owned(&self) -> bool {
+        self.home().is_some()
+    }
+
+    fn mint(solver: &mut Solver, original: &Self, _directions: &[bool], level: Level) -> Self {
+        crate::ccl::capabilities::CapabilityVar::fresh(solver, level, &original.telescope)
+    }
+
+    fn link(solver: &mut Solver, original: &Self, proxy: &Self, positive: bool, _level: Level) {
+        // The edge itself carries what crosses: an edge out of the deeper original pushes what
+        // it holds, now and as it arrives, and one into it is read where it is resolved
+        // ([`crate::ccl::capabilities::relate`]).
         let filter = Filter::default();
         if positive {
             proxy.flows_from(solver, original, filter);
@@ -3956,13 +3925,93 @@ fn extrude_capabilities(
             // each use supplies to it is supplied to the proxy.
             let open = original.open_input(solver);
             proxy.set_open_input(solver, open);
-            original.flows_from(solver, &proxy, filter);
+            original.flows_from(solver, proxy, filter);
         }
-        cache
-            .capabilities
-            .insert((original.uid, positive), Rc::clone(&proxy));
     }
-    Capabilities::var(proxy)
+}
+
+/// `kind` as seen from `target_level`, a part of what a kind proxy holds: a variable deeper than
+/// it through its own proxy on `positive`'s side, and a sum's candidates on both sides.
+fn extrude_kind_part(
+    solver: &mut Solver,
+    kind: &FunKind,
+    positive: bool,
+    target_level: Level,
+) -> FunKind {
+    transport_fun_kind(
+        solver,
+        kind,
+        Side::of(positive),
+        &mut Extruding {
+            level: target_level,
+        },
+    )
+}
+
+/// One fact a funkind variable knows that its proxies hold on its side: an edge to a kind on a
+/// side, with the edge's substitution, or a source it is built over, which is a lower side's.
+pub(crate) enum KindFact<'a> {
+    Edge(&'a FunKind, bool, &'a Subst),
+    BuiltOver(&'a FunKind),
+}
+
+impl KindFact<'_> {
+    /// The side a proxy holding the fact stands on: below the original for a lower edge and a
+    /// source, above it for an upper edge.
+    fn lower(&self) -> bool {
+        match self {
+            KindFact::Edge(_, lower, _) => *lower,
+            KindFact::BuiltOver(_) => true,
+        }
+    }
+}
+
+/// Give `proxy` `fact`, which its original knows on the side `proxy` stands on, as seen from
+/// `proxy`'s level: a variable deeper than it through its own proxy there. An upper that is a
+/// variable is no demand a proxy holds: the variable's own facts reach the proxy where they
+/// are its.
+fn deliver_kind_fact(solver: &mut Solver, proxy: &Rc<crate::ccl::ty::FunKindVar>, fact: &KindFact) {
+    let level = proxy.level(solver);
+    match fact {
+        KindFact::Edge(FunKind::Var(_), false, _) => {}
+        KindFact::Edge(k, lower, edge) => {
+            let part = extrude_kind_part(solver, k, *lower, level);
+            proxy.record_under(solver, part, *lower, (*edge).clone());
+        }
+        KindFact::BuiltOver(k) => {
+            let part = extrude_kind_part(solver, k, true, level);
+            proxy.contributes_first(solver, part);
+        }
+    }
+}
+
+/// Deliver `fact`, just recorded on `original`, to each shallower kind it has an edge to on the
+/// fact's side ([`deliver_kind_fact`]), its proxies among them: what a deeper kind learns crosses
+/// each edge to a shallower one as it is recorded, as a type variable's closure pushes a lower
+/// bound to its uppers. A lower fact crosses to the kinds above the original, an upper one to
+/// those below.
+pub(crate) fn push_to_kind_proxies(
+    solver: &mut Solver,
+    original: &Rc<crate::ccl::ty::FunKindVar>,
+    fact: KindFact,
+) {
+    let level = original.level(solver);
+    let side = fact.lower();
+    let edges = if side {
+        original.upper_edges(solver)
+    } else {
+        original.lower_edges(solver)
+    };
+    let proxies: Vec<_> = edges
+        .into_iter()
+        .filter_map(|(k, _)| match k {
+            FunKind::Var(p) if p.home().is_some() && p.level(solver) < level => Some(p),
+            _ => None,
+        })
+        .collect();
+    for proxy in proxies {
+        deliver_kind_fact(solver, &proxy, &fact);
+    }
 }
 
 /// `ty` as seen from `level`: every variable it reaches above `level` is moved down to
@@ -4028,10 +4077,71 @@ fn lower_var_levels(solver: &mut Solver, ty: &Type, level: Level) {
             kind.lower_level(solver, level);
         }
         if let Repr::Var(v) = capabilities.repr() {
-            v.lower_level(solver, level);
+            lower_capability_levels(solver, v, level);
         }
     }
     ty.walk_children(|child| lower_var_levels(solver, child, level));
+}
+
+/// Lower the capability variable `v` to `level`, with each deeper variable an edge stored on it
+/// reaches and the types its capabilities name, as an inference variable is lowered with its
+/// bounds. Afterwards every edge into a variable still comes from one at its level or shallower,
+/// or is stored on the deeper end (`src/ccl/design/type-inference.md`, "Capabilities cross
+/// levels by push").
+fn lower_capability_levels(
+    solver: &mut Solver,
+    v: &Rc<crate::ccl::capabilities::CapabilityVar>,
+    level: Level,
+) {
+    use crate::ccl::capabilities::Pushed;
+    let mut work = vec![Rc::clone(v)];
+    while let Some(v) = work.pop() {
+        if v.level(solver) <= level {
+            continue;
+        }
+        // Lowered before its edges are walked, which is what ends a cycle.
+        v.lower_level(solver, level);
+        for (other, _) in v
+            .incoming_chains(solver)
+            .into_iter()
+            .chain(v.out_edges(solver))
+        {
+            work.push(other);
+        }
+        let mut items: Vec<_> = v.own(solver).into_iter().map(|c| c.item).collect();
+        items.extend(
+            v.pushed(solver)
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Pushed::Item(capability, _) => Some(capability.item),
+                    _ => None,
+                }),
+        );
+        for item in &items {
+            lower_capability_types(solver, item, level);
+        }
+    }
+}
+
+/// Lower each type `item` names to `level`: the parts
+/// [`super::transport::transport_capability`] carries. An ordering requirement stands whole, as
+/// extrusion keeps it.
+fn lower_capability_types(
+    solver: &mut Solver,
+    item: &crate::ccl::capabilities::Capability,
+    level: Level,
+) {
+    use crate::ccl::capabilities::{Capability, Effect};
+    match item {
+        Capability::Causes(Effect::Raise(raised)) => lower_var_levels(solver, &raised.ty, level),
+        Capability::Requires(r) if r.ordering().is_none() => {
+            r.map_trait_types(|ty| {
+                lower_var_levels(solver, ty, level);
+                ty.clone()
+            });
+        }
+        _ => {}
+    }
 }
 
 /// Extrusion for an *invariant* position — a [`Type::History`] payload.
@@ -4053,7 +4163,6 @@ fn extrude_guarded(
     tv: &InferVar,
     pol: bool,
     target_level: Level,
-    cache: &mut ExtrudeCache,
 ) -> Vec<GuardedBound> {
     let guarded = tv.bounds(solver).guarded_upper.clone();
     guarded
@@ -4062,180 +4171,27 @@ fn extrude_guarded(
             guard: g.guard,
             bound: Bound {
                 origin: g.bound.origin,
-                self_subst: g.bound.self_subst,
-                ty: extrude(solver, &g.bound.ty, pol, target_level, cache),
-                ty_subst: g.bound.ty_subst,
+                self_subst: g.bound.self_subst.clone(),
+                ty: extrude(solver, &g.bound.ty, pol, target_level),
+                ty_subst: g.bound.ty_subst.clone(),
                 rendered: Default::default(),
             },
         })
         .collect()
 }
 
-fn extrude_invariant(
-    solver: &mut Solver,
-    ty: &Type,
-    target_level: Level,
-    cache: &mut ExtrudeCache,
-) -> Type {
-    if type_level(solver, ty) <= target_level {
-        return ty.clone();
-    }
-    match ty {
-        Type::Infer(tv) => {
-            // The proxy is polarity-agnostic and must be linked to the original
-            // in BOTH directions. Two cache states can precede us:
-            //
-            //  * A prior *invariant* extrusion of this variable registered one
-            //    two-way proxy under both keys — reuse it wholesale.
-            //  * A prior *polar* extrusion (`extrude` above) minted a proxy
-            //    under a single key with only *one* bound link. Reusing that
-            //    proxy naively would hand the invariant position a one-way
-            //    proxy, silently dropping the other bound direction across the
-            //    level boundary. Instead,
-            //    reuse the proxy (it is the same original variable) but add the
-            //    link the polar extrusion omitted, upgrading it to two-way.
-            let cached_pos = cache.vars.get(&(tv.uid, true)).cloned();
-            let cached_neg = cache.vars.get(&(tv.uid, false)).cloned();
-            if let (Some(p), Some(n)) = (&cached_pos, &cached_neg)
-                && Rc::ptr_eq(p, n)
-            {
-                // Already two-way (a prior invariant extrusion).
-                return Type::Infer(Rc::clone(p));
-            }
-
-            // Reuse a one-way polar proxy if present (prefer the positive-key
-            // one; either is the same original variable), else mint fresh.
-            let nvs = cached_pos
-                .clone()
-                .or_else(|| cached_neg.clone())
-                .unwrap_or_else(|| InferVar::fresh_in(solver, target_level, &tv.telescope));
-            // Each field of the original, and what the proxy makes of it.
-            let crate::ccl::infer_var::InferVarFields {
-                // The proxy's own.
-                uid: (),
-                // The target level.
-                level: (),
-                // Minted by this solver.
-                home: (),
-                // The original's: the bounds copied below close against the same scope.
-                telescope: (),
-                // None: a barrier variable extrudes in its own arm, above.
-                opaque: (),
-                // Linked both ways, and both sides copied, below.
-                bounds: (),
-                // Its own funkind variable, related to the original's as the link bound relates
-                // the two variables (`relate_proxy_funkinds`).
-                fun_kind: (),
-                // The original's (`copy_watches`).
-                watches: (),
-                // A memo of the variables reading this one under substitutions, minted afresh as
-                // the proxy is read.
-                suspensions: (),
-                // Marked, so a function edge whose domain is the proxy is an equation as one
-                // whose domain is the original is.
-                named_domain: (),
-                // `inherit_stands_for`.
-                stands_for: (),
-                // `inherit_witness_placement`.
-                witness_scopes: (),
-                // None: a barrier variable extrudes in its own arm, above.
-                barrier: (),
-            } = tv.fields(solver);
-            nvs.inherit_witness_placement(solver, tv);
-            nvs.inherit_stands_for(solver, tv);
-            if tv.names_domain(solver) {
-                nvs.mark_named_domain(solver);
-            }
-            relate_proxy_funkinds(solver, tv, &nvs, &[true, false]);
-            // Which bound links does the reused proxy already carry? A polar
-            // proxy under the `true` key has the positive link (`tv <: proxy`);
-            // under the `false` key, the negative link (`proxy <: tv`). A fresh
-            // proxy has neither.
-            let has_pos_link = cached_pos.as_ref().is_some_and(|p| Rc::ptr_eq(p, &nvs));
-            let has_neg_link = cached_neg.as_ref().is_some_and(|n| Rc::ptr_eq(n, &nvs));
-            cache.vars.insert((tv.uid, true), Rc::clone(&nvs));
-            cache.vars.insert((tv.uid, false), Rc::clone(&nvs));
-            copy_watches(solver, tv, &nvs);
-
-            // Snapshot the original's bounds, excluding any edge that already
-            // points at this proxy (a polar extrusion pushed one such link into
-            // `tv`); re-seeding from it would create a spurious `proxy <: proxy`
-            // self-edge.
-            let (lows, ups) = {
-                let s = tv.bounds(solver);
-                let not_proxy = |b: &Bound| !matches!(&b.ty, Type::Infer(v) if v.uid == nvs.uid);
-                (
-                    s.lower()
-                        .iter()
-                        .filter(|b| not_proxy(b))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    s.upper()
-                        .iter()
-                        .filter(|b| not_proxy(b))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            };
-            // Positive link: `tv <: proxy`; proxy inherits `tv`'s lower bounds.
-            if !has_pos_link {
-                tv.bounds_mut(solver)
-                    .upper_mut()
-                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
-                let new_lows: Vec<_> = lows
-                    .iter()
-                    .map(|b| Bound {
-                        origin: b.origin,
-                        self_subst: b.self_subst.clone(),
-                        ty: extrude(solver, &b.ty, true, target_level, cache),
-                        ty_subst: b.ty_subst.clone(),
-                        rendered: Default::default(),
-                    })
-                    .collect();
-                nvs.bounds_mut(solver).lower_mut().extend(new_lows);
-            }
-            // Negative link: `proxy <: tv`; proxy inherits `tv`'s upper bounds.
-            if !has_neg_link {
-                tv.bounds_mut(solver)
-                    .lower_mut()
-                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
-                let new_ups: Vec<_> = ups
-                    .iter()
-                    .map(|b| Bound {
-                        origin: b.origin,
-                        self_subst: b.self_subst.clone(),
-                        ty: extrude(solver, &b.ty, false, target_level, cache),
-                        ty_subst: b.ty_subst.clone(),
-                        rendered: Default::default(),
-                    })
-                    .collect();
-                nvs.bounds_mut(solver).upper_mut().extend(new_ups);
-                let guarded = extrude_guarded(solver, tv, false, target_level, cache);
-                nvs.bounds_mut(solver).guarded_upper.extend(guarded);
-            }
-            Type::Infer(nvs)
-        }
-        // Every structural position under an invariant constructor is
-        // itself invariant; refinement predicates are not walked (same as
-        // the polar extrusion).
-        _ => {
-            let mut out = ty.clone();
-            if let Type::Fun {
-                fun_kind,
-                capabilities,
-                ..
-            } = &mut out
-            {
-                if let FunKind::Var(kind) = fun_kind {
-                    *kind = extrude_kind(solver, kind, &[true, false], target_level, cache);
-                }
-                *capabilities =
-                    extrude_capabilities(solver, capabilities, &[true, false], target_level, cache);
-            }
-            out.walk_children_mut(|t| *t = extrude_invariant(solver, t, target_level, cache));
-            out
-        }
-    }
+/// Extrusion for an invariant position, a history's function and a sum's candidates: every
+/// variable `ty` holds deeper than `target_level` crosses through a proxy related to it in both
+/// directions ([`Extruding`]).
+fn extrude_invariant(solver: &mut Solver, ty: &Type, target_level: Level) -> Type {
+    transport(
+        solver,
+        ty,
+        Side::Both,
+        &mut Extruding {
+            level: target_level,
+        },
+    )
 }
 
 /// Counts the bounds [`constrain_go`] records on variables, so a test can bound how they grow
@@ -4331,9 +4287,9 @@ mod tests {
                     capabilities: Capabilities::none(),
                 };
                 let extruded = if invariant {
-                    extrude_invariant(solver, &function, 0, &mut ExtrudeCache::new())
+                    extrude_invariant(solver, &function, 0)
                 } else {
-                    extrude(solver, &function, true, 0, &mut ExtrudeCache::new())
+                    extrude(solver, &function, true, 0)
                 };
                 assert_eq!(type_level(solver, &extruded), 0);
                 assert_eq!(kind.level(solver), 2);
@@ -4362,9 +4318,9 @@ mod tests {
             original.mark_named_domain(solver);
             let ty = Type::Infer(Rc::clone(&original));
             let extruded = if invariant {
-                extrude_invariant(solver, &ty, 0, &mut ExtrudeCache::new())
+                extrude_invariant(solver, &ty, 0)
             } else {
-                extrude(solver, &ty, true, 0, &mut ExtrudeCache::new())
+                extrude(solver, &ty, true, 0)
             };
             let Type::Infer(proxy) = extruded else {
                 panic!("expected the original's proxy");
@@ -4552,8 +4508,7 @@ mod tests {
                 .bounds_mut(solver)
                 .type_kinds
                 .push(TypeKind::UIntRanges);
-            let mut cache = ExtrudeCache::new();
-            let out = extrude(solver, &Type::Infer(Rc::clone(&fresh)), pol, 0, &mut cache);
+            let out = extrude(solver, &Type::Infer(Rc::clone(&fresh)), pol, 0);
             let Type::Infer(proxy) = out else {
                 panic!("extruding a variable yields a variable, got {out:?}");
             };
@@ -4587,7 +4542,7 @@ mod tests {
                 .bounds_mut(solver)
                 .lower_mut()
                 .push(Bound::conc(Type::fun(domain, b.clone())));
-            let out = extrude(solver, &b, pol, 0, &mut ExtrudeCache::new());
+            let out = extrude(solver, &b, pol, 0);
             let Type::Infer(copy) = out else {
                 panic!("extruding a barrier variable yields one, got {out:?}");
             };
@@ -5451,13 +5406,7 @@ mod tests {
             )))],
         );
         assert_eq!(barrier.level(solver), 1);
-        let out = extrude(
-            solver,
-            &Type::Infer(Rc::clone(&barrier)),
-            true,
-            0,
-            &mut ExtrudeCache::new(),
-        );
+        let out = extrude(solver, &Type::Infer(Rc::clone(&barrier)), true, 0);
         let Type::Infer(extruded) = &out else {
             panic!("extrude changed the constructor: {out}");
         };
@@ -5550,13 +5499,7 @@ mod tests {
             )))],
         );
         assert_eq!(barrier.level(solver), 1);
-        let out = extrude(
-            solver,
-            &Type::Infer(Rc::clone(&barrier)),
-            false,
-            0,
-            &mut ExtrudeCache::new(),
-        );
+        let out = extrude(solver, &Type::Infer(Rc::clone(&barrier)), false, 0);
         let Type::Infer(extruded) = &out else {
             panic!("extrude changed the constructor: {out}");
         };
@@ -5648,13 +5591,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(barrier.level(solver), 1);
-        let extruded = extrude(
-            solver,
-            &Type::Infer(Rc::clone(&barrier)),
-            true,
-            0,
-            &mut ExtrudeCache::new(),
-        );
+        let extruded = extrude(solver, &Type::Infer(Rc::clone(&barrier)), true, 0);
         let mut cache = ConstrainCache::new();
         constrain_subtype(
             solver,
@@ -5700,13 +5637,7 @@ mod tests {
             vec![BarrierUpper::unreported(Bound::conc(b))],
         );
         assert_eq!(barrier.level(solver), 1);
-        let extruded = extrude(
-            solver,
-            &Type::Infer(Rc::clone(&barrier)),
-            false,
-            0,
-            &mut ExtrudeCache::new(),
-        );
+        let extruded = extrude(solver, &Type::Infer(Rc::clone(&barrier)), false, 0);
         let mut cache = ConstrainCache::new();
         constrain_subtype(
             solver,
@@ -5744,7 +5675,7 @@ mod tests {
         // across the level boundary.
         let v1 = fresh_var(solver, 1);
         let h = feed_ty(Type::UIntRange(3), v1.clone());
-        let out = extrude(solver, &h, true, 0, &mut ExtrudeCache::new());
+        let out = extrude(solver, &h, true, 0);
         let Some((_, value, _)) = out.history_parts() else {
             panic!("extrude changed the constructor: {out}");
         };
@@ -5768,24 +5699,24 @@ mod tests {
     }
 
     #[test]
-    fn invariant_extrude_upgrades_a_one_way_polar_cache_hit() {
+    fn an_invariant_position_adds_the_missing_direction_to_a_polar_proxy() {
         let solver = &mut Solver::new();
         // The same variable appears in BOTH a polar position and an invariant
         // (`Feed` value) payload within one type. The structural walk extrudes
-        // the polar occurrence first — minting a *one-way* proxy cached under
-        // that polarity — then reaches the `Feed` value, whose
-        // `extrude_invariant` hits the cache. The cached proxy must be upgraded
-        // to link the original in BOTH directions; otherwise the invariant
-        // payload silently loses one bound direction across the level boundary.
+        // the polar occurrence first, minting a *one-way* proxy registered for
+        // that direction, then reaches the `Feed` value, whose
+        // `extrude_invariant` finds it (`proxy_of`). The proxy must be given the
+        // other direction too; otherwise the invariant payload silently loses one
+        // bound direction across the level boundary.
         let v1 = fresh_var(solver, 1);
         let Type::Infer(orig) = &v1 else {
             unreachable!("fresh_var yields Type::Infer");
         };
         // Tuple element 0 (covariant, polar) extrudes before element 1's `Feed`
-        // value (invariant), so the one-way polar proxy lands in the cache
-        // first and the `Feed` extrusion is the cache hit under test.
+        // value (invariant), so the one-way polar proxy is registered first and
+        // the `Feed` extrusion is the reuse under test.
         let ty = Type::Tuple(vec![v1.clone(), feed_ty(Type::UIntRange(3), v1.clone())]);
-        let out = extrude(solver, &ty, true, 0, &mut ExtrudeCache::new());
+        let out = extrude(solver, &ty, true, 0);
         let Type::Tuple(elems) = &out else {
             panic!("extrude changed the constructor: {out}");
         };
@@ -5807,7 +5738,7 @@ mod tests {
             Rc::ptr_eq(polar_proxy, feed_proxy),
             "invariant position minted a second proxy instead of reusing the polar one"
         );
-        // Both bound directions must survive the cache hit.
+        // Both bound directions must survive the reuse.
         let proxy_ty = Type::Infer(Rc::clone(feed_proxy));
         let bounds = orig.bounds(solver);
         assert!(
@@ -5816,7 +5747,7 @@ mod tests {
         );
         assert!(
             bounds.lower().iter().any(|b| b.ty == proxy_ty),
-            "original is missing the lower (negative) link after the cache hit"
+            "original is missing the lower (negative) link after the reuse"
         );
     }
 

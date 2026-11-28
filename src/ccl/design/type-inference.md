@@ -133,6 +133,19 @@ it does not control that level increment (`in_let_rhs` in `infer/context.rs`, `i
   polarity-appropriate bound (`infer/solver/constrain.rs`). The level it compares counts each
   function type's funkind and capability variables (`type_level`), and each of those above
   the shallower level gets a proxy too.
+- Every sort crosses levels by one rule (`proxy_of`, the `Proxied` trait). A proxy is a fresh
+  variable at the shallower level, related to its original by an edge in each direction asked
+  for: a positive proxy (`original <: proxy`) holds what flows into the original, a negative one
+  (`proxy <: original`) what the original demands, an invariant position both. A sort says how
+  its proxy is minted and what crossing the edge gives it: a type variable's proxy copies the
+  bounds on that side, a funkind variable's the knowledge on that side, and a capability
+  variable's takes what the edge pushes. One proxy stands for an original at a level in a
+  direction while the scope that minted it is live, and a proxy for one direction is given the
+  others it is asked for rather than another being minted (`solver/proxies.rs`). During emission a
+  scope at a level is a `let`'s right-hand side, which closes when its variables are generalized
+  at the binding; a later scope at that level is another, and a proxy minted inside a closed one
+  stands in nowhere else. After emission every walk of the graph is a scope of its own, so a
+  proxy one specialization's pin related carries nothing into another's.
 
 For a schematic `let id = λ x → x`, if `x` has type `α` above the binding cutoff, separate uses
 receive independent copies such as `β ⇒ β` and `γ ⇒ γ`. See
@@ -1105,10 +1118,11 @@ above the binding's cutoff (`FreshenCache`). Every handle goes through one rule 
 
 An ordering requirement is the exception to the order of step 3: it is built from its copied
 positions, source and capabilities, so it records itself once built. A cycle back to it from those
-parts would copy it twice. In debug builds, `FreshenCache::record_copy` asserts that one freshening
-records one copy per original. Two copies of one original would leave one of them out of the map,
-and `rename_instance_binders`, which renames what the map holds, would leave that copy naming the
-definition's binders.
+parts would copy it twice, so a capability naming it while it is built is recorded on its copy once
+it is registered (`FreshenCache::waiting`). In debug builds, `FreshenCache::record_copy` asserts
+that one freshening records one copy per original. Two copies of one original would leave one of
+them out of the map, and `rename_instance_binders`, which renames what the map holds, would leave
+that copy naming the definition's binders.
 
 A solver variable, an inference, barrier, funkind or capability variable, stands above the cutoff
 where its level is above it. A handle with no level is copied wherever freshening reaches it: an
@@ -1120,13 +1134,35 @@ variable's copy is minted and registered by one function for every sort, and car
 records (`copy_var`, [One solver variable](#one-solver-variable)). An ordering requirement's copy
 and an obligation's are their own (`copy_ordering`, `copy_obligation`). Each carries what is
 recorded on the original, copied through the same rule. A capability set a type or a node states is
-copied through the rule too (`freshen_capabilities`): its variables, and a known set's requirements
-and raised types, as a copied variable's own capabilities are. Written clauses hold nothing of a run
-and are kept.
+copied through the rule too (`transport_capabilities`, below): its variables, and a known set's
+requirements and raised types, as a copied variable's own capabilities are. Written clauses hold
+nothing of a run and are kept.
 
 `freshen_level` returns a type unchanged when nothing it holds is above the cutoff, so it reads the
 same state the rule copies: a function's kind and capabilities, a known set's contents, where an
 ordering requirement counts as above every cutoff.
+
+Freshening and extrusion walk a type, a term and a substitution by one structural walk
+(`transport` in `solver/transport.rs`). The walk fixes which positions each constructor has and
+the side each position stands on: a domain flips the side, a data domain, a history's function and
+a sum's candidates stand on both sides, and a nominal argument stands where its variance puts it.
+A mode (`Transport`) decides what stands for each variable, name and held term. Freshening
+(`Copying`) copies each handle above the cutoff by the rule above, renames the binders its
+definition binds, and reads no side. Extrusion (`Extruding`) relates each variable deeper than its
+target to its proxy there on the position's side (`proxy_of`) and keeps every name, since a proxy
+is its original read at a shallower level. Both modes reach a type through `freshen_level`, so
+both walk a refinement's predicate, a projection's term and a known capability set's raised types
+and requirements. The walk carries a capability set the same way in both modes
+(`transport_capabilities`): a raised type at the set's side, since `Raise` is covariant, and a trait
+requirement's types on both sides. A mode decides only what stands for a capability variable, for
+an ordering requirement, which it copies or keeps whole, and for a raised exception at its new
+type. A held term's capabilities stand on the positive side: they are what evaluating the term
+does. A mode's parts that hold types, a polymorphic annotation, a family and a parameter's bound,
+are walked by the same mode, so one copy treats every part it reaches alike.
+
+Extrusion keeps a bound's substitutions as the original's bound holds them. A discharged term or
+type in one can name a variable deeper than the proxy holding the bound. Freshening copies those
+payloads (`transport_subst`).
 
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
@@ -1275,12 +1311,14 @@ the coalesce walk asks whether the name resolves to a specialization frame (`loo
 
 A `let` that `scoped_let` does not generalize is bound at its type as seen from the binding's level
 (`lower_levels` in `infer/solver/constrain.rs`): every variable the type reaches moves down to that
-level, transitively through bounds and kinds, and a declared feed's channel name is at that level
-too. The right-hand side is emitted one level up, where a generalized sibling's is, so without the
-move the sibling's scheme would quantify the binding's variables and each of the sibling's uses
-would get a disconnected copy: beside `out: Feed(_)`, every call of `def put(x): out << x` would
-feed a channel of its own. Bound at its own level, the binding is one type every use shares, the
-sibling's included, and a type parameter reaching it escapes
+level, transitively through bounds, kinds and capability edges, and a declared feed's channel name
+is at that level too. A capability variable moves with each deeper variable an edge stored on it
+reaches and with the types its capabilities name (`lower_capability_levels`), so an edge stored on
+a variable still names nothing deeper than it. The right-hand side is emitted one level up, where a
+generalized sibling's is, so without the move the sibling's scheme would quantify the binding's
+variables and each of the sibling's uses would get a disconnected copy: beside `out: Feed(_)`, every
+call of `def put(x): out << x` would feed a channel of its own. Bound at its own level, the binding
+is one type every use shares, the sibling's included, and a type parameter reaching it escapes
 ([type-parameters.md, "Levels"](type-parameters.md#levels)).
 
 #### Checking a definition alone
@@ -1704,7 +1742,7 @@ when equal, so two equal filters written in two places keep their own terms.
 
 #### One known exception, scoped and unfixed: generic instantiation
 
-`freshen_refinement_predicate` in `infer/solver/scheme.rs` clones the predicate, freshens its
+`transport_refinement` in `infer/solver/transport.rs` clones the predicate, freshens its
 type slots, and installs an unconditional new `Rc`. It does not use a `PredMemo`.
 Occurrences that shared an allocation before instantiation can therefore emerge as separate
 allocations, including inside one specialization clone.
@@ -1811,8 +1849,7 @@ of facts: a solver variable's `Solver::var_state_mut`, through its sort's `Recor
 `Solver::capability_run_mut` for the run's own record of capabilities (`state::Revisions`). No
 write is counted by a line of its own beside it. A cached answer records the counts of every kind
 of state it reads and is reused only while they stand. A funkind variable's resolution reads
-funkind state alone (`Solver::funkind_revision`), and not its binder names, which only its binder
-positions and a component's names read (`Solver::funkind_names_revision`). A capability variable's
+funkind state alone, its classes included (`Solver::funkind_revision`). A capability variable's
 reads capability state, funkind state, since an edge's filter can hold only while a kind is data,
 inference state, since a bound compares exception and position types, ordering requirements' proof
 state, since a bound admits one that is satisfied, and the run's record of capabilities, among them
@@ -1931,6 +1968,15 @@ mints the copy at the target's level for the original's, in the copy of the orig
 registers it, and then carries what the run recorded on the original (`Copied`). Registration comes
 before any of the original's state is freshened, so a cycle back to the original finds the copy;
 no sort orders the two itself.
+
+A copy carries what its original stores, freshened, and records nothing on a variable that stays: an
+inference variable's bounds, a funkind variable's edges, and a capability variable's edges, the
+variables pushing into it and what they pushed. An edge to a variable that stays is carried on the
+copy alone, so that variable does not receive what the copy holds when it is made, only what reaches
+the copy afterwards. What reached that variable from the original was extruded at its level: each
+deeper variable stands there as its proxy, and every copy carries its edge to that proxy, so what
+reaches a copy's variable reaches the proxy. A type flowing into a shallower variable is extruded,
+and so is a capability ([Capabilities cross levels by push](#capabilities-cross-levels-by-push)).
 
 An inference variable's funkind variable is part of its handle, so the copy of the variable is
 minted over a copy of the funkind variable (`mint_copy`). Recording on the funkind variable's copy
@@ -3176,7 +3222,7 @@ inner domain refers to `k`: the inner binder is not in scope in its own domain.
 The same outer reference inside the inner codomain would have index 1.
 
 Freshening preserves these indices and function names while copying eligible inference variables.
-`freshen_refinement_predicate` freshens predicate type slots without renaming its term structure.
+`transport_refinement` freshens predicate type slots without renaming its term structure.
 Captured outer names remain names and continue to reference the definition's environment.
 This does not guarantee predicate allocation sharing; the
 [generic-instantiation exception](#one-known-exception-scoped-and-unfixed-generic-instantiation)
@@ -4280,11 +4326,35 @@ the freshening's cutoff and leaves one at or below it in place, as freshening tr
 variable.
 `lower_levels` lowers a function type's funkind variable to the binding's level, including when
 its domain and codomain contain no variable above that level. Extrusion gives a funkind variable
-above the destination level a proxy there instead (`extrude_kind`). The proxy is related to the
-original as the extrusion's polarity relates a type variable's proxy, and in both directions at an
-invariant position. The proxy binds the original's binders (`FunKindVar::proxy`): the function
-type's parts name them, and so do the telescopes of the variables in those parts. A copy of the
-proxy binds the binders of the copy of the original (`Copied::copy_fixed` for `FunKind`).
+above the destination level a proxy there instead (`proxy_of`), and a type variable's proxy
+stands over its original's kind's proxy. The proxy is related to the original as the extrusion's
+polarity relates a type variable's proxy, and in both directions at an invariant position. The
+proxy binds the original's binders (`FunKindVar::proxy`), as a type variable's proxy keeps its
+original's telescope: binder names belong to the function, and a proxy changes only the level it
+is read at. The function type's parts name them, and so do the telescopes of the variables in
+those parts, so nothing an extrusion carries is renamed, and content reaching the original back
+from the proxy is already in the original's names. A binder reference is a name rather than a
+stored variable, so the shared names hold the level invariant. A proxied type variable is placed
+under the proxies of the kinds its original is placed under. A copy of the proxy binds the binders
+of the copy of the original (`Copied::copy_fixed` for `FunKind`).
+
+An edge between funkind variables within one level is recorded on both ends. A kind names nothing
+deeper than itself, so an edge between kinds at two levels is recorded on the deeper one alone, as
+a type variable's bound to a shallower variable is, and the shallower kind relates to the deeper
+one's proxy at its own level instead (`FunKindVar::record_under`, `proxy_of`). A proxy's link to its
+original is such an edge. The proxy starts with what the original knows on the link's side: its
+lowers and the sources it is built over for a positive proxy, its concrete uppers for a negative
+one. What a kind records later crosses each of its edges to a shallower kind on that side, its
+proxies' links among them, as it is recorded (`push_to_kind_proxies`), as type closure pushes a
+lower bound to an upper.
+
+Kinds an edge relates are one kind, so what they resolve to and which binder each position is are
+facts of a class, held by the solver (`KindClasses`), and not walked for. A pin class, over kind
+edges, joins its members' points and reads the widths of the members built over sources
+(`FunKindVar::resolved_in`). A name class, over kind edges and copies, holds each minted binder's
+position and the members (`FunKindVar::binder_position`, `same_component`, `component_binder_ids`).
+A copy shares which binder each position is with its original, and not what the kind resolves to, so
+a copy joins its original's name class and not its pin class (`FunKindVar::copied_from`).
 
 A funkind variable also stands in a telescope, given when it is minted: a type variable's own
 funkind variable in the variable's telescope, and a demand's or an annotation's in the walk's scope
@@ -4294,9 +4364,9 @@ original would (`FreshenCache::copied_telescope`), so an instantiation renames t
 binders in funkind telescopes as in type variables'.
 
 A copy carries the data stamp, both bound lists and the source relations, with fresh binder IDs.
-An edge to a neighboring funkind variable left in place is recorded on both ends: the neighbor
-gains the copy beside the original, through the edge it already had to the original
-(`copy_var`). So a closure's scheme instantiated inside a definition relates its copies
+The edges shallower kinds drew to the original, held on it, are recorded from each such kind, its
+copy or itself where it stays, to the copy, and `FunKindVar::record_under` places each where the
+two stand (`copy_var`). So a closure's scheme instantiated inside a definition relates its copies
 to the funkind variables the definition owns, the bound `_ |=> 𝑉` on an associated type among
 them, and a specialization of the definition copies both sides with the correspondence between
 them.
@@ -4328,19 +4398,6 @@ Freshening preserves an obligation's operand separately from the watches propaga
 `TraitObligation::copy_watch` copies each watch and its frame, and registers the copy as an operand
 only if the original variable was that operand. Redelivery reads the copied operand's bounds in
 its own frame.
-
-A kind-component walk tracks visited kind identities in a hash set while retaining discovery order
-in its result. Each related kind is tested once per edge rather than against every kind already
-reached. The component is cached at the current funkind revision through weak references. Its binder
-names are cached separately at the binder-name revision, so a new binder is visible without changing
-a kind edge. A content query that already finds a mapped term name, or whose content reads no
-witness, need not enumerate those binder names.
-
-Witness-position lookups cache the position of each reachable binder, including binders on
-concrete sum bounds and on originals a kind was copied from. Collection preserves the lookup's
-existing depth-first precedence and visits each kind identity once. Both the funkind and
-binder-name revisions invalidate the cache, including negative lookups. A freshened kind
-starts without its original's cache.
 
 ### Implementation limits
 
@@ -5623,17 +5680,15 @@ in order (`ExceptionInstance`), so the copies one use makes agree without a tabl
 counts every solver variable, so a definition whose type holds a capability variable above the
 binding level generalizes (`should_generalize`), as one holding a type variable there does. A type
 becoming a bound of a variable at a shallower level gives each capability variable above that level
-a proxy there (`extrude_capabilities`). At a positive position the original flows into the proxy, at
-a negative one the proxy flows into the original, and at an invariant one both. A negative proxy of
-an open input is an open input (`CapabilityVar::open_input`): what each use supplies to the
-original, it supplies to the proxy. A monomorphic binding lowers its capability variables with its
-other variables (`lower_levels`). An edge is recorded on both of its variables
-(`CapabilityVar::flows_from`, `CapabilityVar::outgoing`). Instantiation copies a capability variable
-above the scheme's cutoff with its capabilities, its upper bounds, the edges into it, and its edges
-into variables the copy leaves in place (`copy_var`), so two uses of one polymorphic function
-collect their capabilities apart, and a proxy below the cutoff collects both. `freshen_level` counts
-a function type's capability variable, so a type whose only quantified part is its capabilities is
-copied rather than shared.
+a proxy there (`proxy_of`). A positive proxy holds what flows into the original, a
+negative one flows into the original, and an invariant position does both. A negative proxy of an
+open input is an open input (`CapabilityVar::open_input`): what each use supplies to the original,
+it supplies to the proxy. A monomorphic binding lowers its capability variables with its other
+variables (`lower_levels`). Instantiation copies a capability variable above the scheme's cutoff
+with its capabilities, its upper bounds and the edges it stores (`copy_var`), so two uses of one
+polymorphic function collect their capabilities apart, and a proxy below the cutoff collects both.
+`freshen_level` counts a function type's capability variable, so a type whose only quantified part
+is its capabilities is copied rather than shared.
 
 **A clone takes its use's capabilities.** A clone's capability variables are its use's copies, and
 uses whose functions resolve to different capabilities get separate clones ([Capabilities on every
@@ -5657,6 +5712,51 @@ relates them, and is printed: its requirements as a parameter `R <: Context` and
 inputs alone is dropped, as a type variable at one polarity is. The variables standing together at
 one input are printed as one: `def twice(f, x): f(f(x))` calls `f` twice, and each call's variable
 stands for what `f` does.
+
+#### Capabilities cross levels by push
+
+A capability edge is stored as an inference variable's bound is (`relate`), and a variable names no
+variable deeper than itself. An edge into a variable at the source's level or a shallower one is
+stored on the source (`out`), and what the source holds is pushed along it as it arrives
+(`push_into`), as type closure pushes a lower bound to the variable's upper bounds. An edge from a
+shallower variable into a deeper one is stored on the deeper one (`incoming`), which reads the
+shallower one where it is resolved. Such an edge composes with each edge out of the deeper variable,
+so what arrives at the shallower one later reaches each variable downstream.
+
+What crosses into a variable shallower than the one it leaves is extruded at the shallower level
+(`Pushed::across`), as a type flowing into a shallower variable is: each type a capability names
+stands there as its proxy, and an exception keeps its site and instance (`Extruding`). A guard keeps
+the steps it names, as a guarded bound keeps its guard (`extrude_guarded`). An open-input or hole
+marker keeps its variable. Each of these names the step or the variable whose state a check reads.
+
+What is pushed only grows: each step makes its decision as it is crossed, and what crosses forgets
+the path it took (`Pushed`). A decision waiting on a fact still open rides along instead, as the
+step making it, in the entry's guard, and is made where the capability is read (`Step::waits`): an
+edge waiting on a kind not yet settled, an exception whose type a bound, a `try` or a stated clause
+decides, a requirement whose answer is open, and every step leaving a hole, whose bounds its
+definition sets when its body closes. Each keeps or drops what it decides and rewrites nothing, so a
+guard is a set, and two paths through the same open steps push one entry. A written bound is
+recorded before any edge out of its variable, holes aside (`CapabilityVar::bound_above`), since what
+leaves is decided against it.
+
+The checks that read the graph's shape read markers pushed beside the capabilities: an open input
+(`Pushed::Open`, with the steps an ordering input waits on) and a hole with what the edges crossed
+discharge (`Pushed::Hole`), for `reaches_open_input`, `has_open_ordering_input` and
+`holes_reaching`. A variable also records each variable with an edge stored on it into this one
+(`pushed_from`), since it stores no edge from that variable. `reaching` walks back over these and
+over the shallower variables each variable reads, and reports the variables at the reader's level
+or shallower, since a type at that level names no deeper variable. `empty` counts them, so a
+variable fed only by pushes is not empty.
+
+A copy carries what its original stores, as every sort's copy does ([One solver
+variable](#one-solver-variable)): its own capabilities and written bounds, the edges the original
+stores, each to the copy of the variable at the far end or to that variable where it stays, the
+variables pushing into the original, and what they pushed, freshened. Nothing is pushed again: a
+variable that stays holds what the original pushed into it, extruded at its level, and each copy
+reaches it through the edge the copy carries. Only a variable at the original's level or deeper
+pushes into it, so what was pushed came from variables the freshening copies too, and each pushed
+capability is freshened as its variable's copy freshens it as its own. A copy is not a written hole,
+so no hole reaching the original reaches the copy.
 
 ### Capabilities on every expression
 
