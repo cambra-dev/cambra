@@ -1154,6 +1154,16 @@ impl Subst {
         }
     }
 
+    /// Each kind an elimination names, as [`Self::map_witness_half`] passes it to `kind`.
+    pub(crate) fn eliminated_kinds(
+        &self,
+    ) -> impl Iterator<Item = &Rc<crate::ccl::ty::FunKindVar>> + '_ {
+        self.elims.iter().filter_map(|e| match e {
+            Elim::Top(_) | Elim::Map(_) => None,
+            Elim::Kind(k, _) | Elim::ReadBack(k, _) | Elim::Onto(k) => Some(k),
+        })
+    }
+
     /// This substitution with its witness half rewritten: every binder, a key or a
     /// rename's target, through `binder`, every kind an elimination names through `kind`, and
     /// every discharge's type through `candidate`.

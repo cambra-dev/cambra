@@ -1740,9 +1740,9 @@ fn check_located_memoized(
     } else {
         // Check is a run of its own, and closes what it hands back as every run does.
         let memo = crate::ccl::ccl_utils::PredMemo::replacing();
-        let mut closer = super::solve::Closer::default();
+        let mut closer = super::solve::Closer::new(&memo);
         for error in &mut ctx.errors {
-            closer.error(error, &memo);
+            closer.error(error);
         }
         Err(ctx.errors)
     }

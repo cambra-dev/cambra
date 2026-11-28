@@ -48,6 +48,7 @@ mod component_walk;
 pub mod constrain;
 pub(crate) mod containment;
 pub mod display;
+pub mod held;
 pub mod scheme;
 pub mod simplify_type;
 pub mod smt;

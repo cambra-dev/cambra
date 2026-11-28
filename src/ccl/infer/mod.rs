@@ -789,7 +789,7 @@ pub(crate) fn case_result_ty<'a>(
     let mut resolved =
         resolve_var_type(solver, &result).map_err(|e| map_coalesce_err(e, "Case arm"))?;
     // A run of its own closes what it hands back, as every run does.
-    solve::Closer::default().ty(&mut resolved, &crate::ccl::ccl_utils::PredMemo::replacing());
+    solve::Closer::new(&crate::ccl::ccl_utils::PredMemo::replacing()).ty(&mut resolved);
     Ok(resolved)
 }
 
@@ -1471,7 +1471,7 @@ fn run_once(
             types.extend(scheme.poly.types().cloned());
         }
         for ty in &types {
-            solve::assert_type_closed(ty, &mut seen);
+            solve::assert_settled(ty, &mut seen);
         }
     }
     result
@@ -1480,9 +1480,7 @@ fn run_once(
 /// Close `term` as a run closes what it hands back ([`solve::Closer`]). Whether it held any
 /// variable to close.
 pub(crate) fn close_term(term: &mut Expr) -> bool {
-    let mut closer = solve::Closer::default();
-    closer.expr(term, &crate::ccl::ccl_utils::PredMemo::replacing());
-    closer.closed_any()
+    solve::Closer::new(&crate::ccl::ccl_utils::PredMemo::replacing()).expr(term)
 }
 
 /// Close what a run hands back as it ends ([`solve::Closer`]): its tree, its errors, and on
@@ -1490,29 +1488,31 @@ pub(crate) fn close_term(term: &mut Expr) -> bool {
 /// variable of the run is read once the run ends.
 fn close_run(expr: &mut Expr, result: &mut Result<Inferred, RunFailure>) {
     let memo = crate::ccl::ccl_utils::PredMemo::replacing();
-    let mut closer = solve::Closer::default();
-    closer.expr(expr, &memo);
+    let mut closer = solve::Closer::new(&memo);
+    closer.expr(expr);
     match result {
         Ok(inferred) => {
-            closer.ty(&mut inferred.ty, &memo);
+            closer.ty(&mut inferred.ty);
             for (_, scheme) in &mut inferred.schemes {
-                scheme.map_types(&mut |ty| closer.ty(ty, &memo));
+                scheme.map_types(&mut |ty| {
+                    closer.ty(ty);
+                });
             }
             for capability in &mut inferred.top_level {
                 if let crate::ccl::capabilities::Capability::Causes(
                     crate::ccl::capabilities::Effect::Raise(raised),
                 ) = &mut capability.item
                 {
-                    closer.ty(&mut raised.ty, &memo);
+                    closer.ty(&mut raised.ty);
                 }
             }
             for error in &mut inferred.inert {
-                closer.error(error, &memo);
+                closer.error(error);
             }
         }
         Err(failure) => {
             for error in &mut failure.errors {
-                closer.error(error, &memo);
+                closer.error(error);
             }
         }
     }
